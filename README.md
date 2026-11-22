@@ -193,7 +193,9 @@ Passkeys:
   proof. A new passkey is stored as pending: no read sees it, so it cannot sign in, step up or
   approve. The registration applies its grant again after the insert and activates the passkey
   only if the session is still live and no other passkey appeared meanwhile; otherwise it
-  deletes it. A crash in between leaves an unusable pending row.
+  deletes it. After the activation it checks once more; if the grant no longer holds, it deletes
+  the passkey and ends every session of the account. A crash in between leaves an unusable
+  pending row.
 - Registration, removal and revocation of a passkey revoke sessions before the audit event, so
   a failing audit sink cannot skip the revocation.
 - An e-mail sign-in checks the second-factor rule again after it created the session, so a first
