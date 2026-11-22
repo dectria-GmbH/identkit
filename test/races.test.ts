@@ -278,6 +278,7 @@ describe("passkey registration races", () => {
       t.ik.passkeys.finishRegistration({ sessionToken: user.token }, response),
     ).rejects.toThrow("audit sink down");
     expect(await inner.credentials.listByAccount(user.account.id)).toHaveLength(0);
+    expect(await liveSessions(inner, user.account.id, t.clock.now())).toBe(0);
   });
 
   it("a token rotation in another tab does not cancel the registration", async () => {

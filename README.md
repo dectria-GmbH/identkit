@@ -194,8 +194,11 @@ Passkeys:
   approve. The registration applies its grant again after the insert and activates the passkey
   only if the session is still live and no other passkey appeared meanwhile; otherwise it
   deletes it. After the activation it checks once more; if the grant no longer holds, it deletes
-  the passkey and ends every session of the account. A crash in between leaves an unusable
-  pending row.
+  the passkey and ends every session of the account; an error on the way does the same. A crash
+  in between leaves an unusable pending row.
+- A registration that is already running is cancelled only by revocation, not by a token
+  rotation: `rotate` and step-ups keep the session, so a registration started before them
+  completes. Use `sessions.revokeById` or `revokeAll` to cut off a stolen session.
 - Registration, removal and revocation of a passkey revoke sessions before the audit event, so
   a failing audit sink cannot skip the revocation.
 - An e-mail sign-in checks the second-factor rule again after it created the session, so a first

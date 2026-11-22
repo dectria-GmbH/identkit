@@ -268,51 +268,53 @@ export function createPasskeys(
         account.id,
         verified.credentialId,
       );
-      const activated =
-        holds === true &&
-        (await store.credentials.activate(
+      if (holds !== true) {
+        await store.credentials.delete(verified.credentialId, account.id, verified.publicKey);
+        await ctx.emit({
+          type: "passkey.registration_failed",
+          accountId: account.id,
+          reason: "grant_changed",
+        });
+        return holds;
+      }
+      // From the activation on, the passkey can be usable. A revocation between the check above
+      // and the activation would be missed, so check once more. On failure, or on any error,
+      // the passkey goes and every session of the account ends; a sign-in that raced with the
+      // delete is caught by its own re-check.
+      const undo = async () => {
+        try {
+          await store.credentials.delete(verified.credentialId, account.id, verified.publicKey);
+        } finally {
+          await sessions.revokeAll(account.id);
+        }
+      };
+      let outcome: true | RegistrationDenied;
+      try {
+        const activated = await store.credentials.activate(
           verified.credentialId,
           account.id,
           verified.publicKey,
           clock.now(),
-        ));
-      if (!activated) {
-        await store.credentials.delete(verified.credentialId, account.id, verified.publicKey);
-        await ctx.emit({
-          type: "passkey.registration_failed",
-          accountId: account.id,
-          reason: "grant_changed",
-        });
-        return holds === true ? { status: "denied", reason: "no_session" } : holds;
-      }
-      // A revocation between the check and the activation would be missed: check once more.
-      // The passkey was usable for a moment, so on failure every session of the account ends;
-      // a sign-in that raced with the delete is caught by its own re-check. An error on the way
-      // takes the same exit before it propagates.
-      const undo = async () => {
-        await store.credentials.delete(verified.credentialId, account.id, verified.publicKey);
-        await sessions.revokeAll(account.id);
-      };
-      let stillHolds: true | RegistrationDenied;
-      try {
-        stillHolds = await grantStillHolds(
-          grant,
-          resolved.sessionId,
-          account.id,
-          verified.credentialId,
         );
+        outcome = activated
+          ? await grantStillHolds(grant, resolved.sessionId, account.id, verified.credentialId)
+          : { status: "denied", reason: "no_session" };
       } catch (error) {
-        await undo();
+        try {
+          await undo();
+        } catch {
+          // Keep the original error; the undo failure has the same cause in most cases.
+        }
         throw error;
       }
-      if (stillHolds !== true) {
+      if (outcome !== true) {
         await undo();
         await ctx.emit({
           type: "passkey.registration_failed",
           accountId: account.id,
           reason: "grant_changed",
         });
-        return stillHolds;
+        return outcome;
       }
       // Revoke first: if the audit sink fails afterwards, no other session survives.
       const revokedSessions = await sessions.revokeAll(
