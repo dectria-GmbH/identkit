@@ -107,17 +107,29 @@ export interface CodeConfirmationStart {
 export interface SignatureApprovalVerify {
   sessionToken: string;
   payloadHash: string;
+  level?: "signature";
   response: AuthenticationResponseJSON;
 }
 
 export interface CodeConfirmationVerify {
   sessionToken: string;
   payloadHash: string;
+  /** Required: the level is never inferred from the other fields. */
+  level: "code-confirmation";
   /** The `approvalId` that `start` returned. */
   approvalId: string;
   /** A current TOTP code of the session's account. */
   code: string;
 }
+
+export type ApprovalStartResult = StartApprovalResult | StartCodeConfirmationResult;
+
+/**
+ * The result names the level of its proof (`proof.level`). The type does not depend on the
+ * input, so a caller that passes untyped input must still check `proof.level` before it uses
+ * level-specific fields or shows the proof as a signature.
+ */
+export type ApprovalVerifyResult = VerifyApprovalResult | VerifyCodeConfirmationResult;
 
 export interface Approvals {
   /**
@@ -135,12 +147,12 @@ export interface Approvals {
    * same payload hash, the same session, a passkey of the session's account, and a challenge
    * not used before.
    *
-   * Level `code-confirmation` (with `approvalId` and `code`): consumes the pending approval
-   * (one attempt per pending approval) and the code's time step, and returns a recorded
-   * evidence. Succeeds only for the same payload hash, session and account.
+   * Level `code-confirmation` (`level: "code-confirmation"`, `approvalId` and `code`):
+   * consumes the pending approval (one attempt per pending approval) and the code's time step,
+   * and returns a recorded evidence. Succeeds only for the same payload hash, session and
+   * account. An `approvalId` or `code` without that level throws `TypeError`.
    */
-  verify(input: SignatureApprovalVerify): Promise<VerifyApprovalResult>;
-  verify(input: CodeConfirmationVerify): Promise<VerifyCodeConfirmationResult>;
+  verify(input: SignatureApprovalVerify | CodeConfirmationVerify): Promise<ApprovalVerifyResult>;
   /**
    * Checks the HMAC of a code-confirmation evidence with this deployment's key. `intact`
    * shows only that this deployment wrote the record and nobody changed it. It does not
@@ -177,12 +189,6 @@ function evidenceMacInput(evidence: Omit<CodeConfirmationEvidence, "mac">): stri
     evidence.recordedAt,
     evidence.timeStep,
   ]);
-}
-
-function isCodeConfirmationVerify(
-  input: SignatureApprovalVerify | CodeConfirmationVerify,
-): input is CodeConfirmationVerify {
-  return "code" in input || "approvalId" in input;
 }
 
 /** Signature proofs are always accepted; code confirmations only if the policy allows them. */
@@ -337,7 +343,7 @@ export function createApprovals(
   function start(input: CodeConfirmationStart): Promise<StartCodeConfirmationResult>;
   async function start(
     input: SignatureApprovalStart | CodeConfirmationStart,
-  ): Promise<StartApprovalResult | StartCodeConfirmationResult> {
+  ): Promise<ApprovalStartResult> {
     if (typeof input.payloadHash !== "string" || !PAYLOAD_HASH_PATTERN.test(input.payloadHash)) {
       throw new TypeError("payloadHash must be a lowercase hex SHA-256 digest");
     }
@@ -348,15 +354,19 @@ export function createApprovals(
     return startSignature(input);
   }
 
-  function verify(input: SignatureApprovalVerify): Promise<VerifyApprovalResult>;
-  function verify(input: CodeConfirmationVerify): Promise<VerifyCodeConfirmationResult>;
   async function verify(
     input: SignatureApprovalVerify | CodeConfirmationVerify,
-  ): Promise<VerifyApprovalResult | VerifyCodeConfirmationResult> {
-    if ("response" in input && ("code" in input || "approvalId" in input)) {
-      throw new TypeError("pass either response or approvalId and code, not both");
+  ): Promise<ApprovalVerifyResult> {
+    if (input.level === "code-confirmation") {
+      if ("response" in input) throw new TypeError("a code confirmation takes no response");
+      return verifyCodeConfirmation(input);
     }
-    if (isCodeConfirmationVerify(input)) return verifyCodeConfirmation(input);
+    if (input.level !== undefined && input.level !== "signature") {
+      throw new TypeError("level must be signature or code-confirmation");
+    }
+    if ("code" in input || "approvalId" in input) {
+      throw new TypeError('a code confirmation needs level: "code-confirmation"');
+    }
     return verifySignature(input);
   }
 
@@ -479,7 +489,8 @@ export function createApprovals(
 }
 
 /**
- * Result of `verifyApprovalEvidence`. Compare `status`; never treat the result as a boolean.
+ * Result of `verifyApprovalEvidence`. Compare `status === "verified"`; the result is an
+ * object, so it is always truthy and must never be used as a boolean.
  * - `verified`: a signature evidence checked out with the given public key.
  * - `recorded_not_independently_verifiable`: a code-confirmation evidence. It is a server
  *   record, not a proof anyone else can check, so it is never reported as `verified`.
@@ -506,14 +517,20 @@ export interface ApprovalEvidenceVerifier {
  * record of that account's credentials. It does not check whether the credential is still
  * registered.
  *
- * For level `code-confirmation` it returns `recorded_not_independently_verifiable`: nothing
- * in the record can be checked without the server's keys, and even with them it would show
- * only what the server recorded. See `CodeConfirmationEvidence`.
+ * For level `code-confirmation` it returns `recorded_not_independently_verifiable` for any
+ * record of the right shape, forged or not: nothing in the record can be checked without the
+ * server's keys. Before you accept such a record, check it with
+ * `approvals.checkRecordedEvidence`; even then it shows only what the server recorded. See
+ * `CodeConfirmationEvidence`.
+ *
+ * It takes one options object, so a call written for the earlier boolean form
+ * (`verifyApprovalEvidence(proof, verifier)`) no longer compiles.
  */
-export async function verifyApprovalEvidence(
-  evidence: ApprovalEvidence,
-  verifier?: ApprovalEvidenceVerifier,
-): Promise<ApprovalEvidenceCheck> {
+export async function verifyApprovalEvidence(input: {
+  evidence: ApprovalEvidence;
+  verifier?: ApprovalEvidenceVerifier;
+}): Promise<ApprovalEvidenceCheck> {
+  const { evidence, verifier } = input;
   const invalid: ApprovalEvidenceCheck = { status: "invalid" };
   if (evidence?.version !== 1 || !PAYLOAD_HASH_PATTERN.test(evidence.payloadHash)) {
     return invalid;

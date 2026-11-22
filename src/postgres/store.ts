@@ -630,6 +630,14 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           .executeTakeFirst();
         return row !== undefined;
       },
+      async deleteAllForAccount(accountId) {
+        const rows = await db
+          .deleteFrom("identkit_totp_factors")
+          .where("account_id", "=", accountId)
+          .returning("id")
+          .execute();
+        return rows.length;
+      },
       async replaceSealedSecret(id, expected, next) {
         const row = await db
           .updateTable("identkit_totp_factors")

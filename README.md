@@ -60,7 +60,7 @@ const session = await identkit.sessions.validate(tokenFromCookie);
   `revoke(accountId, id)`, `issueEnrollmentToken(accountId)`.
 - `totp`: `startEnrolment(sessionToken)`, `confirmEnrolment(sessionToken, { factorId, code })`,
   `verifySecondFactor(pendingToken, { code })`, `get(accountId)`, `remove(sessionToken)`,
-  `revoke(accountId)`, `reseal(accountId)`.
+  `revoke(accountId)` (also deletes pending enrolments), `reseal(accountId)`.
 - `stepUp`: `requestEmailCode(sessionToken)`, `verifyEmailCode(sessionToken, { flowId, code })`,
   `startPasskey(sessionToken)`, `finishPasskey(sessionToken, response)`,
   `verifyTotp(sessionToken, { code })`.
@@ -68,7 +68,8 @@ const session = await identkit.sessions.validate(tokenFromCookie);
   `revoke(token)`, `revokeById(id)`, `revokeAll(accountId, { exceptSessionId })`.
 - `approvals`: `start({ sessionToken, payloadHash, level? })`,
   `verify({ sessionToken, payloadHash, response })` for level `signature`,
-  `verify({ sessionToken, payloadHash, approvalId, code })` for level `code-confirmation`,
+  `verify({ sessionToken, payloadHash, level: "code-confirmation", approvalId, code })` for
+  level `code-confirmation`,
   `checkRecordedEvidence(evidence)`.
 - `accounts`: `create({ email })`, `get(id)`, `findByEmail(email)`, `disable(id)`.
 - `identityVerification`: `start({ accountId, returnUrl })`, `handleCallback(payload)`,
@@ -81,12 +82,16 @@ or check ownership yourself before you pass client input: all of `accounts`,
 `sessions.revokeAll`, `identityVerification.start`, `identityVerification.refresh` and
 `identityVerification.get`.
 
-Standalone functions: `verifyApprovalEvidence(evidence, verifier?)`, `hashPayload(payload)`,
+Standalone functions: `verifyApprovalEvidence({ evidence, verifier })`, `hashPayload(payload)`,
 `approvalChallenge(nonce, payloadHash, accountId)`, `normalizeEmail(input)`, `parseConfig(input)`,
 `createAesGcmSealer({ keys, activeKeyId })`. Constant `TOTP_INTEROPERABLE_PARAMETERS`
 (`{ algorithm: "SHA1", digits: 6 }`).
 
-`verifyApprovalEvidence` returns an object, not a boolean: compare `status === "verified"`.
+`verifyApprovalEvidence({ evidence, verifier })` returns an object, not a boolean: compare
+`status === "verified"`. It takes one options object, so code written for the earlier
+two-argument boolean form does not compile. `approvals.verify` returns a result whose type
+does not depend on the input: check `proof.level` before you show or use a proof, and pass
+`level: "code-confirmation"` explicitly for a code confirmation.
 
 Subpath `identkit/postgres`: `createPostgresStore(db)`, `migrateIdentkit(db)`, `MIGRATIONS_DIR`.
 
@@ -116,7 +121,8 @@ Every field is required; there is no default.
 
 Second factor after an e-mail code:
 
-- The option `isPrivilegedAccount(account)` is required. The consumer decides who is privileged.
+- The option `isPrivilegedAccount(account)` is required and must return a boolean (anything
+  else fails the sign-in). The consumer decides who is privileged.
   A privileged account always needs a second factor, whatever `secondFactor` says. If it has
   none, the e-mail code yields no session: `second_factor_unavailable` with reason
   `enrolment_required`. Onboard such accounts with a passkey enrollment token, or enrol the
@@ -124,7 +130,13 @@ Second factor after an e-mail code:
 - With `if_enrolled` (or a privileged account), every enrolled factor counts, also one that
   `secondFactorMethods` does not allow. If the account has factors but none is allowed, the
   answer is `second_factor_unavailable` with reason `method_not_allowed`, not a session from the
-  code alone. A policy change therefore cannot lower the sign-in of an account below its factors.
+  code alone. So a change of `secondFactorMethods` cannot lower the sign-in of an account below
+  its factors. A change of `secondFactor` to `none` does: non-privileged accounts then sign in
+  with the e-mail code alone, whatever factors they have.
+- A TOTP factor counts at sign-in even if the policy names TOTP only through
+  `approvalProofLevel`. With `if_enrolled` and no `totp` in `secondFactorMethods`, such an
+  account gets `method_not_allowed`; list `totp` in `secondFactorMethods` if you let accounts
+  enrol TOTP.
 - `second_factor_required` lists the `methods` that can complete the sign-in. Only the holder of
   a valid code sees them.
 
@@ -353,7 +365,9 @@ Level `code-confirmation`:
   - The server holds the TOTP secret too, so the server, or anyone with its sealed store and
     key, could produce the same record.
   - A third party cannot check it. `verifyApprovalEvidence` returns
-    `{ status: "recorded_not_independently_verifiable" }` for it, never `verified`.
+    `{ status: "recorded_not_independently_verifiable" }` for any record of the right shape,
+    forged or not, and never `verified`. Check a record with
+    `approvals.checkRecordedEvidence` before you accept it.
     `approvals.checkRecordedEvidence` checks the HMAC with your key; `intact` means only that
     this deployment wrote the record and nobody changed it since.
 - Use it where an authenticator app is the only second factor and a server record is enough.

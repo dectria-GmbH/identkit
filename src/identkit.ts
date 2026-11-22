@@ -85,7 +85,15 @@ export function createIdentkit(options: IdentkitOptions): Identkit {
     mail: options.mail,
     identityVerification: options.identityVerification ?? null,
     sealer: options.sealer ?? null,
-    isPrivilegedAccount: async (account) => await isPrivileged(account),
+    // Strict: a hook that returns no boolean (for example a missing `return`) is a bug that
+    // would make every account non-privileged, so it fails the sign-in instead.
+    isPrivilegedAccount: async (account) => {
+      const result: unknown = await isPrivileged(account);
+      if (typeof result !== "boolean") {
+        throw new TypeError("isPrivilegedAccount must return a boolean");
+      }
+      return result;
+    },
     getPolicy: async () =>
       signInPolicySchema.parse(
         typeof policySource === "function" ? await policySource() : policySource,

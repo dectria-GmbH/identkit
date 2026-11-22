@@ -178,7 +178,9 @@ describe("approval proofs", () => {
       payloadHash: payloadA,
       response: t.authenticator.assert(options),
     });
-    if (result.status !== "approved") throw new Error("not approved");
+    if (result.status !== "approved" || result.proof.level !== "signature") {
+      throw new Error("not approved");
+    }
     const credential = await t.store.credentials.findById(user.credentialId);
     const verifier = {
       credentialPublicKey: credential?.publicKey ?? new Uint8Array(),
@@ -188,24 +190,27 @@ describe("approval proofs", () => {
     const verified = { status: "verified", level: "signature" };
     const invalid = { status: "invalid" };
     expect(result.proof.level).toBe("signature");
-    expect(await verifyApprovalEvidence(result.proof, verifier)).toEqual(verified);
+    expect(await verifyApprovalEvidence({ evidence: result.proof, verifier })).toEqual(verified);
     expect(
-      await verifyApprovalEvidence({ ...result.proof, payloadHash: payloadB }, verifier),
-    ).toEqual(invalid);
-    expect(
-      await verifyApprovalEvidence(result.proof, {
-        ...verifier,
-        origins: ["https://other.example"],
+      await verifyApprovalEvidence({
+        evidence: { ...result.proof, payloadHash: payloadB },
+        verifier,
       }),
     ).toEqual(invalid);
-    expect(await verifyApprovalEvidence(result.proof)).toEqual(invalid);
+    expect(
+      await verifyApprovalEvidence({
+        evidence: result.proof,
+        verifier: { ...verifier, origins: ["https://other.example"] },
+      }),
+    ).toEqual(invalid);
+    expect(await verifyApprovalEvidence({ evidence: result.proof })).toEqual(invalid);
     for (const edited of [
       { ...result.proof, accountId: "another-account" },
       { ...result.proof, origin: "https://other.example" },
       { ...result.proof, counter: result.proof.counter + 1 },
       { ...result.proof, rpId: "other.example" },
     ]) {
-      expect(await verifyApprovalEvidence(edited, verifier)).toEqual(invalid);
+      expect(await verifyApprovalEvidence({ evidence: edited, verifier })).toEqual(invalid);
     }
   });
 });

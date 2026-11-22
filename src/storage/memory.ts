@@ -307,6 +307,16 @@ export function createMemoryStore(): IdentkitStore {
         totpFactors.delete(id);
         return Promise.resolve(true);
       },
+      deleteAllForAccount(accountId) {
+        let count = 0;
+        for (const [id, factor] of totpFactors) {
+          if (factor.accountId === accountId) {
+            totpFactors.delete(id);
+            count += 1;
+          }
+        }
+        return Promise.resolve(count);
+      },
       replaceSealedSecret(id, expected, next) {
         const found = totpFactors.get(id);
         if (!found || found.sealedSecret !== expected) return Promise.resolve(false);

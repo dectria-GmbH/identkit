@@ -414,6 +414,18 @@ export function runStoreContract(
       expect(await store.totp.delete(f.id, "other-account")).toBe(false);
       expect(await store.totp.delete(f.id, a.id)).toBe(true);
       expect(await store.totp.findActive(a.id)).toBeNull();
+      const pendingOne = totpFactor(a.id);
+      await store.totp.insert(pendingOne);
+      const activeOne = totpFactor(a.id);
+      await store.totp.insert(activeOne);
+      await store.totp.activate(activeOne.id, a.id, 3, T0);
+      const otherAccount = account();
+      await store.accounts.insert(otherAccount);
+      const foreign = totpFactor(otherAccount.id);
+      await store.totp.insert(foreign);
+      expect(await store.totp.deleteAllForAccount(a.id)).toBe(2);
+      expect(await store.totp.activate(pendingOne.id, a.id, 4, T0)).toBe(false);
+      expect(await store.totp.findPending(foreign.id)).not.toBeNull();
       // A new factor can be activated after the removal.
       const g = totpFactor(a.id);
       await store.totp.insert(g);

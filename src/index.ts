@@ -73,6 +73,8 @@ export {
   type ApprovalEvidenceVerifier,
   type CodeConfirmationEvidence,
   type StartApprovalResult,
+  type ApprovalStartResult,
+  type ApprovalVerifyResult,
   type StartCodeConfirmationResult,
   type VerifyApprovalResult,
   type VerifyCodeConfirmationResult,

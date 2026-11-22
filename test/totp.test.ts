@@ -267,6 +267,47 @@ describe("TOTP enrolment", () => {
     expect(await t.ik.sessions.validate(granted.token)).toBeNull();
   });
 
+  it("administrative revocation also deletes a pending enrolment, so it cannot be confirmed later", async () => {
+    const t = setup();
+    const user = await t.signIn("person@example.org");
+    const start = await t.ik.totp.startEnrolment(user.token);
+    if (start.status !== "ok") throw new Error("denied");
+    expect(await t.ik.totp.revoke(user.account.id)).toBe(true);
+    expect(await t.store.totp.findPending(start.factorId)).toBeNull();
+    const again = await signInAgain(t, "person@example.org");
+    if (again.status !== "signed_in") throw new Error(again.status);
+    expect(
+      await t.ik.totp.confirmEnrolment(again.token, {
+        factorId: start.factorId,
+        code: t.totpCode(start.secret),
+      }),
+    ).toEqual({ status: "failed", reason: "invalid" });
+    expect(await t.store.totp.findActive(user.account.id)).toBeNull();
+  });
+
+  it("a privileged hook that returns no boolean fails the sign-in", async () => {
+    const t = setup({ policy: emailFirstPolicy });
+    const { createIdentkit, createHmacHasher } = await import("../src/index.js");
+    const { createRecordingAuditSink, createRecordingMailSender } =
+      await import("../src/testing/index.js");
+    const mail = createRecordingMailSender();
+    const ik = createIdentkit({
+      config: testConfig,
+      store: createMemoryStore(),
+      hasher: createHmacHasher(randomBytes(32)),
+      mail,
+      audit: createRecordingAuditSink(),
+      sealer: t.sealer,
+      policy: emailFirstPolicy,
+      isPrivilegedAccount: (() => undefined) as unknown as () => boolean,
+    });
+    const requested = await ik.emailSignIn.requestCode({ email: "x@example.org" });
+    if (requested.status !== "sent") throw new Error("not sent");
+    await expect(
+      ik.emailSignIn.verifyCode({ flowId: requested.flowId, code: mail.last()?.code ?? "" }),
+    ).rejects.toThrow("isPrivilegedAccount must return a boolean");
+  });
+
   it("a TOTP step-up stops changing factors once the policy drops TOTP from step-up", async () => {
     const t = setup();
     const user = await t.signIn("person@example.org");
@@ -666,6 +707,7 @@ describe("TOTP secrets", () => {
       await t.ik.approvals.verify({
         sessionToken: granted.token,
         payloadHash: "c".repeat(64),
+        level: "code-confirmation",
         approvalId: approval.approvalId,
         code: code(),
       }),

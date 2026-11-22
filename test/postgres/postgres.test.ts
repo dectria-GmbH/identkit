@@ -155,6 +155,7 @@ describe.skipIf(!url)("postgresql", () => {
         return t.ik.approvals.verify({
           sessionToken: live.token,
           payloadHash,
+          level: "code-confirmation",
           approvalId: start.approvalId,
           code: approvalCode,
         });

@@ -37,10 +37,13 @@ async function confirmed(
   const result = await t.ik.approvals.verify({
     sessionToken: user.token,
     payloadHash: payloadA,
+    level: "code-confirmation",
     approvalId: start.approvalId,
     code: t.totpCode(user.secret),
   });
-  if (result.status !== "approved") throw new Error(`not approved: ${result.status}`);
+  if (result.status !== "approved" || result.proof.level !== "code-confirmation") {
+    throw new Error(`not approved: ${result.status}`);
+  }
   return result.proof;
 }
 
@@ -59,6 +62,7 @@ describe("approval proofs by code confirmation", () => {
       t.ik.approvals.verify({
         sessionToken: user.token,
         payloadHash: payloadA,
+        level: "code-confirmation",
         approvalId: "A".repeat(43),
         code: t.totpCode(user.secret),
       }),
@@ -67,6 +71,39 @@ describe("approval proofs by code confirmation", () => {
     expect(
       (await t.ik.stepUp.verifyTotp(user.token, { code: t.totpCode(user.secret) })).status,
     ).toBe("granted");
+  });
+
+  it("the level of a verification is explicit, never inferred from the fields", async () => {
+    const t = setup({ policy: codePolicy });
+    const user = await userWithTotp(t);
+    const start = await startCode(t, user.token, payloadA);
+    const untyped: unknown = {
+      sessionToken: user.token,
+      payloadHash: payloadA,
+      approvalId: start.approvalId,
+      code: t.totpCode(user.secret),
+    };
+    await expect(
+      t.ik.approvals.verify(untyped as Parameters<typeof t.ik.approvals.verify>[0]),
+    ).rejects.toThrow('needs level: "code-confirmation"');
+    const mixed: unknown = {
+      sessionToken: user.token,
+      payloadHash: payloadA,
+      level: "code-confirmation",
+      response: {},
+    };
+    await expect(
+      t.ik.approvals.verify(mixed as Parameters<typeof t.ik.approvals.verify>[0]),
+    ).rejects.toThrow("takes no response");
+    // Neither call consumed the pending approval or the code.
+    const result = await t.ik.approvals.verify({
+      sessionToken: user.token,
+      payloadHash: payloadA,
+      level: "code-confirmation",
+      approvalId: start.approvalId,
+      code: t.totpCode(user.secret),
+    });
+    expect(result.status === "approved" && result.proof.level).toBe("code-confirmation");
   });
 
   it("signature stays acceptable under policy code-confirmation", async () => {
@@ -94,10 +131,13 @@ describe("approval proofs by code confirmation", () => {
     const result = await t.ik.approvals.verify({
       sessionToken: user.token,
       payloadHash: payloadA,
+      level: "code-confirmation",
       approvalId: start.approvalId,
       code,
     });
-    if (result.status !== "approved") throw new Error("not approved");
+    if (result.status !== "approved" || result.proof.level !== "code-confirmation") {
+      throw new Error("not approved");
+    }
     expect(Object.keys(result.proof).toSorted()).toEqual(
       ["accountId", "level", "mac", "payloadHash", "recordedAt", "timeStep", "version"].toSorted(),
     );
@@ -126,14 +166,18 @@ describe("approval proofs by code confirmation", () => {
       status: "recorded_not_independently_verifiable",
       level: "code-confirmation",
     };
-    expect(await verifyApprovalEvidence(proof)).toEqual(recorded);
-    expect(await verifyApprovalEvidence(proof, verifier)).toEqual(recorded);
+    expect(await verifyApprovalEvidence({ evidence: proof })).toEqual(recorded);
+    expect(await verifyApprovalEvidence({ evidence: proof, verifier })).toEqual(recorded);
     // An edited record is never "verified" either; only the server can tell it was edited.
     const edited: CodeConfirmationEvidence = { ...proof, payloadHash: payloadB };
-    expect((await verifyApprovalEvidence(edited, verifier)).status).not.toBe("verified");
+    expect((await verifyApprovalEvidence({ evidence: edited, verifier })).status).not.toBe(
+      "verified",
+    );
     // Relabelled as a signature, it lacks everything a signature check needs.
     const relabelled = { ...proof, level: "signature" } as unknown as CodeConfirmationEvidence;
-    expect(await verifyApprovalEvidence(relabelled, verifier)).toEqual({ status: "invalid" });
+    expect(await verifyApprovalEvidence({ evidence: relabelled, verifier })).toEqual({
+      status: "invalid",
+    });
 
     expect(await t.ik.approvals.checkRecordedEvidence(proof)).toEqual({ status: "intact" });
     for (const changed of [
@@ -162,6 +206,7 @@ describe("approval proofs by code confirmation", () => {
         await t.ik.approvals.verify({
           sessionToken: user.token,
           payloadHash: payloadA,
+          level: "code-confirmation",
           approvalId: start.approvalId,
           code,
         })
@@ -192,6 +237,7 @@ describe("approval proofs by code confirmation", () => {
       await t.ik.approvals.verify({
         sessionToken: granted.token,
         payloadHash: payloadA,
+        level: "code-confirmation",
         approvalId: start.approvalId,
         code,
       }),
@@ -208,6 +254,7 @@ describe("approval proofs by code confirmation", () => {
       await t.ik.approvals.verify({
         sessionToken: user.token,
         payloadHash: payloadB,
+        level: "code-confirmation",
         approvalId: forPayload.approvalId,
         code: t.totpCode(user.secret),
       }),
@@ -218,6 +265,7 @@ describe("approval proofs by code confirmation", () => {
       await t.ik.approvals.verify({
         sessionToken: other.token,
         payloadHash: payloadA,
+        level: "code-confirmation",
         approvalId: forUser.approvalId,
         code: t.totpCode(other.secret),
       }),
@@ -227,6 +275,7 @@ describe("approval proofs by code confirmation", () => {
       await t.ik.approvals.verify({
         sessionToken: user.token,
         payloadHash: payloadA,
+        level: "code-confirmation",
         approvalId: forUser.approvalId,
         code: t.totpCode(user.secret),
       }),
@@ -238,6 +287,7 @@ describe("approval proofs by code confirmation", () => {
       await t.ik.approvals.verify({
         sessionToken: user.token,
         payloadHash: payloadA,
+        level: "code-confirmation",
         approvalId: expiring.approvalId,
         code: t.totpCode(user.secret),
       }),
@@ -247,6 +297,7 @@ describe("approval proofs by code confirmation", () => {
     const approved = await t.ik.approvals.verify({
       sessionToken: user.token,
       payloadHash: payloadA,
+      level: "code-confirmation",
       approvalId: fine.approvalId,
       code: t.totpCode(user.secret),
     });
@@ -267,6 +318,7 @@ describe("approval proofs by code confirmation", () => {
         await t.ik.approvals.verify({
           sessionToken: user.token,
           payloadHash: payloadA,
+          level: "code-confirmation",
           approvalId: start.approvalId,
           code: t.totpCode(user.secret),
         }),
@@ -296,6 +348,7 @@ describe("approval proofs by code confirmation", () => {
         await t.ik.approvals.verify({
           sessionToken: user.token,
           payloadHash: payloadA,
+          level: "code-confirmation",
           approvalId: start.approvalId,
           code: wrong,
         }),
@@ -306,6 +359,7 @@ describe("approval proofs by code confirmation", () => {
       await t.ik.approvals.verify({
         sessionToken: user.token,
         payloadHash: payloadA,
+        level: "code-confirmation",
         approvalId: start.approvalId,
         code: t.totpCode(user.secret),
       }),

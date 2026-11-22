@@ -280,6 +280,11 @@ export interface IdentkitStore {
     recordStep(id: string, accountId: string, step: number, at: Date): Promise<boolean>;
     /** Deletes the factor of the account, pending or active. */
     delete(id: string, accountId: string): Promise<boolean>;
+    /**
+     * Deletes every factor of the account, pending and active, and returns how many went.
+     * A pending factor deleted here can no longer be activated.
+     */
+    deleteAllForAccount(accountId: string): Promise<number>;
     /** Compare-and-set of the sealed secret, for key rotation. */
     replaceSealedSecret(id: string, expected: string, next: string): Promise<boolean>;
   };

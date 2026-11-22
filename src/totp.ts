@@ -89,9 +89,9 @@ export interface Totp {
     | { status: "denied"; reason: "no_session" | "step_up_required" | "not_found" }
   >;
   /**
-   * Administrative removal after loss or theft. Revokes all sessions of the account, also
-   * when it finds no factor, so a retry after an error completes the revocation. Returns
-   * true if it removed a factor.
+   * Administrative removal after loss or theft. Deletes every TOTP factor of the account,
+   * pending enrolments included, and revokes all its sessions, also when it finds no factor,
+   * so a retry after an error completes the revocation. Returns true if it removed a factor.
    */
   revoke(accountId: string): Promise<boolean>;
   /**
@@ -541,14 +541,15 @@ export function createTotp(
 
     async revoke(accountId) {
       const factor = await store.totp.findActive(accountId);
-      const deleted = factor ? await store.totp.delete(factor.id, accountId) : false;
+      // Pending factors too: an enrolment confirmed at this moment must not survive.
+      const deleted = await store.totp.deleteAllForAccount(accountId);
       // Always, also without a factor: a retry after a failed revocation must still end them.
       await sessions.revokeAll(accountId);
-      if (!factor || !deleted) return false;
+      if (deleted === 0) return false;
       await ctx.emit({
         type: "totp.removed",
         accountId,
-        factorId: factor.id,
+        ...(factor ? { factorId: factor.id } : {}),
         reason: "administrative",
       });
       return true;
