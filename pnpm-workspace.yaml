@@ -1,0 +1,6 @@
+auditConfig:
+  # GHSA-mrhx-c7xc-m3w5: zod memory exhaustion on large untrusted arrays. Fixed only in zod 4,
+  # and this package stays on zod 3. identkit validates only operator configuration with zod
+  # arrays; untrusted input reaches zod only as a single string (the e-mail address).
+  ignoreGhsas:
+    - GHSA-mrhx-c7xc-m3w5

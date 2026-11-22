@@ -3,5 +3,63 @@
   "version": "0.0.0",
   "private": true,
   "description": "Identity toolkit for TypeScript: accounts, passkeys, OIDC, token issuance and delegated agent identities.",
-  "license": "UNLICENSED"
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "pnpm@12.11.2",
+  "files": [
+    "dist",
+    "migrations",
+    "LICENSE",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./postgres": {
+      "types": "./dist/postgres/index.d.ts",
+      "default": "./dist/postgres/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "default": "./dist/testing/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "oxlint --type-aware --deny-warnings",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run --maxWorkers=2",
+    "test:postgres": "vitest run --maxWorkers=2 test/postgres",
+    "check": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test && pnpm build"
+  },
+  "peerDependencies": {
+    "kysely": ">=0.29.0 <0.30.0"
+  },
+  "peerDependenciesMeta": {
+    "kysely": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "@simplewebauthn/server": "14.1.0",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "@types/pg": "8.23.1",
+    "kysely": "0.29.9",
+    "oxlint": "1.94.0",
+    "oxlint-tsgolint": "7.0.2007",
+    "pg": "8.23.1",
+    "prettier": "3.10.1",
+    "typescript": "7.0.2",
+    "vitest": "5.1.1"
+  }
 }
