@@ -281,6 +281,56 @@ describe("passkey registration races", () => {
     expect(await liveSessions(inner, user.account.id, t.clock.now())).toBe(0);
   });
 
+  it("an error in the activation removes the passkey, ends the sessions and keeps the error", async () => {
+    const inner = createMemoryStore();
+    let deleteFailures = 1;
+    const store: IdentkitStore = {
+      ...inner,
+      credentials: {
+        ...inner.credentials,
+        activate: async (...args) => {
+          // The row is activated, then the connection drops before the answer arrives.
+          await inner.credentials.activate(...args);
+          throw new Error("connection lost");
+        },
+        delete: async (...args) => {
+          if (deleteFailures > 0) {
+            deleteFailures -= 1;
+            throw new Error("delete failed once");
+          }
+          return inner.credentials.delete(...args);
+        },
+      },
+    };
+    const t = setup({ store });
+    const user = await t.signIn("person@example.org");
+    const start = await t.ik.passkeys.startRegistration({ sessionToken: user.token });
+    if (start.status !== "ok") throw new Error("denied");
+    const response = t.authenticator.register(start.options);
+    await expect(
+      t.ik.passkeys.finishRegistration({ sessionToken: user.token }, response),
+    ).rejects.toThrow("connection lost");
+    expect(await inner.credentials.listByAccount(user.account.id)).toHaveLength(0);
+    expect(await liveSessions(inner, user.account.id, t.clock.now())).toBe(0);
+  });
+
+  it("a pending row removed before its activation ends no session", async () => {
+    const { inner, store, hooks } = hookedStore();
+    const t = setup({ store });
+    const user = await t.signIn("person@example.org");
+    const start = await t.ik.passkeys.startRegistration({ sessionToken: user.token });
+    if (start.status !== "ok") throw new Error("denied");
+    const response = t.authenticator.register(start.options);
+    hooks.beforeActivate = async () => {
+      await inner.credentials.delete(response.id, user.account.id);
+    };
+    expect(await t.ik.passkeys.finishRegistration({ sessionToken: user.token }, response)).toEqual({
+      status: "denied",
+      reason: "no_session",
+    });
+    expect(await t.ik.sessions.validate(user.token)).not.toBeNull();
+  });
+
   it("a token rotation in another tab does not cancel the registration", async () => {
     const { store, hooks } = hookedStore();
     const t = setup({ store });

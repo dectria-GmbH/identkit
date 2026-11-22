@@ -281,16 +281,20 @@ export function createPasskeys(
       // and the activation would be missed, so check once more. On failure, or on any error,
       // the passkey goes and every session of the account ends; a sign-in that raced with the
       // delete is caught by its own re-check.
+      const remove = () =>
+        store.credentials.delete(verified.credentialId, account.id, verified.publicKey);
       const undo = async () => {
         try {
-          await store.credentials.delete(verified.credentialId, account.id, verified.publicKey);
+          // One retry: a passkey that survives here could sign in again later.
+          await remove().catch(remove);
         } finally {
           await sessions.revokeAll(account.id);
         }
       };
+      let activated = false;
       let outcome: true | RegistrationDenied;
       try {
-        const activated = await store.credentials.activate(
+        activated = await store.credentials.activate(
           verified.credentialId,
           account.id,
           verified.publicKey,
@@ -304,11 +308,20 @@ export function createPasskeys(
           await undo();
         } catch {
           // Keep the original error; the undo failure has the same cause in most cases.
+          await ctx
+            .emit({
+              type: "passkey.registration_failed",
+              accountId: account.id,
+              reason: "cleanup_failed",
+            })
+            .catch(() => undefined);
         }
         throw error;
       }
       if (outcome !== true) {
-        await undo();
+        // Not activated means this registration's row is gone: nothing was usable, nothing to end.
+        if (activated) await undo();
+        else await remove();
         await ctx.emit({
           type: "passkey.registration_failed",
           accountId: account.id,
