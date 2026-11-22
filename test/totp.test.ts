@@ -402,6 +402,69 @@ describe("TOTP enrolment", () => {
     }
   });
 
+  it("rule: an activation that commits and then throws runs the cleanup", async () => {
+    const { inner, store, hooks } = hookedTotpStore();
+    const t = setup({ store });
+    const user = await t.signIn("person@example.org");
+    const start = await t.ik.totp.startEnrolment(user.token);
+    if (start.status !== "ok") throw new Error("denied");
+    hooks.beforeActivate = async () => {
+      await inner.sessions.revoke(user.session.id, t.clock.now(), "test");
+    };
+    hooks.activateThrowsAfterCommit = true;
+    await expect(
+      t.ik.totp.confirmEnrolment(user.token, {
+        factorId: start.factorId,
+        code: t.totpCode(start.secret),
+      }),
+    ).rejects.toThrow("connection lost");
+    expect(await inner.totp.findActive(user.account.id)).toBeNull();
+  });
+
+  it("a cleanup whose disable also fails says so in the audit event", async () => {
+    const { inner, store, hooks } = hookedTotpStore();
+    const t = setup({ store });
+    const user = await t.signIn("person@example.org");
+    const start = await t.ik.totp.startEnrolment(user.token);
+    if (start.status !== "ok") throw new Error("denied");
+    hooks.beforeActivate = async () => {
+      await inner.sessions.revoke(user.session.id, t.clock.now(), "test");
+    };
+    hooks.failTotpDelete = 3;
+    hooks.failSetStatus = 1;
+    // One disable failure is retried.
+    await expect(
+      t.ik.totp.confirmEnrolment(user.token, {
+        factorId: start.factorId,
+        code: t.totpCode(start.secret),
+      }),
+    ).rejects.toThrow("store unavailable");
+    expect((await inner.accounts.findById(user.account.id))?.status).toBe("disabled");
+    expect(t.audit.ofType("account.disabled")).toHaveLength(1);
+
+    const second = hookedTotpStore();
+    const u = setup({ store: second.store });
+    const person = await u.signIn("person@example.org");
+    const begun = await u.ik.totp.startEnrolment(person.token);
+    if (begun.status !== "ok") throw new Error("denied");
+    second.hooks.beforeActivate = async () => {
+      await second.inner.sessions.revoke(person.session.id, u.clock.now(), "test");
+    };
+    second.hooks.failTotpDelete = 3;
+    second.hooks.failSetStatus = 2;
+    await expect(
+      u.ik.totp.confirmEnrolment(person.token, {
+        factorId: begun.factorId,
+        code: u.totpCode(begun.secret),
+      }),
+    ).rejects.toThrow("store unavailable");
+    expect((await second.inner.accounts.findById(person.account.id))?.status).toBe("active");
+    expect(u.audit.ofType("totp.enrolment_failed").map((e) => e.reason)).toContain(
+      "cleanup_failed_disable_failed",
+    );
+    expect(u.audit.ofType("account.disabled")).toHaveLength(0);
+  });
+
   it("the TOTP secret is stored only sealed", async () => {
     const t = setup();
     const user = await t.signIn("person@example.org");

@@ -415,37 +415,63 @@ export function createTotp(
         await enrolmentFailed(record.accountId, "wrong_code", factor.id);
         return { status: "failed", reason: "invalid" };
       }
-      // The confirming code's step is recorded, so it cannot sign in or step up afterwards.
-      if (!(await store.totp.activate(factor.id, factor.accountId, step, now))) {
-        await enrolmentFailed(record.accountId, "not_activated", factor.id);
-        return { status: "failed", reason: "invalid" };
-      }
-
-      // A revocation or a lost step-up between the check above and the activation would be
-      // missed, so check once more. If it fails, or anything throws, the factor goes and every
-      // session of the account ends.
+      // From the activation on, the factor can be usable. A revocation or a lost step-up
+      // between the check above and the activation would be missed, so check once more. If
+      // that check fails, or anything throws from the activation on (also an activation that
+      // committed and then lost its reply), the factor goes and every session of the account
+      // ends.
       const remove = async () => store.totp.delete(factor.id, factor.accountId);
       const removeAll = async () => store.totp.deleteAllForAccount(factor.accountId);
+      const disable = async () => store.accounts.setStatus(factor.accountId, "disabled");
       const undo = async () => {
         try {
           await remove().catch(remove).catch(removeAll);
         } catch (error) {
-          // The factor may still be active, and the party that lost the grant knows its
-          // secret: fail closed and disable the account until an operator looks at it.
-          await store.accounts.setStatus(factor.accountId, "disabled").catch(() => undefined);
+          // The factor may still be active with a secret that someone without the grant
+          // knows: fail closed and disable the account until an operator looks at it.
+          const disabled = await disable()
+            .catch(disable)
+            .then(
+              () => true,
+              () => false,
+            );
           await ctx
             .emit({
               type: "totp.enrolment_failed",
               accountId: factor.accountId,
               factorId: factor.id,
-              reason: "cleanup_failed_account_disabled",
+              reason: disabled
+                ? "cleanup_failed_account_disabled"
+                : "cleanup_failed_disable_failed",
             })
             .catch(() => undefined);
+          if (disabled) {
+            await ctx
+              .emit({
+                type: "account.disabled",
+                accountId: factor.accountId,
+                reason: "totp_cleanup",
+              })
+              .catch(() => undefined);
+          }
           throw error;
         } finally {
           await sessions.revokeAll(factor.accountId);
         }
       };
+      // The confirming code's step is recorded, so it cannot sign in or step up afterwards.
+      let activated: boolean;
+      try {
+        activated = await store.totp.activate(factor.id, factor.accountId, step, now);
+      } catch (error) {
+        await undo().catch(() => undefined);
+        throw error;
+      }
+      if (!activated) {
+        await enrolmentFailed(record.accountId, "not_activated", factor.id);
+        return { status: "failed", reason: "invalid" };
+      }
+
       let outcome: true | { status: "denied"; reason: "no_session" | "step_up_required" };
       try {
         const live = await internals.loadById(record.id, "complete");

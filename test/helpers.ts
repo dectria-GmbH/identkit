@@ -199,7 +199,13 @@ export function hookedTotpStore() {
     failThrottleReset: number;
     /** Number of further TOTP deletes (single and per account) that throw. */
     failTotpDelete: number;
+    /** Number of further account status writes that throw. */
+    failSetStatus: number;
+    /** If set, the next activation commits and then throws, as a lost reply would. */
+    activateThrowsAfterCommit: boolean;
   } = {
+    failSetStatus: 0,
+    activateThrowsAfterCommit: false,
     afterRecordStep: null,
     beforeActivate: null,
     failRevokeAll: 0,
@@ -208,6 +214,16 @@ export function hookedTotpStore() {
   };
   const store: IdentkitStore = {
     ...inner,
+    accounts: {
+      ...inner.accounts,
+      setStatus: async (...args) => {
+        if (hooks.failSetStatus > 0) {
+          hooks.failSetStatus -= 1;
+          throw new Error("store unavailable");
+        }
+        return inner.accounts.setStatus(...args);
+      },
+    },
     throttle: {
       ...inner.throttle,
       reset: async (key) => {
@@ -255,7 +271,12 @@ export function hookedTotpStore() {
         const hook = hooks.beforeActivate;
         hooks.beforeActivate = null;
         if (hook) await hook();
-        return inner.totp.activate(...args);
+        const result = await inner.totp.activate(...args);
+        if (hooks.activateThrowsAfterCommit) {
+          hooks.activateThrowsAfterCommit = false;
+          throw new Error("connection lost");
+        }
+        return result;
       },
     },
   };

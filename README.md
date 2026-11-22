@@ -290,12 +290,16 @@ TOTP:
   session. The confirming code's time step is consumed. An account has at most one active TOTP
   factor; remove it before you enrol another.
 - After the activation identkit checks the grant once more. If the session was revoked or its
-  step-up lost meanwhile, the factor goes and every session of the account ends. If the store
-  fails on every delete (two tries, then a delete of all the account's factors), identkit
-  disables the account, emits `totp.enrolment_failed` with reason
-  `cleanup_failed_account_disabled` and throws: the factor may still be active and the party
-  that lost the grant knows its secret. An operator then removes the factor and enables the
-  account again in the store; identkit has no call to enable an account.
+  step-up lost meanwhile, the factor goes and every session of the account ends. The same
+  cleanup runs if anything throws from the activation on, also an activation that committed
+  and then lost its reply. If the store fails on every delete (two tries, then a delete of all
+  the account's factors), identkit tries twice to disable the account, ends all its sessions
+  and throws: the factor may still be active, and someone without the grant may know its
+  secret. The audit event `totp.enrolment_failed` says `cleanup_failed_account_disabled`
+  (with an `account.disabled` event) or, if the disable failed too,
+  `cleanup_failed_disable_failed`. On the error paths no grant may have been lost; the account
+  is disabled all the same. An operator removes the factor with `totp.revoke(accountId)` and
+  enables the account again in the store; identkit has no call to enable an account.
 - A code is accepted within `driftSteps` time steps on either side of the current one. All
   candidates are computed and compared in constant time.
 - Replay: the store keeps the latest accepted time step per factor and accepts a step only if
