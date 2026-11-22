@@ -289,8 +289,12 @@ TOTP:
 - Adding or removing a second factor needs a fresh step-up with the strongest factor the
   account has: passkey, else TOTP; with no factor, any fresh step-up. So a first passkey on an
   account with only TOTP needs a TOTP step-up. Removing a passkey still needs a passkey step-up.
+  The named step-up counts only while the policy still lists its method in `stepUpMethods`: if
+  the operator drops it, factor changes need another method or an administrative call.
   Enrolment, removal and administrative revocation revoke the other sessions of the account (all
-  of them for `revoke`).
+  of them for `revoke`). If that revocation fails, enrolment removes the factor again and ends
+  every session; removal retries once; `revoke` ends all sessions also when it finds no factor,
+  so a retry after an error completes it.
 - A TOTP second factor or step-up checks after its write that the same factor is still the
   account's active factor. A removal that raced with the check yields no session and no step-up.
 
@@ -338,7 +342,9 @@ Level `code-confirmation`:
 - `start({ sessionToken, payloadHash, level: "code-confirmation" })` creates one pending
   approval for the session's account and returns an `approvalId`. `verify` with the
   `approvalId` and a current TOTP code consumes the pending approval (one attempt) and the
-  code's time step. It succeeds only for the same session, account and payload hash.
+  code's time step. It succeeds only for the same session, account and payload hash. After the
+  code is accepted, identkit checks again that the factor is still active and the session still
+  live, so a removal or revocation that raced with the check yields no evidence.
 - The evidence holds `version`, `level`, `accountId`, `payloadHash`, `recordedAt`, the accepted
   `timeStep` and `mac`: an HMAC over these fields with the `SecretHasher` key. It holds no code.
 - What this level does not give:
