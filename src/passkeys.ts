@@ -278,10 +278,11 @@ export function createPasskeys(
         return holds;
       }
       // From the activation on, the passkey can be usable. A revocation between the check above
-      // and the activation would be missed, so check once more. On failure, or on any error,
-      // the passkey goes and every session of the account ends; a sign-in that raced with the
-      // delete is caught by its own re-check.
-      const remove = () =>
+      // and the activation would be missed, so check once more. If the second check fails, or
+      // anything throws, the passkey goes and every session of the account ends; a sign-in that
+      // raced with the delete is caught by its own re-check.
+      // Async, so a store that throws synchronously still gets the retry below.
+      const remove = async () =>
         store.credentials.delete(verified.credentialId, account.id, verified.publicKey);
       const undo = async () => {
         try {
