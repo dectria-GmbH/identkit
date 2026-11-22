@@ -197,7 +197,15 @@ export function hookedTotpStore() {
     failRevokeAll: number;
     /** Number of further throttle resets that throw. */
     failThrottleReset: number;
-  } = { afterRecordStep: null, beforeActivate: null, failRevokeAll: 0, failThrottleReset: 0 };
+    /** Number of further TOTP deletes (single and per account) that throw. */
+    failTotpDelete: number;
+  } = {
+    afterRecordStep: null,
+    beforeActivate: null,
+    failRevokeAll: 0,
+    failThrottleReset: 0,
+    failTotpDelete: 0,
+  };
   const store: IdentkitStore = {
     ...inner,
     throttle: {
@@ -228,6 +236,20 @@ export function hookedTotpStore() {
         hooks.afterRecordStep = null;
         if (hook) await hook();
         return result;
+      },
+      delete: async (...args) => {
+        if (hooks.failTotpDelete > 0) {
+          hooks.failTotpDelete -= 1;
+          throw new Error("store unavailable");
+        }
+        return inner.totp.delete(...args);
+      },
+      deleteAllForAccount: async (accountId) => {
+        if (hooks.failTotpDelete > 0) {
+          hooks.failTotpDelete -= 1;
+          throw new Error("store unavailable");
+        }
+        return inner.totp.deleteAllForAccount(accountId);
       },
       activate: async (...args) => {
         const hook = hooks.beforeActivate;

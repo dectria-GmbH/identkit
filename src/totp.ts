@@ -425,9 +425,23 @@ export function createTotp(
       // missed, so check once more. If it fails, or anything throws, the factor goes and every
       // session of the account ends.
       const remove = async () => store.totp.delete(factor.id, factor.accountId);
+      const removeAll = async () => store.totp.deleteAllForAccount(factor.accountId);
       const undo = async () => {
         try {
-          await remove().catch(remove);
+          await remove().catch(remove).catch(removeAll);
+        } catch (error) {
+          // The factor may still be active, and the party that lost the grant knows its
+          // secret: fail closed and disable the account until an operator looks at it.
+          await store.accounts.setStatus(factor.accountId, "disabled").catch(() => undefined);
+          await ctx
+            .emit({
+              type: "totp.enrolment_failed",
+              accountId: factor.accountId,
+              factorId: factor.id,
+              reason: "cleanup_failed_account_disabled",
+            })
+            .catch(() => undefined);
+          throw error;
         } finally {
           await sessions.revokeAll(factor.accountId);
         }

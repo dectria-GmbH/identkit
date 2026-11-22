@@ -92,6 +92,9 @@ never accept on `status !== "invalid"`. It takes exactly one options object and 
 JavaScript. It replaces `verifyApprovalEvidence` from the first increment, which is gone
 without an alias, so an old call site fails instead of accepting.
 
+Signature proofs stored from the first increment have no `level` field; `checkApprovalEvidence`
+reports them as `invalid`. Add `level: "signature"` to them before you check them again.
+
 `approvals.verify` returns `{ status: "approved", evidence }`. `evidence.level` comes from the
 pending approval that `start` stored, never from the verify input; check it before you show or
 use the evidence.
@@ -287,7 +290,12 @@ TOTP:
   session. The confirming code's time step is consumed. An account has at most one active TOTP
   factor; remove it before you enrol another.
 - After the activation identkit checks the grant once more. If the session was revoked or its
-  step-up lost meanwhile, the factor goes and every session of the account ends.
+  step-up lost meanwhile, the factor goes and every session of the account ends. If the store
+  fails on every delete (two tries, then a delete of all the account's factors), identkit
+  disables the account, emits `totp.enrolment_failed` with reason
+  `cleanup_failed_account_disabled` and throws: the factor may still be active and the party
+  that lost the grant knows its secret. An operator then removes the factor and enables the
+  account again in the store; identkit has no call to enable an account.
 - A code is accepted within `driftSteps` time steps on either side of the current one. All
   candidates are computed and compared in constant time.
 - Replay: the store keeps the latest accepted time step per factor and accepts a step only if
@@ -305,7 +313,8 @@ TOTP:
   account has: passkey, else TOTP; with no factor, any fresh step-up. So a first passkey on an
   account with only TOTP needs a TOTP step-up. Removing a passkey still needs a passkey step-up.
   The named step-up counts only while the policy still lists its method in `stepUpMethods`: if
-  the operator drops it, factor changes need another method or an administrative call.
+  the operator drops it, only an administrative call (`passkeys.revoke`, `totp.revoke`, an
+  enrollment token) can change the account's factors.
   Enrolment, removal and administrative revocation revoke the other sessions of the account (all
   of them for `revoke`). If that revocation fails, enrolment removes the factor again and ends
   every session; removal retries once; `revoke` ends all sessions also when it finds no factor,

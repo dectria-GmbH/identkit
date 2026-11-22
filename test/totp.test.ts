@@ -370,6 +370,38 @@ describe("TOTP enrolment", () => {
     expect(await t.ik.sessions.validate(bystander.token)).toBeNull();
   });
 
+  it("rule: enrolment cleanup fails closed - if the factor cannot be deleted, the account is disabled", async () => {
+    for (const failures of [2, 3]) {
+      const { inner, store, hooks } = hookedTotpStore();
+      const t = setup({ store });
+      const user = await t.signIn("person@example.org");
+      const start = await t.ik.totp.startEnrolment(user.token);
+      if (start.status !== "ok") throw new Error("denied");
+      hooks.beforeActivate = async () => {
+        await inner.sessions.revoke(user.session.id, t.clock.now(), "test");
+      };
+      hooks.failTotpDelete = failures;
+      const result = t.ik.totp.confirmEnrolment(user.token, {
+        factorId: start.factorId,
+        code: t.totpCode(start.secret),
+      });
+      if (failures === 2) {
+        // The per-account delete still removes it.
+        expect(await result, "2").toEqual({ status: "denied", reason: "no_session" });
+        expect(await inner.totp.findActive(user.account.id)).toBeNull();
+        expect((await inner.accounts.findById(user.account.id))?.status).toBe("active");
+      } else {
+        await expect(result, "3").rejects.toThrow("store unavailable");
+        // The factor survived every delete, so nobody can sign in to the account any more.
+        expect(await inner.totp.findActive(user.account.id)).not.toBeNull();
+        expect((await inner.accounts.findById(user.account.id))?.status).toBe("disabled");
+        expect(t.audit.ofType("totp.enrolment_failed").map((e) => e.reason)).toContain(
+          "cleanup_failed_account_disabled",
+        );
+      }
+    }
+  });
+
   it("the TOTP secret is stored only sealed", async () => {
     const t = setup();
     const user = await t.signIn("person@example.org");
