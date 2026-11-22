@@ -84,6 +84,8 @@ export function createAesGcmSealer(options: AesGcmSealerOptions): SecretSealer {
     },
 
     open(sealed, context) {
+      // GCM returns plaintext from `update` before the tag is checked; wipe it on any path.
+      let head: Buffer | undefined;
       try {
         const parts = typeof sealed === "string" ? sealed.split(".") : [];
         const [format, keyId, ivText, ciphertextText, tagText] = parts;
@@ -107,14 +109,19 @@ export function createAesGcmSealer(options: AesGcmSealerOptions): SecretSealer {
         const decipher = createDecipheriv("aes-256-gcm", key, iv, { authTagLength: TAG_BYTES });
         decipher.setAAD(additionalData(keyId, context));
         decipher.setAuthTag(tag);
-        const plaintext = Buffer.concat([
-          decipher.update(Buffer.from(ciphertextText, "base64url")),
-          decipher.final(),
-        ]);
-        return Promise.resolve(new Uint8Array(plaintext));
+        head = decipher.update(Buffer.from(ciphertextText, "base64url"));
+        const tail = decipher.final();
+        const joined = Buffer.concat([head, tail]);
+        const plaintext = new Uint8Array(joined);
+        // Small buffers can come from a shared pool: wipe the intermediate copies.
+        tail.fill(0);
+        joined.fill(0);
+        return Promise.resolve(plaintext);
       } catch {
         // The library error says nothing secret, but a fixed error keeps it that way.
         return Promise.reject(new SealedSecretError());
+      } finally {
+        head?.fill(0);
       }
     },
   };

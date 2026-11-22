@@ -184,3 +184,44 @@ export const mfaPolicy: SignInPolicy = {
 
 /** Seconds per TOTP time step. */
 export const STEP = 30;
+
+/** A memory store with hooks that run a concurrent change at the exact point it would hurt. */
+export function hookedTotpStore() {
+  const inner = createMemoryStore();
+  const hooks: {
+    afterRecordStep: (() => Promise<void>) | null;
+    beforeActivate: (() => Promise<void>) | null;
+    /** Number of further revokeAllForAccount calls that throw. */
+    failRevokeAll: number;
+  } = { afterRecordStep: null, beforeActivate: null, failRevokeAll: 0 };
+  const store: IdentkitStore = {
+    ...inner,
+    sessions: {
+      ...inner.sessions,
+      revokeAllForAccount: async (...args) => {
+        if (hooks.failRevokeAll > 0) {
+          hooks.failRevokeAll -= 1;
+          throw new Error("store unavailable");
+        }
+        return inner.sessions.revokeAllForAccount(...args);
+      },
+    },
+    totp: {
+      ...inner.totp,
+      recordStep: async (...args) => {
+        const result = await inner.totp.recordStep(...args);
+        const hook = hooks.afterRecordStep;
+        hooks.afterRecordStep = null;
+        if (hook) await hook();
+        return result;
+      },
+      activate: async (...args) => {
+        const hook = hooks.beforeActivate;
+        hooks.beforeActivate = null;
+        if (hook) await hook();
+        return inner.totp.activate(...args);
+      },
+    },
+  };
+  return { inner, store, hooks };
+}

@@ -88,7 +88,11 @@ export interface Totp {
     | { status: "removed" }
     | { status: "denied"; reason: "no_session" | "step_up_required" | "not_found" }
   >;
-  /** Administrative removal after loss or theft. Revokes all sessions of the account. */
+  /**
+   * Administrative removal after loss or theft. Revokes all sessions of the account, also
+   * when it finds no factor, so a retry after an error completes the revocation. Returns
+   * true if it removed a factor.
+   */
   revoke(accountId: string): Promise<boolean>;
   /**
    * Administrative: seals the account's TOTP secret again with the sealer's active key, for
@@ -256,7 +260,7 @@ export function createTotp(
       record.accountId,
       newFactorId === undefined ? {} : { totpId: newFactorId },
     );
-    if (!hasFreshStepUp(ctx, record, factorChangeStepUp(enrolled))) {
+    if (!(await hasFreshStepUp(ctx, record, factorChangeStepUp(enrolled)))) {
       return { status: "denied", reason: "step_up_required" };
     }
     return true;
@@ -444,10 +448,17 @@ export function createTotp(
         await enrolmentFailed(record.accountId, "grant_changed", factor.id);
         return outcome;
       }
-      // Revoke first: if the audit sink fails afterwards, no other session survives.
-      const revokedSessions = await sessions.revokeAll(factor.accountId, {
-        exceptSessionId: record.id,
-      });
+      // Revoke first: if the audit sink fails afterwards, no other session survives. If the
+      // revocation fails, the factor goes and every session ends, as for any other error.
+      let revokedSessions: number;
+      try {
+        revokedSessions = await sessions.revokeAll(factor.accountId, {
+          exceptSessionId: record.id,
+        });
+      } catch (error) {
+        await undo().catch(() => undefined);
+        throw error;
+      }
       await ctx.emit({
         type: "totp.enrolled",
         accountId: factor.accountId,
@@ -508,14 +519,17 @@ export function createTotp(
       const factor = await store.totp.findActive(record.accountId);
       if (!factor) return { status: "denied", reason: "not_found" };
       const enrolled = await enrolledSecondFactors(ctx, record.accountId);
-      if (!hasFreshStepUp(ctx, record, factorChangeStepUp(enrolled))) {
+      if (!(await hasFreshStepUp(ctx, record, factorChangeStepUp(enrolled)))) {
         return { status: "denied", reason: "step_up_required" };
       }
       if (!(await store.totp.delete(factor.id, record.accountId))) {
         return { status: "denied", reason: "not_found" };
       }
-      // Revoke first: if the audit sink fails afterwards, no other session survives.
-      await sessions.revokeAll(record.accountId, { exceptSessionId: record.id });
+      // Revoke first: if the audit sink fails afterwards, no other session survives. One
+      // retry: a retried `remove` would answer `not_found` and not reach the revocation.
+      const revokeOthers = async () =>
+        sessions.revokeAll(record.accountId, { exceptSessionId: record.id });
+      await revokeOthers().catch(revokeOthers);
       await ctx.emit({
         type: "totp.removed",
         accountId: record.accountId,
@@ -527,9 +541,10 @@ export function createTotp(
 
     async revoke(accountId) {
       const factor = await store.totp.findActive(accountId);
-      if (!factor) return false;
-      if (!(await store.totp.delete(factor.id, accountId))) return false;
+      const deleted = factor ? await store.totp.delete(factor.id, accountId) : false;
+      // Always, also without a factor: a retry after a failed revocation must still end them.
       await sessions.revokeAll(accountId);
+      if (!factor || !deleted) return false;
       await ctx.emit({
         type: "totp.removed",
         accountId,

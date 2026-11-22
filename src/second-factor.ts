@@ -33,15 +33,23 @@ export function factorChangeStepUp(enrolled: SecondFactorMethod[]): StepUpMethod
   return null;
 }
 
-/** True if the session has a step-up within the validity window by one of `methods`. */
-export function hasFreshStepUp(
+/**
+ * True if the session has a step-up within the validity window by one of `methods`. A named
+ * method counts only while the current policy still lists it in `stepUpMethods`, so a step-up
+ * taken before the operator dropped that method no longer changes factors. `null` (no factor
+ * yet) accepts any fresh step-up, including the fresh sign-in.
+ */
+export async function hasFreshStepUp(
   ctx: Context,
   record: SessionRecord,
   methods: StepUpMethod[] | null,
-): boolean {
+): Promise<boolean> {
   const stepUp = record.stepUp;
   if (!stepUp) return false;
-  if (methods !== null && !methods.includes(stepUp.method)) return false;
+  if (methods !== null) {
+    const allowed = (await ctx.getPolicy()).stepUpMethods;
+    if (!methods.includes(stepUp.method) || !allowed.includes(stepUp.method)) return false;
+  }
   return (
     ctx.clock.now().getTime() < addSeconds(stepUp.at, ctx.config.stepUp.validitySeconds).getTime()
   );

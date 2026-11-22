@@ -5,7 +5,7 @@ import {
   verifyApprovalEvidence,
   type CodeConfirmationEvidence,
 } from "../src/index.js";
-import { mfaPolicy, ORIGIN, RP_ID, setup, STEP, testConfig } from "./helpers.js";
+import { hookedTotpStore, mfaPolicy, ORIGIN, RP_ID, setup, STEP, testConfig } from "./helpers.js";
 
 const payloadA = hashPayload(JSON.stringify({ request: "release", amount: 100 }));
 const payloadB = hashPayload(JSON.stringify({ request: "release", amount: 100000 }));
@@ -251,6 +251,29 @@ describe("approval proofs by code confirmation", () => {
       code: t.totpCode(user.secret),
     });
     expect(approved.status).toBe("approved");
+  });
+
+  it("a factor removal or session revocation during the check yields no evidence", async () => {
+    for (const race of ["factor", "session"] as const) {
+      const { inner, store, hooks } = hookedTotpStore();
+      const t = setup({ store, policy: codePolicy });
+      const user = await userWithTotp(t);
+      const start = await startCode(t, user.token, payloadA);
+      hooks.afterRecordStep = async () => {
+        if (race === "factor") await inner.totp.delete(user.factorId, user.account.id);
+        else await inner.sessions.revoke(user.session.id, t.clock.now(), "test");
+      };
+      expect(
+        await t.ik.approvals.verify({
+          sessionToken: user.token,
+          payloadHash: payloadA,
+          approvalId: start.approvalId,
+          code: t.totpCode(user.secret),
+        }),
+        race,
+      ).toEqual({ status: "failed", reason: "invalid" });
+      expect(t.audit.ofType("approval.code_confirmation_recorded"), race).toHaveLength(0);
+    }
   });
 
   it("needs a full session and an active TOTP factor; a wrong code fails, a lock reports locked", async () => {

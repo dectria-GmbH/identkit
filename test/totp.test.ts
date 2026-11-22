@@ -8,9 +8,15 @@ import {
   SealedSecretError,
   type SecretSealer,
 } from "../src/index.js";
-import type { IdentkitStore } from "../src/storage/types.js";
 import { base32Decode } from "../src/totp-core.js";
-import { emailFirstPolicy, mfaPolicy, setup, STEP, testConfig } from "./helpers.js";
+import {
+  emailFirstPolicy,
+  hookedTotpStore,
+  mfaPolicy,
+  setup,
+  STEP,
+  testConfig,
+} from "./helpers.js";
 
 type T = ReturnType<typeof setup>;
 
@@ -39,34 +45,6 @@ async function signInAgain(t: T, email: string) {
   t.clock.advanceSeconds(testConfig.emailOtp.resendCooldownSeconds);
   const { flowId, code } = await t.codeFor(email);
   return t.ik.emailSignIn.verifyCode({ flowId, code });
-}
-
-function hookedTotpStore() {
-  const inner = createMemoryStore();
-  const hooks: {
-    afterRecordStep: (() => Promise<void>) | null;
-    beforeActivate: (() => Promise<void>) | null;
-  } = { afterRecordStep: null, beforeActivate: null };
-  const store: IdentkitStore = {
-    ...inner,
-    totp: {
-      ...inner.totp,
-      recordStep: async (...args) => {
-        const result = await inner.totp.recordStep(...args);
-        const hook = hooks.afterRecordStep;
-        hooks.afterRecordStep = null;
-        if (hook) await hook();
-        return result;
-      },
-      activate: async (...args) => {
-        const hook = hooks.beforeActivate;
-        hooks.beforeActivate = null;
-        if (hook) await hook();
-        return inner.totp.activate(...args);
-      },
-    },
-  };
-  return { inner, store, hooks };
 }
 
 describe("TOTP enrolment", () => {
@@ -244,6 +222,67 @@ describe("TOTP enrolment", () => {
       }),
     ).toEqual({ status: "denied", reason: "no_session" });
     expect(await inner.totp.findActive(user.account.id)).toBeNull();
+  });
+
+  it("a failed session revocation after the factor write is retried or undone", async () => {
+    const { inner, store, hooks } = hookedTotpStore();
+    const t = setup({ store });
+    const a = await t.signIn("person@example.org");
+    const b = await signInAgain(t, "person@example.org");
+    if (b.status !== "signed_in") throw new Error("no session");
+
+    // Enrolment: the revocation of the other sessions fails, so the factor goes and every
+    // session ends.
+    const start = await t.ik.totp.startEnrolment(a.token);
+    if (start.status !== "ok") throw new Error("denied");
+    hooks.failRevokeAll = 1;
+    await expect(
+      t.ik.totp.confirmEnrolment(a.token, {
+        factorId: start.factorId,
+        code: t.totpCode(start.secret),
+      }),
+    ).rejects.toThrow("store unavailable");
+    expect(await inner.totp.findActive(a.account.id)).toBeNull();
+    expect(await t.ik.sessions.validate(b.token)).toBeNull();
+    expect(await t.ik.sessions.validate(a.token)).toBeNull();
+
+    // Removal: one failure is retried.
+    const c = await signInAgain(t, "person@example.org");
+    if (c.status !== "signed_in") throw new Error("no session");
+    const { secret } = await t.enrolTotp(c.token);
+    const d = await signInAgain(t, "person@example.org");
+    if (d.status !== "signed_in") throw new Error("no session");
+    t.clock.advanceSeconds(STEP);
+    const granted = await stepUpTotp(t, c.token, t.totpCode(secret));
+    if (granted.status !== "granted") throw new Error("no step-up");
+    hooks.failRevokeAll = 1;
+    expect(await t.ik.totp.remove(granted.token)).toEqual({ status: "removed" });
+    expect(await t.ik.sessions.validate(d.token)).toBeNull();
+
+    // Administrative revocation: a retry after a failure still ends the sessions.
+    await t.enrolTotp(granted.token);
+    hooks.failRevokeAll = 1;
+    await expect(t.ik.totp.revoke(c.account.id)).rejects.toThrow("store unavailable");
+    expect(await t.ik.totp.revoke(c.account.id)).toBe(false);
+    expect(await t.ik.sessions.validate(granted.token)).toBeNull();
+  });
+
+  it("a TOTP step-up stops changing factors once the policy drops TOTP from step-up", async () => {
+    const t = setup();
+    const user = await t.signIn("person@example.org");
+    const { secret } = await t.enrolTotp(user.token);
+    t.clock.advanceSeconds(STEP);
+    const granted = await stepUpTotp(t, user.token, t.totpCode(secret));
+    if (granted.status !== "granted") throw new Error("no step-up");
+    t.policy.current = { ...t.policy.current, stepUpMethods: ["passkey", "email_otp"] };
+    expect(await t.ik.passkeys.startRegistration({ sessionToken: granted.token })).toEqual({
+      status: "denied",
+      reason: "step_up_required",
+    });
+    expect(await t.ik.totp.remove(granted.token)).toEqual({
+      status: "denied",
+      reason: "step_up_required",
+    });
   });
 
   it("the TOTP secret is stored only sealed", async () => {

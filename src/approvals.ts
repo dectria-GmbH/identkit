@@ -300,12 +300,21 @@ export function createApprovals(
       );
       return checked.reason === "locked" ? { status: "failed", reason: "locked" } : failure;
     }
+    // The record is valid as of `recordedAt`: a removal of the factor or a revocation of the
+    // session that raced with the check yields no evidence.
+    const recordedAt = clock.now();
+    if (
+      !(await totp.isStillCurrent(checked.factor)) ||
+      !(await internals.loadById(session.id, "complete"))
+    ) {
+      return failed("factor_or_session_gone", input.payloadHash, session.accountId, level);
+    }
     const unsigned = {
       version: 1 as const,
       level,
       accountId: session.accountId,
       payloadHash: input.payloadHash,
-      recordedAt: clock.now().toISOString(),
+      recordedAt: recordedAt.toISOString(),
       timeStep: checked.step,
     };
     const proof: CodeConfirmationEvidence = {

@@ -109,7 +109,7 @@ export function createPasskeys(
       record.accountId,
       newId === undefined ? {} : { passkeyId: newId },
     );
-    return hasFreshStepUp(ctx, record, factorChangeStepUp(enrolled));
+    return await hasFreshStepUp(ctx, record, factorChangeStepUp(enrolled));
   }
 
   type ResolvedGrant =
@@ -450,7 +450,7 @@ export function createPasskeys(
     async remove(sessionToken, credentialId) {
       const loaded = await internals.load(sessionToken, "complete");
       if (!loaded) return { status: "denied", reason: "no_session" };
-      if (!hasFreshStepUp(ctx, loaded.record, ["passkey"]))
+      if (!(await hasFreshStepUp(ctx, loaded.record, ["passkey"])))
         return { status: "denied", reason: "step_up_required" };
       const removed = await store.credentials.delete(credentialId, loaded.record.accountId);
       if (!removed) return { status: "denied", reason: "not_found" };
