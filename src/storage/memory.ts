@@ -229,9 +229,9 @@ export function createMemoryStore(): IdentkitStore {
         challenges.set(challenge.challengeDigest, copy(challenge));
         return Promise.resolve();
       },
-      consumeByDigest(digest) {
+      consumeByDigest(digest, purpose) {
         const found = challenges.get(digest);
-        if (!found) return Promise.resolve(null);
+        if (!found || found.purpose !== purpose) return Promise.resolve(null);
         challenges.delete(digest);
         return Promise.resolve(found);
       },
@@ -274,13 +274,17 @@ export function createMemoryStore(): IdentkitStore {
         if (found) found.vendorReference = reference;
         return Promise.resolve();
       },
-      markConflict(id, reason) {
+      claim(id) {
         const found = verifications.get(id);
-        if (found?.status === "verified") {
-          found.status = "conflict";
-          found.failureReason = reason;
-        }
-        return Promise.resolve();
+        if (found?.status !== "pending") return Promise.resolve(false);
+        found.status = "processing";
+        return Promise.resolve(true);
+      },
+      finalize(id, update) {
+        const found = verifications.get(id);
+        if (found?.status !== "processing") return Promise.resolve(false);
+        Object.assign(found, copy(update));
+        return Promise.resolve(true);
       },
       complete(id, update) {
         const found = verifications.get(id);

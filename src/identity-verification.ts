@@ -39,7 +39,8 @@ export interface IdentityVerificationAdapter {
 export interface VerificationView {
   id: string;
   accountId: string;
-  status: VerificationStatus;
+  /** `verified` only once the person is linked; a success still being linked reads `pending`. */
+  status: Exclude<VerificationStatus, "processing">;
   assuranceLevel: AssuranceLevel | null;
   evidenceReference: string | null;
   failureReason: string | null;
@@ -71,7 +72,7 @@ function auditReason(reason: string): string {
 const view = (record: VerificationRecord): VerificationView => ({
   id: record.id,
   accountId: record.accountId,
-  status: record.status,
+  status: record.status === "processing" ? "pending" : record.status,
   assuranceLevel: record.assuranceLevel,
   evidenceReference: record.evidenceReference,
   failureReason: record.failureReason,
@@ -112,9 +113,59 @@ export function createIdentityVerification(ctx: Context): IdentityVerification {
     return current;
   }
 
+  /** Links the person and moves a `processing` verification to its final state. */
+  async function linkAndFinalize(
+    record: VerificationRecord,
+    result: Extract<VendorResult, { status: "verified" }>,
+    now: Date,
+  ): Promise<VerificationRecord> {
+    const personKeyDigest = await hasher.digest("person-key", result.personKey);
+    const linked = await store.accounts.linkPerson(
+      record.accountId,
+      personKeyDigest,
+      result.assuranceLevel,
+      now,
+    );
+    const conflict = linked === "person_linked_elsewhere" || linked === "account_has_other_person";
+    const changed = await store.verifications.finalize(record.id, {
+      status: conflict ? "conflict" : "verified",
+      assuranceLevel: result.assuranceLevel,
+      evidenceReference: result.evidenceReference,
+      failureReason: conflict ? linked : null,
+      completedAt: now,
+    });
+    if (changed) {
+      await ctx.emit({
+        type: conflict
+          ? "identity_verification.person_conflict"
+          : "identity_verification.completed",
+        accountId: record.accountId,
+        verificationId: record.id,
+        ...(conflict ? { reason: linked } : {}),
+      });
+    }
+    return (await store.verifications.findById(record.id)) ?? record;
+  }
+
   async function refreshRecord(record: VerificationRecord): Promise<VerificationRecord> {
-    if (record.status !== "pending") return record;
+    if (record.status !== "pending" && record.status !== "processing") return record;
     const now = clock.now();
+
+    if (record.status === "processing") {
+      // An earlier call claimed a success but did not finish, for example after a store error.
+      if (!record.vendorReference) return record;
+      const retry = await adapter().fetchResult(record.vendorReference);
+      if (retry.status === "verified") return linkAndFinalize(record, retry, now);
+      await store.verifications.finalize(record.id, {
+        status: "failed",
+        assuranceLevel: null,
+        evidenceReference: null,
+        failureReason: "vendor_result_changed",
+        completedAt: now,
+      });
+      return (await store.verifications.findById(record.id)) ?? record;
+    }
+
     const final = { completedAt: now };
     if (now.getTime() >= record.expiresAt.getTime()) {
       return finish(record, {
@@ -137,31 +188,12 @@ export function createIdentityVerification(ctx: Context): IdentityVerification {
         failureReason: result.reason.slice(0, 200),
       });
     }
-    // Claim the final state first, so a concurrent timeout and a link cannot both happen.
-    const claimed = await store.verifications.complete(record.id, {
-      ...final,
-      status: "verified",
-      assuranceLevel: result.assuranceLevel,
-      evidenceReference: result.evidenceReference,
-      failureReason: null,
-    });
-    if (!claimed) return (await store.verifications.findById(record.id)) ?? record;
-    const personKeyDigest = await hasher.digest("person-key", result.personKey);
-    const linked = await store.accounts.linkPerson(
-      record.accountId,
-      personKeyDigest,
-      result.assuranceLevel,
-      now,
-    );
-    const conflict = linked === "person_linked_elsewhere" || linked === "account_has_other_person";
-    if (conflict) await store.verifications.markConflict(record.id, linked);
-    await ctx.emit({
-      type: conflict ? "identity_verification.person_conflict" : "identity_verification.completed",
-      accountId: record.accountId,
-      verificationId: record.id,
-      ...(conflict ? { reason: linked } : {}),
-    });
-    return (await store.verifications.findById(record.id)) ?? record;
+    // Claim the result first, so a concurrent timeout and a link cannot both happen. Until
+    // the link is done, the verification reads as pending.
+    if (!(await store.verifications.claim(record.id))) {
+      return (await store.verifications.findById(record.id)) ?? record;
+    }
+    return linkAndFinalize(record, result, now);
   }
 
   return {

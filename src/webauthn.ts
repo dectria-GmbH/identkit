@@ -118,7 +118,7 @@ export function isSameOriginCeremony(clientDataJSON: unknown): boolean {
   try {
     const parsed: unknown = JSON.parse(isoBase64URL.toUTF8String(clientDataJSON));
     if (!parsed || typeof parsed !== "object") return false;
-    return Reflect.get(parsed, "crossOrigin") !== true && !("topOrigin" in parsed);
+    return !Reflect.get(parsed, "crossOrigin") && !("topOrigin" in parsed);
   } catch {
     return false;
   }

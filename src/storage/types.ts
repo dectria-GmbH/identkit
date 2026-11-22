@@ -122,7 +122,9 @@ export interface EnrollmentTokenRecord {
   consumedAt: Date | null;
 }
 
-export type VerificationStatus = "pending" | "verified" | "failed" | "expired" | "conflict";
+/** `processing`: the vendor reported success and identkit is linking the person. */
+export type VerificationStatus =
+  "pending" | "processing" | "verified" | "failed" | "expired" | "conflict";
 
 export interface VerificationRecord {
   id: string;
@@ -221,8 +223,11 @@ export interface IdentkitStore {
   };
   challenges: {
     insert(challenge: ChallengeRecord): Promise<void>;
-    /** Atomically removes and returns the challenge with this digest. */
-    consumeByDigest(digest: string): Promise<ChallengeRecord | null>;
+    /**
+     * Atomically removes and returns the challenge with this digest and purpose. A challenge
+     * of another purpose stays, so one ceremony cannot destroy another one's challenge.
+     */
+    consumeByDigest(digest: string, purpose: ChallengePurpose): Promise<ChallengeRecord | null>;
   };
   enrollment: {
     insert(token: EnrollmentTokenRecord): Promise<void>;
@@ -235,8 +240,16 @@ export interface IdentkitStore {
     findById(id: string): Promise<VerificationRecord | null>;
     findByVendorReference(reference: string): Promise<VerificationRecord | null>;
     setVendorReference(id: string, reference: string): Promise<void>;
-    /** Moves a verified verification to `conflict` with the given reason. */
-    markConflict(id: string, reason: string): Promise<void>;
+    /** Moves a pending verification to `processing`. Returns false if it was not pending. */
+    claim(id: string): Promise<boolean>;
+    /** Moves a processing verification to a final state. Returns false if it was not processing. */
+    finalize(
+      id: string,
+      update: Pick<
+        VerificationRecord,
+        "status" | "assuranceLevel" | "evidenceReference" | "failureReason" | "completedAt"
+      >,
+    ): Promise<boolean>;
     /** Moves a pending verification to a final state. Returns false if it was not pending. */
     complete(
       id: string,

@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import { addSeconds } from "./clock.js";
 import type { Context } from "./context.js";
 import { randomId, randomToken } from "./crypto.js";
@@ -14,6 +15,10 @@ import {
   type AuthenticationResponseJSON,
   type RelyingParty,
 } from "./webauthn.js";
+
+function timingSafeEqualBytes(a: Uint8Array, b: Uint8Array): boolean {
+  return a.byteLength === b.byteLength && timingSafeEqual(a, b);
+}
 
 export interface ChallengeBinding {
   accountId: string | null;
@@ -49,6 +54,12 @@ export interface PasskeyCore {
     allowedCredentialIds?: string[];
   }): Promise<{ credential: CredentialRecord; account: AccountRecord; counter: number } | null>;
   allowList(accountId: string): Promise<{ id: string; transports: string[] }[]>;
+  /**
+   * True if the same credential (id, account and public key) is still registered and its
+   * account is active. Call it after writing the result of an assertion, so a revocation that
+   * raced with the ceremony cannot be missed.
+   */
+  isStillCurrent(credential: CredentialRecord): Promise<boolean>;
 }
 
 export function createPasskeyCore(ctx: Context): PasskeyCore {
@@ -85,9 +96,9 @@ export function createPasskeyCore(ctx: Context): PasskeyCore {
       if (!challenge) return null;
       const record = await store.challenges.consumeByDigest(
         await hasher.digest("webauthn-challenge", challenge),
+        purpose,
       );
       if (!record) return null;
-      if (record.purpose !== purpose) return null;
       if (clock.now().getTime() >= record.expiresAt.getTime()) return null;
       return { challenge, record };
     },
@@ -144,6 +155,19 @@ export function createPasskeyCore(ctx: Context): PasskeyCore {
       );
       if (!updated) return null;
       return { credential, account, counter: verified.newCounter };
+    },
+
+    async isStillCurrent(credential) {
+      const current = await store.credentials.findById(credential.id);
+      if (
+        !current ||
+        current.accountId !== credential.accountId ||
+        !timingSafeEqualBytes(current.publicKey, credential.publicKey)
+      ) {
+        return false;
+      }
+      const account = await store.accounts.findById(credential.accountId);
+      return account?.status === "active";
     },
 
     async allowList(accountId) {

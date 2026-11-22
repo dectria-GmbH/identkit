@@ -138,6 +138,18 @@ export function createStepUp(
         "step_up",
       );
       if (!issued) return failed(record.id, record.accountId, "passkey", "rotation");
+      // A revocation that raced with this ceremony must not leave a fresh step-up behind.
+      if (!(await core.isStillCurrent(verified.credential))) {
+        if (await store.sessions.revoke(record.id, clock.now(), "credential_revoked")) {
+          await ctx.emit({
+            type: "session.revoked",
+            accountId: record.accountId,
+            sessionId: record.id,
+            reason: "credential_revoked",
+          });
+        }
+        return failed(record.id, record.accountId, "passkey", "credential_revoked");
+      }
       await ctx.emit({
         type: "step_up.granted",
         sessionId: record.id,

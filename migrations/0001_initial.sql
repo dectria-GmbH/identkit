@@ -109,7 +109,8 @@ CREATE TABLE identkit_verifications (
   id text PRIMARY KEY,
   account_id text NOT NULL REFERENCES identkit_accounts (id) ON DELETE CASCADE,
   vendor_reference text UNIQUE,
-  status text NOT NULL CHECK (status IN ('pending', 'verified', 'failed', 'expired', 'conflict')),
+  status text NOT NULL
+    CHECK (status IN ('pending', 'processing', 'verified', 'failed', 'expired', 'conflict')),
   assurance_level text CHECK (assurance_level IN ('low', 'substantial', 'high')),
   evidence_reference text,
   failure_reason text,

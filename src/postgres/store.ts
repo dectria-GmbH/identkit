@@ -114,7 +114,7 @@ const toVerification = (r: Row<"identkit_verifications">): VerificationRecord =>
   id: r.id,
   accountId: r.account_id,
   vendorReference: r.vendor_reference,
-  status: oneOf(r.status, ["pending", "verified", "failed", "expired", "conflict"]),
+  status: oneOf(r.status, ["pending", "processing", "verified", "failed", "expired", "conflict"]),
   assuranceLevel: oneOfOrNull(r.assurance_level, LEVELS),
   evidenceReference: r.evidence_reference,
   failureReason: r.failure_reason,
@@ -502,10 +502,11 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           })
           .execute();
       },
-      async consumeByDigest(digest) {
+      async consumeByDigest(digest, purpose) {
         const r = await db
           .deleteFrom("identkit_challenges")
           .where("challenge_digest", "=", digest)
+          .where("purpose", "=", purpose)
           .returningAll()
           .executeTakeFirst();
         return r ? toChallenge(r) : null;
@@ -603,13 +604,31 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           .where("id", "=", id)
           .execute();
       },
-      async markConflict(id, reason) {
-        await db
+      async claim(id) {
+        const row = await db
           .updateTable("identkit_verifications")
-          .set({ status: "conflict", failure_reason: reason })
+          .set({ status: "processing" })
           .where("id", "=", id)
-          .where("status", "=", "verified")
-          .execute();
+          .where("status", "=", "pending")
+          .returning("id")
+          .executeTakeFirst();
+        return row !== undefined;
+      },
+      async finalize(id, u) {
+        const row = await db
+          .updateTable("identkit_verifications")
+          .set({
+            status: u.status,
+            assurance_level: u.assuranceLevel,
+            evidence_reference: u.evidenceReference,
+            failure_reason: u.failureReason,
+            completed_at: u.completedAt,
+          })
+          .where("id", "=", id)
+          .where("status", "=", "processing")
+          .returning("id")
+          .executeTakeFirst();
+        return row !== undefined;
       },
       async complete(id, u) {
         const row = await db

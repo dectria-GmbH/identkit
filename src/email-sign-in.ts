@@ -74,8 +74,11 @@ export function createEmailSignIn(
       }
       const { account, created } = found;
 
-      const credentials = await store.credentials.listByAccount(account.id);
-      if (policy.secondFactor === "passkey_if_enrolled" && credentials.length > 0) {
+      const needsPasskey = async () =>
+        policy.secondFactor === "passkey_if_enrolled" &&
+        (await store.credentials.listByAccount(account.id)).length > 0;
+
+      async function pendingSession(): Promise<EmailSignInResult> {
         const pending = await internals.create({
           accountId: account.id,
           state: "pending_second_factor",
@@ -94,12 +97,27 @@ export function createEmailSignIn(
         };
       }
 
+      if (await needsPasskey()) return pendingSession();
+
       const issued = await internals.create({
         accountId: account.id,
         state: "complete",
         authMethods: ["email_otp"],
         stepUp: { method: "email_otp", at: clock.now() },
       });
+      // A first passkey registered while this sign-in ran makes the second factor due: check
+      // again after the insert, so the race cannot yield a full session.
+      if (await needsPasskey()) {
+        if (await store.sessions.revoke(issued.session.id, clock.now(), "second_factor_due")) {
+          await ctx.emit({
+            type: "session.revoked",
+            accountId: account.id,
+            sessionId: issued.session.id,
+            reason: "second_factor_due",
+          });
+        }
+        return pendingSession();
+      }
       return {
         status: "signed_in",
         account: toAccountView(account),

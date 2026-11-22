@@ -283,7 +283,7 @@ export function createPasskeys(
       });
       // A revocation of the passkey between the check above and the insert would miss this
       // session. Checking again after the insert closes that window.
-      if (!(await store.credentials.findById(verified.credential.id))) {
+      if (!(await core.isStillCurrent(verified.credential))) {
         await sessions.revokeById(issued.session.id, "credential_revoked");
         return signInFailed("credential_revoked", verified.account.id);
       }
@@ -329,6 +329,10 @@ export function createPasskeys(
         "second_factor",
       );
       if (!issued) return signInFailed("rotation", record.accountId);
+      if (!(await core.isStillCurrent(verified.credential))) {
+        await sessions.revokeById(record.id, "credential_revoked");
+        return signInFailed("credential_revoked", record.accountId);
+      }
       return { status: "signed_in", account: toAccountView(verified.account), ...issued };
     },
 

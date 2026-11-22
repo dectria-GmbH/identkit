@@ -283,8 +283,10 @@ export function runStoreContract(
         createdAt: T0,
         expiresAt: addSeconds(T0, 60),
       });
+      // Another purpose does not consume it.
+      expect(await store.challenges.consumeByDigest(digest, "sign_in")).toBeNull();
       const results = await Promise.all(
-        Array.from({ length: 5 }, () => store.challenges.consumeByDigest(digest)),
+        Array.from({ length: 5 }, () => store.challenges.consumeByDigest(digest, "approval")),
       );
       const found = results.filter((r) => r !== null);
       expect(found).toHaveLength(1);
@@ -339,14 +341,34 @@ export function runStoreContract(
         failureReason: null,
         completedAt: T0,
       };
-      expect(await store.verifications.complete(id, done)).toBe(true);
-      expect(await store.verifications.complete(id, { ...done, status: "failed" })).toBe(false);
-      expect((await store.verifications.findById(id))?.status).toBe("verified");
-      await store.verifications.markConflict(id, "person_linked_elsewhere");
-      expect(await store.verifications.findById(id)).toMatchObject({
-        status: "conflict",
-        failureReason: "person_linked_elsewhere",
+      // A pending verification is claimed once, then finalized once.
+      expect(await store.verifications.finalize(id, done)).toBe(false);
+      const claims = await Promise.all([
+        store.verifications.claim(id),
+        store.verifications.claim(id),
+      ]);
+      expect(claims.filter(Boolean)).toHaveLength(1);
+      expect((await store.verifications.findById(id))?.status).toBe("processing");
+      expect(await store.verifications.complete(id, { ...done, status: "expired" })).toBe(false);
+      expect(await store.verifications.finalize(id, { ...done, status: "conflict" })).toBe(true);
+      expect(await store.verifications.finalize(id, done)).toBe(false);
+      expect((await store.verifications.findById(id))?.status).toBe("conflict");
+
+      const other = uid("ver");
+      await store.verifications.insert({
+        id: other,
+        accountId: a.id,
+        vendorReference: null,
+        status: "pending",
+        assuranceLevel: null,
+        evidenceReference: null,
+        failureReason: null,
+        createdAt: T0,
+        expiresAt: addSeconds(T0, 60),
+        completedAt: null,
       });
+      expect(await store.verifications.complete(other, { ...done, status: "expired" })).toBe(true);
+      expect(await store.verifications.claim(other)).toBe(false);
     });
   });
 }

@@ -168,6 +168,12 @@ export function createApprovals(
       });
       if (!verified) return failed("assertion", input.payloadHash, session.accountId);
 
+      // The proof is valid as of `verifiedAt`: the passkey is checked again at that moment, so a
+      // revocation that raced with the ceremony yields no proof.
+      const verifiedAt = clock.now();
+      if (!(await core.isStillCurrent(verified.credential))) {
+        return failed("credential_revoked", input.payloadHash, session.accountId);
+      }
       const origin = readClientField(input.response.response.clientDataJSON, "origin") ?? "";
       const proof: ApprovalProof = {
         version: 1,
@@ -179,7 +185,7 @@ export function createApprovals(
         rpId: core.rp.rpId,
         origin,
         counter: verified.counter,
-        verifiedAt: clock.now().toISOString(),
+        verifiedAt: verifiedAt.toISOString(),
         assertion: { ...input.response.response },
       };
       await ctx.emit({
