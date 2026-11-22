@@ -256,6 +256,48 @@ describe("passkey registration races", () => {
     );
   });
 
+  it("an error in the check after the activation still removes the passkey", async () => {
+    const { inner, store, hooks } = hookedStore();
+    const t = setup({ store });
+    const user = await t.signIn("person@example.org");
+    const start = await t.ik.passkeys.startRegistration({ sessionToken: user.token });
+    if (start.status !== "ok") throw new Error("denied");
+    const response = t.authenticator.register(start.options);
+    const sink = { ...t.audit };
+    hooks.beforeActivate = () => {
+      // The session idles out now; the check after the activation revokes it, and the audit
+      // event for that fails.
+      t.clock.advanceSeconds(testConfig.sessions.idleTimeoutSeconds);
+      t.audit.emit = (event) => {
+        if (event.type === "session.expired") throw new Error("audit sink down");
+        return sink.emit(event);
+      };
+      return Promise.resolve();
+    };
+    await expect(
+      t.ik.passkeys.finishRegistration({ sessionToken: user.token }, response),
+    ).rejects.toThrow("audit sink down");
+    expect(await inner.credentials.listByAccount(user.account.id)).toHaveLength(0);
+  });
+
+  it("a token rotation in another tab does not cancel the registration", async () => {
+    const { store, hooks } = hookedStore();
+    const t = setup({ store });
+    const user = await t.signIn("person@example.org");
+    const start = await t.ik.passkeys.startRegistration({ sessionToken: user.token });
+    if (start.status !== "ok") throw new Error("denied");
+    const response = t.authenticator.register(start.options);
+    let rotated: string | null = null;
+    hooks.beforeActivate = async () => {
+      rotated = (await t.ik.sessions.rotate(user.token))?.token ?? null;
+    };
+    expect(
+      (await t.ik.passkeys.finishRegistration({ sessionToken: user.token }, response)).status,
+    ).toBe("registered");
+    expect(rotated).not.toBeNull();
+    expect(await t.ik.sessions.validate(rotated ?? "")).not.toBeNull();
+  });
+
   it("a passkey cannot sign in before its registration completed", async () => {
     const { inner, store, hooks } = hookedStore();
     const t = setup({ store });

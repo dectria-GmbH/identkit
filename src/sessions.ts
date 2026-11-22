@@ -56,6 +56,8 @@ export interface SessionInternals {
     token: string,
     state: SessionState,
   ): Promise<{ record: SessionRecord; digest: string } | null>;
+  /** Like `load`, by session id. The session may have rotated its token since. */
+  loadById(sessionId: string, state: SessionState): Promise<SessionRecord | null>;
   /** Replaces the token of a live session with a new one and applies the change. */
   elevate(
     loaded: { record: SessionRecord; digest: string },
@@ -92,6 +94,19 @@ export function createSessions(ctx: Context): { sessions: Sessions; internals: S
     if (!isTokenShaped(token)) return null;
     const digest = await digestOf(token);
     const record = await store.sessions.findByTokenDigest(digest);
+    const live = await checkLive(record, state);
+    return live ? { record: live, digest } : null;
+  }
+
+  async function loadById(sessionId: string, state: SessionState) {
+    return checkLive(await store.sessions.findById(sessionId), state);
+  }
+
+  /** Applies revocation, state, timeouts and account status to a stored session. */
+  async function checkLive(
+    record: SessionRecord | null,
+    state: SessionState,
+  ): Promise<SessionRecord | null> {
     if (!record || record.revokedAt !== null || record.state !== state) return null;
     const now = clock.now();
     const expired =
@@ -120,7 +135,7 @@ export function createSessions(ctx: Context): { sessions: Sessions; internals: S
       }
       return null;
     }
-    return { record, digest };
+    return record;
   }
 
   async function create(input: Parameters<SessionInternals["create"]>[0]): Promise<IssuedSession> {
@@ -257,5 +272,5 @@ export function createSessions(ctx: Context): { sessions: Sessions; internals: S
     },
   };
 
-  return { sessions, internals: { create, load, elevate, view } };
+  return { sessions, internals: { create, load, loadById, elevate, view } };
 }

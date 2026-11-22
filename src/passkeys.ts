@@ -154,11 +154,11 @@ export function createPasskeys(
     const account = await store.accounts.findById(accountId);
     if (!account || account.status !== "active") return { status: "denied", reason: "no_session" };
     if (!("sessionToken" in grant)) return true;
-    const loaded = await internals.load(grant.sessionToken, "complete");
-    if (!loaded || loaded.record.id !== sessionId)
-      return { status: "denied", reason: "no_session" };
+    // By id: a token rotation in another tab is not a lost grant.
+    const live = sessionId === null ? null : await internals.loadById(sessionId, "complete");
+    if (!live) return { status: "denied", reason: "no_session" };
     const others = (await store.credentials.listByAccount(accountId)).filter((c) => c.id !== newId);
-    if (!hasFreshStepUp(loaded.record, others.length > 0)) {
+    if (!hasFreshStepUp(live, others.length > 0)) {
       return { status: "denied", reason: "step_up_required" };
     }
     return true;
@@ -287,16 +287,26 @@ export function createPasskeys(
       }
       // A revocation between the check and the activation would be missed: check once more.
       // The passkey was usable for a moment, so on failure every session of the account ends;
-      // a sign-in that raced with the delete is caught by its own re-check.
-      const stillHolds = await grantStillHolds(
-        grant,
-        resolved.sessionId,
-        account.id,
-        verified.credentialId,
-      );
-      if (stillHolds !== true) {
+      // a sign-in that raced with the delete is caught by its own re-check. An error on the way
+      // takes the same exit before it propagates.
+      const undo = async () => {
         await store.credentials.delete(verified.credentialId, account.id, verified.publicKey);
         await sessions.revokeAll(account.id);
+      };
+      let stillHolds: true | RegistrationDenied;
+      try {
+        stillHolds = await grantStillHolds(
+          grant,
+          resolved.sessionId,
+          account.id,
+          verified.credentialId,
+        );
+      } catch (error) {
+        await undo();
+        throw error;
+      }
+      if (stillHolds !== true) {
+        await undo();
         await ctx.emit({
           type: "passkey.registration_failed",
           accountId: account.id,
