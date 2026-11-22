@@ -1,0 +1,7 @@
+{
+  "name": "identkit",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Identity toolkit for TypeScript: accounts, passkeys, OIDC, token issuance and delegated agent identities.",
+  "license": "UNLICENSED"
+}
