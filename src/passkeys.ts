@@ -144,6 +144,26 @@ export function createPasskeys(
     return { ok: true, account, sessionId: null, enrollmentTokenDigest: digest };
   }
 
+  /** Applies the registration grant again, counting only the passkeys other than `newId`. */
+  async function grantStillHolds(
+    grant: RegistrationGrant,
+    sessionId: string | null,
+    accountId: string,
+    newId: string,
+  ): Promise<true | RegistrationDenied> {
+    const account = await store.accounts.findById(accountId);
+    if (!account || account.status !== "active") return { status: "denied", reason: "no_session" };
+    if (!("sessionToken" in grant)) return true;
+    const loaded = await internals.load(grant.sessionToken, "complete");
+    if (!loaded || loaded.record.id !== sessionId)
+      return { status: "denied", reason: "no_session" };
+    const others = (await store.credentials.listByAccount(accountId)).filter((c) => c.id !== newId);
+    if (!hasFreshStepUp(loaded.record, others.length > 0)) {
+      return { status: "denied", reason: "step_up_required" };
+    }
+    return true;
+  }
+
   const failRegistration = async (
     accountId: string,
     reason: string,
@@ -237,16 +257,34 @@ export function createPasskeys(
         });
         return { status: "failed", reason: "duplicate" };
       }
+      // The grant was checked before the insert. A revocation, a removed step-up passkey or a
+      // concurrent first registration in between must not leave this passkey behind.
+      const holds = await grantStillHolds(
+        grant,
+        resolved.sessionId,
+        account.id,
+        verified.credentialId,
+      );
+      if (holds !== true) {
+        await store.credentials.delete(verified.credentialId, account.id);
+        await ctx.emit({
+          type: "passkey.registration_failed",
+          accountId: account.id,
+          reason: "grant_changed",
+        });
+        return holds;
+      }
+      // Revoke first: if the audit sink fails afterwards, no other session survives.
+      const revokedSessions = await sessions.revokeAll(
+        account.id,
+        resolved.sessionId ? { exceptSessionId: resolved.sessionId } : undefined,
+      );
       await ctx.emit({
         type: "passkey.registered",
         accountId: account.id,
         credentialId: verified.credentialId,
         method: resolved.enrollmentTokenDigest ? "enrollment_token" : "session",
       });
-      const revokedSessions = await sessions.revokeAll(
-        account.id,
-        resolved.sessionId ? { exceptSessionId: resolved.sessionId } : undefined,
-      );
       return { status: "registered", credentialId: verified.credentialId, revokedSessions };
     },
 
@@ -355,26 +393,28 @@ export function createPasskeys(
         return { status: "denied", reason: "step_up_required" };
       const removed = await store.credentials.delete(credentialId, loaded.record.accountId);
       if (!removed) return { status: "denied", reason: "not_found" };
+      // Revoke first: if the audit sink fails afterwards, no other session survives.
+      await sessions.revokeAll(loaded.record.accountId, { exceptSessionId: loaded.record.id });
       await ctx.emit({
         type: "passkey.removed",
         accountId: loaded.record.accountId,
         credentialId,
         sessionId: loaded.record.id,
       });
-      await sessions.revokeAll(loaded.record.accountId, { exceptSessionId: loaded.record.id });
       return { status: "removed" };
     },
 
     async revoke(accountId, credentialId) {
       const removed = await store.credentials.delete(credentialId, accountId);
       if (!removed) return false;
+      // Revoke first: if the audit sink fails afterwards, no session survives.
+      await sessions.revokeAll(accountId);
       await ctx.emit({
         type: "passkey.removed",
         accountId,
         credentialId,
         reason: "administrative",
       });
-      await sessions.revokeAll(accountId);
       return true;
     },
 

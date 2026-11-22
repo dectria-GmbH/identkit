@@ -14,15 +14,28 @@ interface Hooks {
   beforeSessionInsert: ((session: SessionRecord) => Promise<void>) | null;
   /** If set, the next linkPerson call throws once. */
   failNextLink: boolean;
+  /** Runs once, right before a credential is inserted. */
+  beforeCredentialInsert: (() => Promise<void>) | null;
 }
 
 function hookedStore() {
   const inner = createMemoryStore();
-  const hooks: Hooks = { afterCounterUpdate: null, beforeSessionInsert: null, failNextLink: false };
+  const hooks: Hooks = {
+    afterCounterUpdate: null,
+    beforeSessionInsert: null,
+    failNextLink: false,
+    beforeCredentialInsert: null,
+  };
   const store: IdentkitStore = {
     ...inner,
     credentials: {
       ...inner.credentials,
+      insert: async (credential) => {
+        const hook = hooks.beforeCredentialInsert;
+        hooks.beforeCredentialInsert = null;
+        if (hook) await hook();
+        return inner.credentials.insert(credential);
+      },
       updateCounter: async (...args) => {
         const result = await inner.credentials.updateCounter(...args);
         const hook = hooks.afterCounterUpdate;
@@ -184,6 +197,78 @@ describe("races with a concurrent revocation", () => {
       "probe",
     );
     expect(sessions).toHaveLength(2);
+  });
+});
+
+describe("passkey registration races", () => {
+  it("a session revoked during the registration leaves no new passkey", async () => {
+    const { inner, store, hooks } = hookedStore();
+    const t = setup({ store });
+    const user = await t.signIn("person@example.org");
+    const start = await t.ik.passkeys.startRegistration({ sessionToken: user.token });
+    if (start.status !== "ok") throw new Error("denied");
+    const response = t.authenticator.register(start.options);
+    hooks.beforeCredentialInsert = async () => {
+      await t.ik.sessions.revokeAll(user.account.id);
+    };
+    expect(await t.ik.passkeys.finishRegistration({ sessionToken: user.token }, response)).toEqual({
+      status: "denied",
+      reason: "no_session",
+    });
+    expect(await inner.credentials.listByAccount(user.account.id)).toHaveLength(0);
+  });
+
+  it("a concurrent first registration makes a passkey step-up due for the other one", async () => {
+    const { inner, store, hooks } = hookedStore();
+    const t = setup({ store });
+    const user = await t.signIn("person@example.org");
+    const start = await t.ik.passkeys.startRegistration({ sessionToken: user.token });
+    if (start.status !== "ok") throw new Error("denied");
+    const response = t.authenticator.register(start.options);
+    hooks.beforeCredentialInsert = async () => {
+      await inner.credentials.insert({
+        id: "owner-first-passkey",
+        accountId: user.account.id,
+        publicKey: new Uint8Array([1]),
+        counter: 0,
+        transports: [],
+        deviceType: "multiDevice",
+        backedUp: true,
+        createdAt: t.clock.now(),
+        lastUsedAt: null,
+      });
+    };
+    expect(await t.ik.passkeys.finishRegistration({ sessionToken: user.token }, response)).toEqual({
+      status: "denied",
+      reason: "step_up_required",
+    });
+    const ids = (await inner.credentials.listByAccount(user.account.id)).map((c) => c.id);
+    expect(ids).toEqual(["owner-first-passkey"]);
+  });
+});
+
+describe("a failing audit sink does not skip session revocation", () => {
+  it("removing a passkey revokes the other sessions before the audit event", async () => {
+    const t = setup();
+    const user = await t.userWithPasskey("person@example.org");
+    t.clock.advanceSeconds(testConfig.emailOtp.resendCooldownSeconds);
+    const other = await t.signIn("person@example.org");
+    const start = await t.ik.stepUp.startPasskey(user.token);
+    if (start.status !== "ok") throw new Error("denied");
+    const granted = await t.ik.stepUp.finishPasskey(
+      user.token,
+      t.authenticator.assert(start.options),
+    );
+    if (granted.status !== "granted") throw new Error("not granted");
+    const sink = { ...t.audit };
+    t.audit.emit = (event) => {
+      if (event.type === "passkey.removed") throw new Error("audit sink down");
+      return sink.emit(event);
+    };
+    await expect(t.ik.passkeys.remove(granted.token, user.credentialId)).rejects.toThrow(
+      "audit sink down",
+    );
+    expect(await t.ik.sessions.validate(other.token)).toBeNull();
   });
 });
 

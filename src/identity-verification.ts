@@ -154,16 +154,10 @@ export function createIdentityVerification(ctx: Context): IdentityVerification {
     if (record.status === "processing") {
       // An earlier call claimed a success but did not finish, for example after a store error.
       if (!record.vendorReference) return record;
+      // Another call may still be linking. Only a success is acted on; anything else waits.
       const retry = await adapter().fetchResult(record.vendorReference);
       if (retry.status === "verified") return linkAndFinalize(record, retry, now);
-      await store.verifications.finalize(record.id, {
-        status: "failed",
-        assuranceLevel: null,
-        evidenceReference: null,
-        failureReason: "vendor_result_changed",
-        completedAt: now,
-      });
-      return (await store.verifications.findById(record.id)) ?? record;
+      return record;
     }
 
     const final = { completedAt: now };
