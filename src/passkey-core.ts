@@ -98,7 +98,8 @@ export function createPasskeyCore(ctx: Context): PasskeyCore {
         await hasher.digest("webauthn-challenge", challenge),
         purpose,
       );
-      if (!record) return null;
+      // The store filters by purpose; checking again guards against a faulty store.
+      if (!record || record.purpose !== purpose) return null;
       if (clock.now().getTime() >= record.expiresAt.getTime()) return null;
       return { challenge, record };
     },
