@@ -42,11 +42,10 @@ function encodeCbor(value: CborValue): Buffer {
 
 const sha256 = (data: Uint8Array | string) => createHash("sha256").update(data).digest();
 
-function clientData(type: string, challenge: string, origin: string): string {
-  return Buffer.from(
-    JSON.stringify({ type, challenge, origin, crossOrigin: false }),
-    "utf8",
-  ).toString("base64url");
+function clientData(type: string, challenge: string, origin: string, crossOrigin = false): string {
+  return Buffer.from(JSON.stringify({ type, challenge, origin, crossOrigin }), "utf8").toString(
+    "base64url",
+  );
 }
 
 const FLAG_UP = 0x01;
@@ -70,6 +69,7 @@ export interface AssertOverrides {
   /** Challenge to sign instead of the one in the options. */
   challenge?: string;
   type?: string;
+  crossOrigin?: boolean;
 }
 
 export interface SoftwareAuthenticatorOptions {
@@ -174,6 +174,7 @@ export function createSoftwareAuthenticator(
         overrides.type ?? "webauthn.get",
         overrides.challenge ?? request.challenge,
         overrides.origin ?? options.origin,
+        overrides.crossOrigin ?? false,
       );
       const signature = sign(
         "sha256",

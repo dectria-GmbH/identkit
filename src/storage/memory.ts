@@ -274,6 +274,14 @@ export function createMemoryStore(): IdentkitStore {
         if (found) found.vendorReference = reference;
         return Promise.resolve();
       },
+      markConflict(id, reason) {
+        const found = verifications.get(id);
+        if (found?.status === "verified") {
+          found.status = "conflict";
+          found.failureReason = reason;
+        }
+        return Promise.resolve();
+      },
       complete(id, update) {
         const found = verifications.get(id);
         if (!found || found.status !== "pending") return Promise.resolve(false);

@@ -47,8 +47,12 @@ export const identkitConfigSchema = z
             maxFailures: z.number().int().min(1).max(MAX_ADDRESS_FAILURES),
             windowSeconds: seconds(60, DAY),
             lockSeconds: seconds(60, DAY),
+            maxLockSeconds: seconds(60, 30 * DAY),
           })
-          .strict(),
+          .strict()
+          .refine((value) => value.maxLockSeconds >= value.lockSeconds, {
+            message: "maxLockSeconds must be at least lockSeconds",
+          }),
       })
       .strict(),
     sessions: z

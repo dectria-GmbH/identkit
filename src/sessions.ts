@@ -35,8 +35,12 @@ export interface Sessions {
   /** Issues a new token for the session and invalidates the old one. */
   rotate(token: string): Promise<IssuedSession | null>;
   revoke(token: string): Promise<boolean>;
+  /** Administrative: takes a bare id. Do not pass client input without your own check. */
   revokeById(sessionId: string, reason?: string): Promise<boolean>;
-  /** Revokes all sessions of an account, for example after a factor change or on sign-out everywhere. */
+  /**
+   * Administrative: revokes all sessions of an account, for example on sign-out everywhere.
+   * Takes a bare id. Do not pass client input without your own check.
+   */
   revokeAll(accountId: string, options?: { exceptSessionId?: string }): Promise<number>;
 }
 

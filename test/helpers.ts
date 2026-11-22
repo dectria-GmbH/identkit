@@ -24,7 +24,12 @@ export const testConfig = {
     codeTtlSeconds: 600,
     maxAttemptsPerCode: 5,
     resendCooldownSeconds: 30,
-    addressLockout: { maxFailures: 10, windowSeconds: 900, lockSeconds: 900 },
+    addressLockout: {
+      maxFailures: 10,
+      windowSeconds: 900,
+      lockSeconds: 900,
+      maxLockSeconds: 86_400,
+    },
   },
   sessions: { idleTimeoutSeconds: 900, absoluteTimeoutSeconds: 43_200, pendingTimeoutSeconds: 300 },
   stepUp: { validitySeconds: 300 },

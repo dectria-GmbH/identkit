@@ -195,5 +195,13 @@ describe("approval proofs", () => {
         origins: ["https://other.example"],
       }),
     ).toBe(false);
+    for (const edited of [
+      { ...result.proof, accountId: "another-account" },
+      { ...result.proof, origin: "https://other.example" },
+      { ...result.proof, counter: result.proof.counter + 1 },
+      { ...result.proof, rpId: "other.example" },
+    ]) {
+      expect(await verifyApprovalEvidence(edited, verifier)).toBe(false);
+    }
   });
 });

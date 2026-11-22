@@ -49,6 +49,7 @@ export interface ThrottleRule {
   maxFailures: number;
   windowSeconds: number;
   lockSeconds: number;
+  maxLockSeconds: number;
 }
 
 export type SessionState = "pending_second_factor" | "complete";
@@ -234,6 +235,8 @@ export interface IdentkitStore {
     findById(id: string): Promise<VerificationRecord | null>;
     findByVendorReference(reference: string): Promise<VerificationRecord | null>;
     setVendorReference(id: string, reference: string): Promise<void>;
+    /** Moves a verified verification to `conflict` with the given reason. */
+    markConflict(id: string, reason: string): Promise<void>;
     /** Moves a pending verification to a final state. Returns false if it was not pending. */
     complete(
       id: string,

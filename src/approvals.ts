@@ -60,10 +60,13 @@ export interface Approvals {
   }): Promise<VerifyApprovalResult>;
 }
 
-/** The challenge for an approval: SHA-256 over a domain label, the nonce and the payload hash. */
-export function approvalChallenge(nonce: string, payloadHash: string): string {
+/**
+ * The challenge for an approval: SHA-256 over a domain label, the nonce, the payload hash
+ * and the account id. The signature therefore covers who approves what.
+ */
+export function approvalChallenge(nonce: string, payloadHash: string, accountId: string): string {
   return createHash("sha256")
-    .update(`${APPROVAL_DOMAIN}\u0000${nonce}\u0000${payloadHash}`, "utf8")
+    .update(`${APPROVAL_DOMAIN}\u0000${nonce}\u0000${payloadHash}\u0000${accountId}`, "utf8")
     .digest("base64url");
 }
 
@@ -103,6 +106,7 @@ export function createApprovals(
       const allow = await core.allowList(loaded.record.accountId);
       if (allow.length === 0) return { status: "denied", reason: "no_passkey" };
       const nonce = randomBytes(32).toString("base64url");
+      const challenge = approvalChallenge(nonce, input.payloadHash, loaded.record.accountId);
       const { record } = await core.issueChallenge(
         "approval",
         {
@@ -111,7 +115,7 @@ export function createApprovals(
           payloadHash: input.payloadHash,
           nonce,
         },
-        approvalChallenge(nonce, input.payloadHash),
+        challenge,
       );
       await ctx.emit({
         type: "approval.challenge_created",
@@ -122,7 +126,7 @@ export function createApprovals(
       });
       const options = await authenticationOptions({
         rp: core.rp,
-        challenge: approvalChallenge(nonce, input.payloadHash),
+        challenge,
         timeoutSeconds: config.webauthn.challengeTtlSeconds,
         allow,
       });
@@ -149,7 +153,11 @@ export function createApprovals(
         return failed("challenge", input.payloadHash, session.accountId);
       }
       // The challenge the person signed must commit to the payload hash given now.
-      const expectedChallenge = approvalChallenge(consumed.record.nonce, input.payloadHash);
+      const expectedChallenge = approvalChallenge(
+        consumed.record.nonce,
+        input.payloadHash,
+        session.accountId,
+      );
       if (expectedChallenge !== consumed.challenge) {
         return failed("payload_mismatch", input.payloadHash, session.accountId);
       }
@@ -188,21 +196,25 @@ export function createApprovals(
 }
 
 /**
- * Checks an approval proof again, without storage: the challenge commits to the payload
- * hash, and the signature verifies with the credential's public key under the RP ID and
- * origins. It does not check the signature counter or whether the credential is still
- * registered; the caller decides what those mean for old evidence.
+ * Checks an approval proof again, without storage. It checks that the signed challenge
+ * commits to the payload hash and the account id, that the signature verifies with the given
+ * public key, and that RP ID, origin and counter in the proof match what was signed.
+ *
+ * It cannot check `verifiedAt`, nor that `credentialId` belonged to `accountId`: look up the
+ * public key through your own record of that account's credentials. It does not check
+ * whether the credential is still registered.
  */
 export async function verifyApprovalEvidence(
   proof: ApprovalProof,
   verifier: { credentialPublicKey: Uint8Array; rpId: string; origins: string[] },
 ): Promise<boolean> {
   if (proof.version !== 1 || !PAYLOAD_HASH_PATTERN.test(proof.payloadHash)) return false;
-  const expectedChallenge = approvalChallenge(proof.nonce, proof.payloadHash);
+  if (proof.rpId !== verifier.rpId) return false;
+  const expectedChallenge = approvalChallenge(proof.nonce, proof.payloadHash, proof.accountId);
   if (readClientChallenge(proof.assertion.clientDataJSON) !== expectedChallenge) return false;
   const rp: RelyingParty = { rpId: verifier.rpId, rpName: "", origins: verifier.origins };
   try {
-    await verifyAssertion({
+    const verified = await verifyAssertion({
       rp,
       response: {
         id: proof.credentialId,
@@ -218,7 +230,7 @@ export async function verifyApprovalEvidence(
         transports: [],
       },
     });
-    return true;
+    return verified.origin === proof.origin && verified.newCounter === proof.counter;
   } catch {
     return false;
   }

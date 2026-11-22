@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { MethodNotAllowedError } from "../src/index.js";
+import { createMemoryStore, MethodNotAllowedError } from "../src/index.js";
+import type { IdentkitStore } from "../src/storage/types.js";
 import { createSoftwareAuthenticator } from "../src/testing/index.js";
 import { ORIGIN, setup, testConfig } from "./helpers.js";
 
@@ -210,6 +211,15 @@ describe("passkey sign-in", () => {
     });
   });
 
+  it("rule: origin check - rejects an assertion made in a cross-origin frame", async () => {
+    const t = setup();
+    await t.userWithPasskey("person@example.org");
+    expect(await passkeySignIn(t, { crossOrigin: true })).toEqual({
+      status: "failed",
+      reason: "invalid",
+    });
+  });
+
   it("rejects an assertion for another RP ID", async () => {
     const t = setup();
     await t.userWithPasskey("person@example.org");
@@ -274,6 +284,37 @@ describe("passkey sign-in", () => {
     await t.userWithPasskey("person@example.org");
     expect((await passkeySignIn(t, { counter: 2 })).status).toBe("signed_in");
     expect((await passkeySignIn(t, { counter: 0 })).status).toBe("failed");
+  });
+
+  it("a passkey revoked while its sign-in is in flight yields no session", async () => {
+    const inner = createMemoryStore();
+    let revokeDuringInsert: (() => Promise<void>) | null = null;
+    const store: IdentkitStore = {
+      ...inner,
+      sessions: {
+        ...inner.sessions,
+        insert: async (session) => {
+          // The revocation runs completely between the assertion check and the insert.
+          if (revokeDuringInsert) await revokeDuringInsert();
+          return inner.sessions.insert(session);
+        },
+      },
+    };
+    const t = setup({ store });
+    const user = await t.userWithPasskey("person@example.org");
+    const { options } = await t.ik.passkeys.startSignIn();
+    const assertion = t.authenticator.assert(options);
+    revokeDuringInsert = async () => {
+      revokeDuringInsert = null;
+      await t.ik.passkeys.revoke(user.account.id, user.credentialId);
+    };
+    expect(await t.ik.passkeys.finishSignIn(assertion)).toEqual({
+      status: "failed",
+      reason: "invalid",
+    });
+    const live = (await inner.sessions.revokeAllForAccount(user.account.id, t.clock.now(), "probe"))
+      .length;
+    expect(live).toBe(0);
   });
 
   it("a disabled account cannot sign in with its passkey", async () => {

@@ -14,7 +14,9 @@ export type CodeFailure = { status: "failed"; reason: "invalid" | "expired" | "l
 
 export type CheckCodeResult = { status: "verified"; flow: OtpFlowRecord } | CodeFailure;
 
-const throttleKey = (addressDigest: string) => `otp:${addressDigest}`;
+/** Failures count per address and purpose, so step-up use does not affect sign-in. */
+const throttleKey = (purpose: OtpPurpose, addressDigest: string) =>
+  `otp:${purpose}:${addressDigest}`;
 
 const CODE_PATTERN = new RegExp(`^[0-9]{${OTP_DIGITS}}$`);
 const FLOW_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
@@ -74,7 +76,7 @@ export function createOtpEngine(ctx: Context): OtpEngine {
     const addressDigest = await hasher.digest("address", email);
     const now = clock.now();
 
-    const lockedUntil = await store.throttle.peek(throttleKey(addressDigest), now);
+    const lockedUntil = await store.throttle.peek(throttleKey(input.purpose, addressDigest), now);
     if (lockedUntil) {
       await ctx.emit({
         type: "otp.send_refused",
@@ -160,7 +162,7 @@ export function createOtpEngine(ctx: Context): OtpEngine {
     }
 
     const now = clock.now();
-    const addressKey = throttleKey(flow.addressDigest);
+    const addressKey = throttleKey(flow.purpose, flow.addressDigest);
     if (await store.throttle.peek(addressKey, now)) {
       return fail("locked", "address_locked", flow);
     }

@@ -60,13 +60,18 @@ const session = await identkit.sessions.validate(tokenFromCookie);
   `revoke(token)`, `revokeById(id)`, `revokeAll(accountId, { exceptSessionId })`.
 - `approvals`: `start({ sessionToken, payloadHash })`,
   `verify({ sessionToken, payloadHash, response })`.
-- `accounts` (administrative): `create({ email })`, `get(id)`, `findByEmail(email)`,
-  `disable(id)`.
+- `accounts`: `create({ email })`, `get(id)`, `findByEmail(email)`, `disable(id)`.
 - `identityVerification`: `start({ accountId, returnUrl })`, `handleCallback(payload)`,
   `refresh(verificationId)`, `get(verificationId)`.
 
+Administrative calls take bare ids and trust their caller. Expose them only to privileged code,
+or check ownership yourself before you pass client input: all of `accounts`,
+`passkeys.list`, `passkeys.revoke`, `passkeys.issueEnrollmentToken`, `sessions.revokeById`,
+`sessions.revokeAll`, `identityVerification.start`, `identityVerification.refresh` and
+`identityVerification.get`.
+
 Standalone functions: `verifyApprovalEvidence(proof, verifier)`, `hashPayload(payload)`,
-`approvalChallenge(nonce, payloadHash)`, `normalizeEmail(input)`, `parseConfig(input)`.
+`approvalChallenge(nonce, payloadHash, accountId)`, `normalizeEmail(input)`, `parseConfig(input)`.
 
 Subpath `identkit/postgres`: `createPostgresStore(db)`, `migrateIdentkit(db)`, `MIGRATIONS_DIR`.
 
@@ -100,21 +105,22 @@ Every time and limit value is required configuration. identkit has no hidden def
 example values below are what the tests use. Values marked "assumption" are not confirmed by a
 standard or an owner decision; choose your own from your risk analysis.
 
-| Setting                                 | Example | Bounds enforced                          | Source                                                                                                         |
-| --------------------------------------- | ------- | ---------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `emailOtp.codeTtlSeconds`               | 600     | 60 to 600                                | Upper bound: OWASP ASVS 5.0.0 6.5.5 (out-of-band codes at most 10 minutes). Value: assumption at the bound.    |
-| `emailOtp.maxAttemptsPerCode`           | 5       | 1 to 10                                  | Assumption                                                                                                     |
-| `emailOtp.resendCooldownSeconds`        | 30      | 1 to 3600                                | Assumption                                                                                                     |
-| `emailOtp.addressLockout.maxFailures`   | 10      | 1 to 100                                 | Upper bound: NIST SP 800-63B-4 (at most 100 consecutive failed attempts per authenticator). Value: assumption. |
-| `emailOtp.addressLockout.windowSeconds` | 900     | 60 to 86400                              | Assumption                                                                                                     |
-| `emailOtp.addressLockout.lockSeconds`   | 900     | 60 to 86400                              | Assumption                                                                                                     |
-| `sessions.idleTimeoutSeconds`           | 900     | 60 to 86400                              | Assumption (ASVS 7.3.1 asks for a documented inactivity timeout, no value)                                     |
-| `sessions.absoluteTimeoutSeconds`       | 43200   | 60 to 30 days, at least the idle timeout | Assumption (ASVS 7.3.2 asks for a documented maximum lifetime, no value)                                       |
-| `sessions.pendingTimeoutSeconds`        | 300     | 30 to 3600                               | Assumption                                                                                                     |
-| `stepUp.validitySeconds`                | 300     | 30 to 3600                               | Assumption                                                                                                     |
-| `webauthn.challengeTtlSeconds`          | 300     | 30 to 600                                | Assumption                                                                                                     |
-| `identityVerification.timeoutSeconds`   | 1800    | 60 to 7 days                             | Assumption                                                                                                     |
-| `enrollment.tokenTtlSeconds`            | 86400   | 60 to 7 days                             | Assumption                                                                                                     |
+| Setting                                  | Example | Bounds enforced                          | Source                                                                                                                   |
+| ---------------------------------------- | ------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `emailOtp.codeTtlSeconds`                | 600     | 60 to 600                                | Upper bound: OWASP ASVS 5.0.0 6.5.5 (out-of-band codes at most 10 minutes). Value: assumption at the bound.              |
+| `emailOtp.maxAttemptsPerCode`            | 5       | 1 to 10                                  | Assumption                                                                                                               |
+| `emailOtp.resendCooldownSeconds`         | 30      | 1 to 3600                                | Assumption                                                                                                               |
+| `emailOtp.addressLockout.maxFailures`    | 10      | 1 to 100                                 | Upper bound taken from NIST SP 800-63B-4 (at most 100 consecutive failed attempts per authenticator). Value: assumption. |
+| `emailOtp.addressLockout.windowSeconds`  | 900     | 60 to 86400                              | Assumption                                                                                                               |
+| `emailOtp.addressLockout.lockSeconds`    | 900     | 60 to 86400                              | Assumption                                                                                                               |
+| `emailOtp.addressLockout.maxLockSeconds` | 86400   | 60 to 30 days, at least `lockSeconds`    | Assumption                                                                                                               |
+| `sessions.idleTimeoutSeconds`            | 900     | 60 to 86400                              | Assumption (ASVS 7.3.1 asks for a documented inactivity timeout, no value)                                               |
+| `sessions.absoluteTimeoutSeconds`        | 43200   | 60 to 30 days, at least the idle timeout | Assumption (ASVS 7.3.2 asks for a documented maximum lifetime, no value)                                                 |
+| `sessions.pendingTimeoutSeconds`         | 300     | 30 to 3600                               | Assumption                                                                                                               |
+| `stepUp.validitySeconds`                 | 300     | 30 to 3600                               | Assumption                                                                                                               |
+| `webauthn.challengeTtlSeconds`           | 300     | 30 to 600                                | Assumption                                                                                                               |
+| `identityVerification.timeoutSeconds`    | 1800    | 60 to 7 days                             | Assumption                                                                                                               |
+| `enrollment.tokenTtlSeconds`             | 86400   | 60 to 7 days                             | Assumption                                                                                                               |
 
 Fixed values:
 
@@ -137,9 +143,18 @@ E-mail codes:
 - A code is stored as an HMAC over the flow id, purpose, address, session and code. It works
   once, for the flow that requested it, until it expires. Attempts are counted before the
   comparison, so concurrent guesses cannot exceed the limit. After the limit the flow locks.
-- Failed attempts are also counted per address across flows. After the limit the address locks
-  for `lockSeconds`, for known and unknown addresses alike. A person who can request codes for an
-  address can trigger this lock: it trades a denial of service for brute-force protection.
+- Failed attempts are also counted per address and purpose across flows. After `maxFailures`
+  in one window the address locks for `lockSeconds`, for known and unknown addresses alike. Each
+  further lock without a success in between lasts twice as long, up to `maxLockSeconds`. A
+  success resets the count. So guesses per address shrink over time, but they never reach zero:
+  identkit does not disable an address for good after 100 failures, as NIST SP 800-63B-4 asks of
+  an authenticator, because anyone who can request codes for an address could then lock its
+  owner out for good.
+- A person who can request codes for an address can trigger a lock: it trades a denial of
+  service for brute-force protection.
+- identkit limits per address only. Add rate limits per client and in total in your HTTP layer:
+  an attacker who guesses against many addresses at once is not limited by the per-address
+  count.
 - A new code for the same address and purpose supersedes the previous one. The resend cooldown
   applies per address and purpose.
 - The mail sender receives only the recipient, the code, the purpose and the lifetime.
@@ -161,16 +176,20 @@ Passkeys:
   passkey step-up. An enrollment token (single use, for onboarding or recovery) also allows
   registration. Adding or removing a passkey revokes the other sessions of the account.
 - Every challenge is single use, bound to its purpose and session, and expires.
-- Assertions need user verification, a configured origin and the RP ID. The signature counter
-  must increase unless the authenticator always reports zero.
+- Assertions need user verification, a configured origin and the RP ID. Ceremonies in a
+  cross-origin frame are refused. The signature counter must increase unless the authenticator
+  always reports zero.
+- A passkey sign-in that races with the revocation of that passkey yields no session.
 
 Approval proofs:
 
-- The challenge is `SHA-256("identkit/approval/v1" || nonce || payloadHash)`. The person signs
-  it with a passkey of the session's account. `verify` recomputes the challenge from the payload
-  hash it receives, so a signature for one payload cannot approve another.
+- The challenge is `SHA-256("identkit/approval/v1" || nonce || payloadHash || accountId)`. The
+  person signs it with a passkey of the session's account. `verify` recomputes the challenge from
+  the payload hash it receives, so a signature for one payload cannot approve another.
 - The proof holds the raw assertion and the nonce. `verifyApprovalEvidence` checks it again
-  later with the stored public key, without storage.
+  later with a public key you supply: challenge, signature, RP ID, origin and counter. It cannot
+  check `verifiedAt`, and it cannot know that `credentialId` belonged to `accountId`: take the
+  public key from your own record of that account's credentials.
 
 One account per person:
 

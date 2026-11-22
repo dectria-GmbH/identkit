@@ -33,6 +33,7 @@ export interface IdentkitDatabase {
     window_start: Date;
     attempts: number;
     locked_until: Date | null;
+    lock_count: number;
   };
   identkit_sessions: {
     id: string;

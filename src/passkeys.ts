@@ -70,6 +70,7 @@ export interface Passkeys {
     pendingToken: string,
     response: AuthenticationResponseJSON,
   ): Promise<PasskeySignInResult>;
+  /** Administrative: takes a bare id. Do not pass client input without your own check. */
   list(accountId: string): Promise<PasskeyInfo[]>;
   /**
    * Removes a passkey of the session's account. Needs a fresh passkey step-up. Revokes all
@@ -280,6 +281,12 @@ export function createPasskeys(
         authMethods: ["passkey"],
         stepUp: { method: "passkey", at: clock.now() },
       });
+      // A revocation of the passkey between the check above and the insert would miss this
+      // session. Checking again after the insert closes that window.
+      if (!(await store.credentials.findById(verified.credential.id))) {
+        await sessions.revokeById(issued.session.id, "credential_revoked");
+        return signInFailed("credential_revoked", verified.account.id);
+      }
       return { status: "signed_in", account: toAccountView(verified.account), ...issued };
     },
 

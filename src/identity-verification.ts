@@ -55,9 +55,17 @@ export interface IdentityVerification {
   }): Promise<{ verificationId: string; redirectUrl?: string; expiresAt: Date }>;
   /** Handles a vendor callback: authenticates it through the adapter, then refreshes. */
   handleCallback(payload: unknown): Promise<VerificationView>;
-  /** Asks the vendor for the current result, and applies the timeout. */
+  /**
+   * Asks the vendor for the current result, and applies the timeout. `refresh` and `get` take
+   * a bare id: check that the caller owns the verification before you pass client input.
+   */
   refresh(verificationId: string): Promise<VerificationView | null>;
   get(verificationId: string): Promise<VerificationView | null>;
+}
+
+/** Vendor reasons are free text; audit events get them only if they look like a code. */
+function auditReason(reason: string): string {
+  return /^[a-z0-9_]{1,64}$/.test(reason) ? reason : "vendor_reason";
 }
 
 const view = (record: VerificationRecord): VerificationView => ({
@@ -99,7 +107,7 @@ export function createIdentityVerification(ctx: Context): IdentityVerification {
       type,
       accountId: record.accountId,
       verificationId: record.id,
-      ...(update.failureReason ? { reason: update.failureReason } : {}),
+      ...(update.failureReason ? { reason: auditReason(update.failureReason) } : {}),
     });
     return current;
   }
@@ -129,6 +137,15 @@ export function createIdentityVerification(ctx: Context): IdentityVerification {
         failureReason: result.reason.slice(0, 200),
       });
     }
+    // Claim the final state first, so a concurrent timeout and a link cannot both happen.
+    const claimed = await store.verifications.complete(record.id, {
+      ...final,
+      status: "verified",
+      assuranceLevel: result.assuranceLevel,
+      evidenceReference: result.evidenceReference,
+      failureReason: null,
+    });
+    if (!claimed) return (await store.verifications.findById(record.id)) ?? record;
     const personKeyDigest = await hasher.digest("person-key", result.personKey);
     const linked = await store.accounts.linkPerson(
       record.accountId,
@@ -136,22 +153,15 @@ export function createIdentityVerification(ctx: Context): IdentityVerification {
       result.assuranceLevel,
       now,
     );
-    if (linked === "person_linked_elsewhere" || linked === "account_has_other_person") {
-      return finish(record, {
-        ...final,
-        status: "conflict",
-        assuranceLevel: result.assuranceLevel,
-        evidenceReference: result.evidenceReference,
-        failureReason: linked,
-      });
-    }
-    return finish(record, {
-      ...final,
-      status: "verified",
-      assuranceLevel: result.assuranceLevel,
-      evidenceReference: result.evidenceReference,
-      failureReason: null,
+    const conflict = linked === "person_linked_elsewhere" || linked === "account_has_other_person";
+    if (conflict) await store.verifications.markConflict(record.id, linked);
+    await ctx.emit({
+      type: conflict ? "identity_verification.person_conflict" : "identity_verification.completed",
+      accountId: record.accountId,
+      verificationId: record.id,
+      ...(conflict ? { reason: linked } : {}),
     });
+    return (await store.verifications.findById(record.id)) ?? record;
   }
 
   return {

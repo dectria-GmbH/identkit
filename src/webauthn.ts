@@ -109,6 +109,21 @@ export function readClientField(
   return null;
 }
 
+/**
+ * True unless the client data says the ceremony ran in a cross-origin frame. identkit does
+ * not support embedding, so such a response is refused.
+ */
+export function isSameOriginCeremony(clientDataJSON: unknown): boolean {
+  if (typeof clientDataJSON !== "string" || clientDataJSON.length > 4096) return false;
+  try {
+    const parsed: unknown = JSON.parse(isoBase64URL.toUTF8String(clientDataJSON));
+    if (!parsed || typeof parsed !== "object") return false;
+    return Reflect.get(parsed, "crossOrigin") !== true && !("topOrigin" in parsed);
+  } catch {
+    return false;
+  }
+}
+
 /** Reads the challenge from the client data without trusting anything else in it. */
 export function readClientChallenge(clientDataJSON: unknown): string | null {
   return readClientField(clientDataJSON, "challenge");
@@ -194,6 +209,9 @@ export async function verifyRegistration(input: {
   );
   const fmt = attestation.get("fmt");
   if (fmt !== "none") throw new Error("unsupported attestation format");
+  if (!isSameOriginCeremony(input.response.response.clientDataJSON)) {
+    throw new Error("cross-origin ceremony");
+  }
 
   const result = await verifyRegistrationResponse({
     response: toLibraryRegistration(input.response),
@@ -225,6 +243,9 @@ export async function verifyAssertion(input: {
   expectedChallenge: Base64Url;
   credential: { id: Base64Url; publicKey: Uint8Array; transports: string[] };
 }): Promise<VerifiedAssertion> {
+  if (!isSameOriginCeremony(input.response.response.clientDataJSON)) {
+    throw new Error("cross-origin ceremony");
+  }
   const result = await verifyAuthenticationResponse({
     response: toLibraryAssertion(input.response),
     expectedChallenge: input.expectedChallenge,

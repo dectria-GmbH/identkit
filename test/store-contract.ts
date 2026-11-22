@@ -134,7 +134,7 @@ export function runStoreContract(
     it("throttle: locks after the limit, unlocks after the lock time, resets", async () => {
       const store = await factory();
       const key = uid("thr");
-      const rule = { maxFailures: 2, windowSeconds: 60, lockSeconds: 120 };
+      const rule = { maxFailures: 2, windowSeconds: 60, lockSeconds: 120, maxLockSeconds: 600 };
       expect((await store.throttle.reserve(key, T0, rule)).allowed).toBe(true);
       expect((await store.throttle.reserve(key, T0, rule)).allowed).toBe(true);
       const locked = await store.throttle.reserve(key, T0, rule);
@@ -152,10 +152,30 @@ export function runStoreContract(
       expect(await store.throttle.peek(key, T0)).toBeNull();
     });
 
+    it("throttle: repeated locks double up to the maximum, a reset clears the count", async () => {
+      const store = await factory();
+      const key = uid("thr");
+      const rule = { maxFailures: 1, windowSeconds: 60, lockSeconds: 100, maxLockSeconds: 300 };
+      let at = T0;
+      const lockLengths: number[] = [];
+      for (let i = 0; i < 4; i += 1) {
+        await store.throttle.reserve(key, at, rule);
+        const locked = await store.throttle.reserve(key, at, rule);
+        if (!locked.lockedUntil) throw new Error("not locked");
+        lockLengths.push((locked.lockedUntil.getTime() - at.getTime()) / 1000);
+        at = locked.lockedUntil;
+      }
+      expect(lockLengths).toEqual([100, 200, 300, 300]);
+      await store.throttle.reset(key);
+      await store.throttle.reserve(key, at, rule);
+      const again = await store.throttle.reserve(key, at, rule);
+      expect(((again.lockedUntil?.getTime() ?? 0) - at.getTime()) / 1000).toBe(100);
+    });
+
     it("throttle: concurrent attempts cannot exceed the limit", async () => {
       const store = await factory();
       const key = uid("thr");
-      const rule = { maxFailures: 3, windowSeconds: 60, lockSeconds: 60 };
+      const rule = { maxFailures: 3, windowSeconds: 60, lockSeconds: 60, maxLockSeconds: 60 };
       const results = await Promise.all(
         Array.from({ length: 10 }, () => store.throttle.reserve(key, T0, rule)),
       );
@@ -322,6 +342,11 @@ export function runStoreContract(
       expect(await store.verifications.complete(id, done)).toBe(true);
       expect(await store.verifications.complete(id, { ...done, status: "failed" })).toBe(false);
       expect((await store.verifications.findById(id))?.status).toBe("verified");
+      await store.verifications.markConflict(id, "person_linked_elsewhere");
+      expect(await store.verifications.findById(id)).toMatchObject({
+        status: "conflict",
+        failureReason: "person_linked_elsewhere",
+      });
     });
   });
 }

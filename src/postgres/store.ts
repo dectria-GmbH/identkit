@@ -292,22 +292,22 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
     throttle: {
       async reserve(key, at, rule) {
         return db.transaction().execute(async (trx) => {
-          await trx
-            .insertInto("identkit_throttles")
-            .values({ key, window_start: at, attempts: 0, locked_until: null })
-            .onConflict((oc) => oc.column("key").doNothing())
-            .execute();
+          // The no-op update makes the upsert return the row and hold its lock until commit,
+          // also when a concurrent reset deleted it in between.
           const row = await trx
-            .selectFrom("identkit_throttles")
-            .selectAll()
-            .where("key", "=", key)
-            .forUpdate()
+            .insertInto("identkit_throttles")
+            .values({ key, window_start: at, attempts: 0, locked_until: null, lock_count: 0 })
+            .onConflict((oc) =>
+              oc.column("key").doUpdateSet((eb) => ({ key: eb.ref("excluded.key") })),
+            )
+            .returningAll()
             .executeTakeFirstOrThrow();
           const { next, result } = applyThrottle(
             {
               windowStart: row.window_start,
               attempts: row.attempts,
               lockedUntil: row.locked_until,
+              lockCount: row.lock_count,
             },
             at,
             rule,
@@ -318,6 +318,7 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
               window_start: next.windowStart,
               attempts: next.attempts,
               locked_until: next.lockedUntil,
+              lock_count: next.lockCount,
             })
             .where("key", "=", key)
             .execute();
@@ -600,6 +601,14 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           .updateTable("identkit_verifications")
           .set({ vendor_reference: reference })
           .where("id", "=", id)
+          .execute();
+      },
+      async markConflict(id, reason) {
+        await db
+          .updateTable("identkit_verifications")
+          .set({ status: "conflict", failure_reason: reason })
+          .where("id", "=", id)
+          .where("status", "=", "verified")
           .execute();
       },
       async complete(id, u) {

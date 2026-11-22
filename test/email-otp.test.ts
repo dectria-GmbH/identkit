@@ -111,6 +111,70 @@ describe("e-mail code sign-in", () => {
     expect((await t.signIn(email)).status).toBe("signed_in");
   });
 
+  it("rule: address lockout - each further lock lasts twice as long until a success", async () => {
+    const t = setup();
+    const email = "person@example.org";
+    const { maxFailures, lockSeconds } = testConfig.emailOtp.addressLockout;
+    async function failUntilLocked() {
+      let failures = 0;
+      while (failures <= maxFailures) {
+        t.clock.advanceSeconds(testConfig.emailOtp.resendCooldownSeconds);
+        const { flowId, code } = await t.codeFor(email);
+        for (
+          let i = 0;
+          i < testConfig.emailOtp.maxAttemptsPerCode - 1 && failures <= maxFailures;
+          i += 1
+        ) {
+          await t.ik.emailSignIn.verifyCode({ flowId, code: otherCode(code) });
+          failures += 1;
+        }
+      }
+    }
+    await failUntilLocked();
+    t.clock.advanceSeconds(lockSeconds);
+    await failUntilLocked();
+    // Second lock: twice the base lock time.
+    t.clock.advanceSeconds(lockSeconds);
+    expect((await t.ik.emailSignIn.requestCode({ email })).status).toBe("locked");
+    t.clock.advanceSeconds(lockSeconds);
+    expect((await t.signIn(email)).status).toBe("signed_in");
+    // The success reset the count: the next lock is back to the base time.
+    t.clock.advanceSeconds(testConfig.emailOtp.resendCooldownSeconds);
+    await failUntilLocked();
+    t.clock.advanceSeconds(lockSeconds);
+    expect((await t.ik.emailSignIn.requestCode({ email })).status).toBe("sent");
+  });
+
+  it("rule: address lockout - sign-in and step-up failures are counted apart", async () => {
+    const t = setup();
+    const session = await t.signIn("person@example.org");
+    const { maxFailures } = testConfig.emailOtp.addressLockout;
+    let failures = 0;
+    while (failures <= maxFailures) {
+      t.clock.advanceSeconds(testConfig.emailOtp.resendCooldownSeconds);
+      const requested = await t.ik.stepUp.requestEmailCode(session.token);
+      if (requested.status !== "sent") break;
+      const code = t.mail.last()?.code ?? "";
+      for (
+        let i = 0;
+        i < testConfig.emailOtp.maxAttemptsPerCode - 1 && failures <= maxFailures;
+        i += 1
+      ) {
+        await t.ik.stepUp.verifyEmailCode(session.token, {
+          flowId: requested.flowId,
+          code: otherCode(code),
+        });
+        failures += 1;
+      }
+      // Keep the session alive while failing step-ups.
+      await t.ik.sessions.validate(session.token);
+    }
+    expect((await t.ik.stepUp.requestEmailCode(session.token)).status).toBe("locked");
+    expect((await t.ik.emailSignIn.requestCode({ email: "person@example.org" })).status).toBe(
+      "sent",
+    );
+  });
+
   it("rule: resend cooldown - refuses a second code inside the cooldown", async () => {
     const t = setup();
     await t.codeFor("person@example.org");

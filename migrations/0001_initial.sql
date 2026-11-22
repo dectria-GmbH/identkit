@@ -1,5 +1,7 @@
--- identkit schema, version 1. Secrets (codes, tokens, challenges, person keys) are stored
--- only as keyed hashes in the *_digest columns.
+-- identkit schema, version 1. Secrets (codes, session and enrollment tokens, person keys) are
+-- stored only as keyed hashes in the *_digest columns. WebAuthn challenges are stored as keyed
+-- hashes too; an approval challenge can be recomputed from its stored nonce and payload hash,
+-- because it is public by design and only binds the signature to the payload.
 
 CREATE TABLE identkit_accounts (
   id text PRIMARY KEY,
@@ -42,7 +44,8 @@ CREATE TABLE identkit_throttles (
   key text PRIMARY KEY,
   window_start timestamptz NOT NULL,
   attempts integer NOT NULL,
-  locked_until timestamptz
+  locked_until timestamptz,
+  lock_count integer NOT NULL CHECK (lock_count >= 0)
 );
 
 CREATE TABLE identkit_sessions (
