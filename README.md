@@ -162,6 +162,9 @@ E-mail codes:
   applies per address and purpose. Both apply to every address, so they reveal no account, but a
   `cooldown` answer shows that someone requested a code for the address in the last seconds. The
   owner always gets the newest code by mail.
+- A success resets the failure count of the address. Someone who probes the count with wrong
+  codes can therefore tell that a correct code was entered for the address in between. The probe
+  is noisy: the owner receives every code it requests.
 - The mail sender receives only the recipient, the code, the purpose and the lifetime.
 
 Sessions:
@@ -187,7 +190,10 @@ Passkeys:
 - After a passkey ceremony wrote its result, identkit checks again that the same credential (id,
   account and public key) is still registered and the account is active. A revocation that races
   with a sign-in, second factor, step-up or approval therefore yields no session, step-up or
-  proof.
+  proof. A registration applies its grant again after the insert and deletes the new passkey if
+  the session ended or another passkey appeared meanwhile.
+- Registration, removal and revocation of a passkey revoke sessions before the audit event, so
+  a failing audit sink cannot skip the revocation.
 - An e-mail sign-in checks the second-factor rule again after it created the session, so a first
   passkey registered at the same moment cannot leave a full session from a code alone.
 
