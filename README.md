@@ -190,8 +190,10 @@ Passkeys:
 - After a passkey ceremony wrote its result, identkit checks again that the same credential (id,
   account and public key) is still registered and the account is active. A revocation that races
   with a sign-in, second factor, step-up or approval therefore yields no session, step-up or
-  proof. A registration applies its grant again after the insert and deletes the new passkey if
-  the session ended or another passkey appeared meanwhile.
+  proof. A new passkey is stored as pending: no read sees it, so it cannot sign in, step up or
+  approve. The registration applies its grant again after the insert and activates the passkey
+  only if the session is still live and no other passkey appeared meanwhile; otherwise it
+  deletes it. A crash in between leaves an unusable pending row.
 - Registration, removal and revocation of a passkey revoke sessions before the audit event, so
   a failing audit sink cannot skip the revocation.
 - An e-mail sign-in checks the second-factor rule again after it created the session, so a first
@@ -213,7 +215,8 @@ One account per person:
 - An identity verification result carries a stable person key. identkit stores its HMAC and
   links it to at most one account. A second account for the same person ends as `conflict`.
 - A verification reads `verified` only after the person is linked. If the link fails, it reads
-  `pending` and the next `refresh` completes it.
+  `pending` and the next `refresh` completes it. Such a verification does not time out: it waits
+  for the vendor to report success again.
 
 ## Identity verification port
 
@@ -249,8 +252,8 @@ identkit returns tokens; your HTTP layer stores them. Recommendations:
 migrations in `migrations/` first, with `migrateIdentkit(db)` or with your own migration tool.
 Use a database role for migrations that differs from the runtime role.
 
-identkit does not delete expired rows. Remove expired codes, challenges and sessions with a
-scheduled job if you need to.
+identkit does not delete expired rows. Remove expired codes, challenges and sessions, and
+pending credentials older than the challenge lifetime, with a scheduled job if you need to.
 
 ## Development
 
