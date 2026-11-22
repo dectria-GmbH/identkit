@@ -247,6 +247,7 @@ export function runStoreContract(
         backedUp: true,
         createdAt: T0,
         lastUsedAt: null,
+        activatedAt: T0,
       };
       expect(await store.credentials.insert(c)).toBe("inserted");
       expect(await store.credentials.insert({ ...c, accountId: b.id })).toBe("duplicate");
@@ -266,6 +267,37 @@ export function runStoreContract(
       expect(await store.credentials.delete(c.id, b.id)).toBe(false);
       expect(await store.credentials.delete(c.id, a.id)).toBe(true);
       expect(await store.credentials.findById(c.id)).toBeNull();
+    });
+
+    it("credentials: a pending credential is invisible and unusable until activated", async () => {
+      const store = await factory();
+      const a = account();
+      await store.accounts.insert(a);
+      const pending = {
+        id: uid("cred"),
+        accountId: a.id,
+        publicKey: new Uint8Array([4]),
+        counter: 0,
+        transports: [],
+        deviceType: "singleDevice" as const,
+        backedUp: false,
+        createdAt: T0,
+        lastUsedAt: null,
+        activatedAt: null,
+      };
+      expect(await store.credentials.insert(pending)).toBe("inserted");
+      expect(await store.credentials.insert(pending)).toBe("duplicate");
+      expect(await store.credentials.findById(pending.id)).toBeNull();
+      expect(await store.credentials.listByAccount(a.id)).toHaveLength(0);
+      expect(await store.credentials.updateCounter(pending.id, 0, 1, T0)).toBe(false);
+      expect(await store.credentials.activate(pending.id, "other-account", T0)).toBe(false);
+      expect(await store.credentials.activate(pending.id, a.id, T0)).toBe(true);
+      expect((await store.credentials.findById(pending.id))?.activatedAt?.getTime()).toBe(
+        T0.getTime(),
+      );
+      expect(await store.credentials.listByAccount(a.id)).toHaveLength(1);
+      expect(await store.credentials.delete(pending.id, a.id)).toBe(true);
+      expect(await store.credentials.activate(pending.id, a.id, T0)).toBe(false);
     });
 
     it("challenges: consumed once, also under concurrency", async () => {

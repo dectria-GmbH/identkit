@@ -201,18 +201,28 @@ export function createMemoryStore(): IdentkitStore {
         credentials.set(credential.id, copy(credential));
         return Promise.resolve("inserted");
       },
+      activate(id, accountId, at) {
+        const found = credentials.get(id);
+        if (!found || found.accountId !== accountId) return Promise.resolve(false);
+        found.activatedAt ??= at;
+        return Promise.resolve(true);
+      },
       findById(id) {
         const found = credentials.get(id);
-        return Promise.resolve(found ? copy(found) : null);
+        return Promise.resolve(found && found.activatedAt !== null ? copy(found) : null);
       },
       listByAccount(accountId) {
         return Promise.resolve(
-          [...credentials.values()].filter((c) => c.accountId === accountId).map(copy),
+          [...credentials.values()]
+            .filter((c) => c.accountId === accountId && c.activatedAt !== null)
+            .map(copy),
         );
       },
       updateCounter(id, expected, next, usedAt) {
         const found = credentials.get(id);
-        if (!found || found.counter !== expected) return Promise.resolve(false);
+        if (!found || found.activatedAt === null || found.counter !== expected) {
+          return Promise.resolve(false);
+        }
         found.counter = next;
         found.lastUsedAt = usedAt;
         return Promise.resolve(true);

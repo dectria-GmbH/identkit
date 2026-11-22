@@ -76,7 +76,9 @@ CREATE TABLE identkit_credentials (
   device_type text NOT NULL CHECK (device_type IN ('singleDevice', 'multiDevice')),
   backed_up boolean NOT NULL,
   created_at timestamptz NOT NULL,
-  last_used_at timestamptz
+  last_used_at timestamptz,
+  -- Null while the registration that created it is still running; such rows are not usable.
+  activated_at timestamptz
 );
 
 CREATE INDEX identkit_credentials_account_idx ON identkit_credentials (account_id);

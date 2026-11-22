@@ -95,6 +95,7 @@ const toCredential = (r: Row<"identkit_credentials">): CredentialRecord => ({
   backedUp: r.backed_up,
   createdAt: r.created_at,
   lastUsedAt: r.last_used_at,
+  activatedAt: r.activated_at,
 });
 
 const toChallenge = (r: Row<"identkit_challenges">): ChallengeRecord => ({
@@ -440,17 +441,29 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
             backed_up: c.backedUp,
             created_at: c.createdAt,
             last_used_at: c.lastUsedAt,
+            activated_at: c.activatedAt,
           })
           .onConflict((oc) => oc.column("id").doNothing())
           .returning("id")
           .executeTakeFirst();
         return row ? "inserted" : "duplicate";
       },
+      async activate(id, accountId, at) {
+        const row = await db
+          .updateTable("identkit_credentials")
+          .set((eb) => ({ activated_at: eb.fn.coalesce("activated_at", eb.val(at)) }))
+          .where("id", "=", id)
+          .where("account_id", "=", accountId)
+          .returning("id")
+          .executeTakeFirst();
+        return row !== undefined;
+      },
       async findById(id) {
         const r = await db
           .selectFrom("identkit_credentials")
           .selectAll()
           .where("id", "=", id)
+          .where("activated_at", "is not", null)
           .executeTakeFirst();
         return r ? toCredential(r) : null;
       },
@@ -459,6 +472,7 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           .selectFrom("identkit_credentials")
           .selectAll()
           .where("account_id", "=", accountId)
+          .where("activated_at", "is not", null)
           .orderBy("created_at")
           .execute();
         return rows.map(toCredential);
@@ -469,6 +483,7 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           .set({ counter: next, last_used_at: usedAt })
           .where("id", "=", id)
           .where("counter", "=", expected)
+          .where("activated_at", "is not", null)
           .returning("id")
           .executeTakeFirst();
         return row !== undefined;

@@ -60,6 +60,7 @@ export interface IdentkitDatabase {
     backed_up: boolean;
     created_at: Date;
     last_used_at: Date | null;
+    activated_at: Date | null;
   };
   identkit_challenges: {
     id: string;

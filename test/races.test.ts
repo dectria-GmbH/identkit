@@ -16,6 +16,8 @@ interface Hooks {
   failNextLink: boolean;
   /** Runs once, right before a credential is inserted. */
   beforeCredentialInsert: (() => Promise<void>) | null;
+  /** Runs once, right after a credential was inserted. */
+  afterCredentialInsert: (() => Promise<void>) | null;
 }
 
 function hookedStore() {
@@ -25,6 +27,7 @@ function hookedStore() {
     beforeSessionInsert: null,
     failNextLink: false,
     beforeCredentialInsert: null,
+    afterCredentialInsert: null,
   };
   const store: IdentkitStore = {
     ...inner,
@@ -34,7 +37,11 @@ function hookedStore() {
         const hook = hooks.beforeCredentialInsert;
         hooks.beforeCredentialInsert = null;
         if (hook) await hook();
-        return inner.credentials.insert(credential);
+        const result = await inner.credentials.insert(credential);
+        const after = hooks.afterCredentialInsert;
+        hooks.afterCredentialInsert = null;
+        if (after) await after();
+        return result;
       },
       updateCounter: async (...args) => {
         const result = await inner.credentials.updateCounter(...args);
@@ -186,6 +193,7 @@ describe("races with a concurrent revocation", () => {
         backedUp: true,
         createdAt: t.clock.now(),
         lastUsedAt: null,
+        activatedAt: t.clock.now(),
       });
     };
     const result = await t.ik.emailSignIn.verifyCode({ flowId, code });
@@ -218,6 +226,27 @@ describe("passkey registration races", () => {
     expect(await inner.credentials.listByAccount(user.account.id)).toHaveLength(0);
   });
 
+  it("a passkey cannot sign in before its registration completed", async () => {
+    const { inner, store, hooks } = hookedStore();
+    const t = setup({ store });
+    const user = await t.signIn("person@example.org");
+    const start = await t.ik.passkeys.startRegistration({ sessionToken: user.token });
+    if (start.status !== "ok") throw new Error("denied");
+    const response = t.authenticator.register(start.options);
+    const { options } = await t.ik.passkeys.startSignIn();
+    let midway: unknown = null;
+    // Runs right after the insert, while the registration re-checks its grant.
+    hooks.afterCredentialInsert = async () => {
+      midway = await t.ik.passkeys.finishSignIn(t.authenticator.assert(options));
+      await t.ik.sessions.revokeAll(user.account.id);
+    };
+    expect(
+      (await t.ik.passkeys.finishRegistration({ sessionToken: user.token }, response)).status,
+    ).toBe("denied");
+    expect(midway).toEqual({ status: "failed", reason: "invalid" });
+    expect(await liveSessions(inner, user.account.id, t.clock.now())).toBe(0);
+  });
+
   it("a concurrent first registration makes a passkey step-up due for the other one", async () => {
     const { inner, store, hooks } = hookedStore();
     const t = setup({ store });
@@ -236,6 +265,7 @@ describe("passkey registration races", () => {
         backedUp: true,
         createdAt: t.clock.now(),
         lastUsedAt: null,
+        activatedAt: t.clock.now(),
       });
     };
     expect(await t.ik.passkeys.finishRegistration({ sessionToken: user.token }, response)).toEqual({

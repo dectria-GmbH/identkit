@@ -248,6 +248,8 @@ export function createPasskeys(
         backedUp: verified.backedUp,
         createdAt: clock.now(),
         lastUsedAt: null,
+        // Pending: invisible and unusable until the grant was checked again below.
+        activatedAt: null,
       });
       if (inserted === "duplicate") {
         await ctx.emit({
@@ -258,21 +260,25 @@ export function createPasskeys(
         return { status: "failed", reason: "duplicate" };
       }
       // The grant was checked before the insert. A revocation, a removed step-up passkey or a
-      // concurrent first registration in between must not leave this passkey behind.
+      // concurrent first registration in between must not leave this passkey behind. Until
+      // the activation the passkey cannot sign in, step up or approve.
       const holds = await grantStillHolds(
         grant,
         resolved.sessionId,
         account.id,
         verified.credentialId,
       );
-      if (holds !== true) {
+      const activated =
+        holds === true &&
+        (await store.credentials.activate(verified.credentialId, account.id, clock.now()));
+      if (!activated) {
         await store.credentials.delete(verified.credentialId, account.id);
         await ctx.emit({
           type: "passkey.registration_failed",
           accountId: account.id,
           reason: "grant_changed",
         });
-        return holds;
+        return holds === true ? { status: "denied", reason: "no_session" } : holds;
       }
       // Revoke first: if the audit sink fails afterwards, no other session survives.
       const revokedSessions = await sessions.revokeAll(
