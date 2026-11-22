@@ -1,5 +1,6 @@
 import { addSeconds } from "./clock.js";
 import type { Context } from "./context.js";
+import { enrolledSecondFactors, factorChangeStepUp, hasFreshStepUp } from "./second-factor.js";
 import { isTokenShaped, randomToken } from "./crypto.js";
 import { assertMethodAllowed } from "./email-otp.js";
 import type { PasskeyCore } from "./passkey-core.js";
@@ -19,7 +20,8 @@ import {
 /**
  * What allows a passkey registration:
  * - `sessionToken`: a full session with a fresh step-up. If the account already has a
- *   passkey, the step-up must be a passkey step-up.
+ *   passkey, the step-up must be a passkey step-up; if it has only a TOTP factor, a TOTP
+ *   step-up.
  * - `enrollmentToken`: a single-use token from `passkeys.issueEnrollmentToken`, for
  *   onboarding without another factor or for recovery after identity verification.
  */
@@ -100,11 +102,14 @@ export function createPasskeys(
 ): Passkeys {
   const { config, store, hasher, clock } = ctx;
 
-  function hasFreshStepUp(record: SessionRecord, requirePasskey: boolean): boolean {
-    const stepUp = record.stepUp;
-    if (!stepUp) return false;
-    if (requirePasskey && stepUp.method !== "passkey") return false;
-    return clock.now().getTime() < addSeconds(stepUp.at, config.stepUp.validitySeconds).getTime();
+  /** The step-up a registration needs, counting the account's factors other than `newId`. */
+  async function registrationStepUpHolds(record: SessionRecord, newId?: string) {
+    const enrolled = await enrolledSecondFactors(
+      ctx,
+      record.accountId,
+      newId === undefined ? {} : { passkeyId: newId },
+    );
+    return await hasFreshStepUp(ctx, record, factorChangeStepUp(enrolled));
   }
 
   type ResolvedGrant =
@@ -120,8 +125,7 @@ export function createPasskeys(
     if ("sessionToken" in grant) {
       const loaded = await internals.load(grant.sessionToken, "complete");
       if (!loaded) return { status: "denied", reason: "no_session" };
-      const existing = await store.credentials.listByAccount(loaded.record.accountId);
-      if (!hasFreshStepUp(loaded.record, existing.length > 0)) {
+      if (!(await registrationStepUpHolds(loaded.record))) {
         return { status: "denied", reason: "step_up_required" };
       }
       const account = await store.accounts.findById(loaded.record.accountId);
@@ -157,8 +161,7 @@ export function createPasskeys(
     // By id: a token rotation in another tab is not a lost grant.
     const live = sessionId === null ? null : await internals.loadById(sessionId, "complete");
     if (!live) return { status: "denied", reason: "no_session" };
-    const others = (await store.credentials.listByAccount(accountId)).filter((c) => c.id !== newId);
-    if (!hasFreshStepUp(live, others.length > 0)) {
+    if (!(await registrationStepUpHolds(live, newId))) {
       return { status: "denied", reason: "step_up_required" };
     }
     return true;
@@ -385,6 +388,7 @@ export function createPasskeys(
     },
 
     async startSecondFactor(pendingToken) {
+      assertMethodAllowed((await ctx.getPolicy()).secondFactorMethods, "passkey");
       const loaded = await internals.load(pendingToken, "pending_second_factor");
       if (!loaded) return { status: "denied", reason: "no_pending_session" };
       const { challenge } = await core.issueChallenge("second_factor", {
@@ -401,6 +405,7 @@ export function createPasskeys(
     },
 
     async finishSecondFactor(pendingToken, response) {
+      assertMethodAllowed((await ctx.getPolicy()).secondFactorMethods, "passkey");
       const loaded = await internals.load(pendingToken, "pending_second_factor");
       if (!loaded) return signInFailed("no_pending_session");
       const { record } = loaded;
@@ -445,7 +450,7 @@ export function createPasskeys(
     async remove(sessionToken, credentialId) {
       const loaded = await internals.load(sessionToken, "complete");
       if (!loaded) return { status: "denied", reason: "no_session" };
-      if (!hasFreshStepUp(loaded.record, true))
+      if (!(await hasFreshStepUp(ctx, loaded.record, ["passkey"])))
         return { status: "denied", reason: "step_up_required" };
       const removed = await store.credentials.delete(credentialId, loaded.record.accountId);
       if (!removed) return { status: "denied", reason: "not_found" };

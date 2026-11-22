@@ -20,6 +20,13 @@ describe("configuration", () => {
       ["webauthn", "challengeTtlSeconds"],
       ["identityVerification", "timeoutSeconds"],
       ["enrollment", "tokenTtlSeconds"],
+      ["totp", "issuer"],
+      ["totp", "algorithm"],
+      ["totp", "digits"],
+      ["totp", "driftSteps"],
+      ["totp", "enrolmentTtlSeconds"],
+      ["totp", "approvalTtlSeconds"],
+      ["totp", "lockout"],
     ];
     for (const [section, key] of paths) {
       const copy = structuredClone(testConfig) as Record<string, Record<string, unknown>>;
@@ -53,6 +60,50 @@ describe("configuration", () => {
     expect(() => parseConfig({ ...testConfig, extra: 1 })).toThrow();
   });
 
+  it("bounds the TOTP settings: drift window, digits, algorithm, issuer", () => {
+    const variants: [string, unknown][] = [
+      ["driftSteps", 2],
+      ["driftSteps", -1],
+      ["digits", 7],
+      ["algorithm", "MD5"],
+      ["issuer", "a:b"],
+      ["issuer", ""],
+      ["enrolmentTtlSeconds", 901],
+      ["approvalTtlSeconds", 601],
+    ];
+    for (const [key, value] of variants) {
+      const config = structuredClone(testConfig) as unknown as { totp: Record<string, unknown> };
+      config.totp[key] = value;
+      expect(() => parseConfig(config), `${key}=${String(value)}`).toThrow();
+    }
+    const lockout = structuredClone(testConfig);
+    lockout.totp.lockout.maxFailures = 101;
+    expect(() => parseConfig(lockout)).toThrow();
+  });
+
+  it("the policy requires second-factor methods and the approval proof level", () => {
+    const base = {
+      signInMethods: ["email_otp"],
+      secondFactor: "if_enrolled",
+      secondFactorMethods: ["totp"],
+      stepUpMethods: ["totp"],
+      approvalEvidenceLevels: ["signature"],
+      createAccountOnFirstSignIn: true,
+    };
+    expect(() => signInPolicySchema.parse(base)).not.toThrow();
+    for (const key of ["secondFactorMethods", "approvalEvidenceLevels"]) {
+      const copy: Record<string, unknown> = { ...base };
+      delete copy[key];
+      expect(() => signInPolicySchema.parse(copy), key).toThrow();
+    }
+    expect(() => signInPolicySchema.parse({ ...base, secondFactorMethods: [] })).toThrow();
+    expect(() =>
+      signInPolicySchema.parse({ ...base, secondFactor: "passkey_if_enrolled" }),
+    ).toThrow();
+    expect(() => signInPolicySchema.parse({ ...base, approvalEvidenceLevels: ["none"] })).toThrow();
+    expect(() => signInPolicySchema.parse({ ...base, approvalEvidenceLevels: [] })).toThrow();
+  });
+
   it("refuses a hash key shorter than 32 bytes", () => {
     expect(() => createHmacHasher(new Uint8Array(31))).toThrow(RangeError);
   });
@@ -63,6 +114,8 @@ describe("configuration", () => {
         signInMethods: [],
         secondFactor: "none",
         stepUpMethods: ["passkey"],
+        secondFactorMethods: ["passkey"],
+        approvalEvidenceLevels: ["signature"],
         createAccountOnFirstSignIn: true,
       }),
     ).toThrow();

@@ -325,6 +325,8 @@ describe("e-mail code sign-in", () => {
         signInMethods: ["passkey"],
         secondFactor: "none",
         stepUpMethods: ["passkey"],
+        secondFactorMethods: ["passkey"],
+        approvalEvidenceLevels: ["signature"],
         createAccountOnFirstSignIn: false,
       },
     });

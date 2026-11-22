@@ -1,5 +1,5 @@
 import { addSeconds } from "./clock.js";
-import type { SignInMethod, StepUpMethod } from "./config.js";
+import type { AuthMethod, StepUpMethod } from "./config.js";
 import type { Context } from "./context.js";
 import { isTokenShaped, randomId, randomToken } from "./crypto.js";
 import type { SessionRecord, SessionState, StepUpRecord } from "./storage/types.js";
@@ -8,7 +8,7 @@ import type { SessionRecord, SessionState, StepUpRecord } from "./storage/types.
 export interface SessionView {
   id: string;
   accountId: string;
-  authMethods: SignInMethod[];
+  authMethods: AuthMethod[];
   createdAt: Date;
   /** The earlier of the idle and the absolute expiry, as of this validation. */
   expiresAt: Date;
@@ -48,7 +48,7 @@ export interface SessionInternals {
   create(input: {
     accountId: string;
     state: SessionState;
-    authMethods: SignInMethod[];
+    authMethods: AuthMethod[];
     stepUp: StepUpRecord | null;
   }): Promise<IssuedSession>;
   /** Loads a live session in the given state, applying timeouts. Does not touch it. */
@@ -61,7 +61,7 @@ export interface SessionInternals {
   /** Replaces the token of a live session with a new one and applies the change. */
   elevate(
     loaded: { record: SessionRecord; digest: string },
-    change: { state?: SessionState; addMethod?: SignInMethod; stepUp?: StepUpRecord },
+    change: { state?: SessionState; addMethod?: AuthMethod; stepUp?: StepUpRecord },
     reason: string,
   ): Promise<IssuedSession | null>;
   view(record: SessionRecord): SessionView;
@@ -171,7 +171,7 @@ export function createSessions(ctx: Context): { sessions: Sessions; internals: S
 
   async function elevate(
     loaded: { record: SessionRecord; digest: string },
-    change: { state?: SessionState; addMethod?: SignInMethod; stepUp?: StepUpRecord },
+    change: { state?: SessionState; addMethod?: AuthMethod; stepUp?: StepUpRecord },
     reason: string,
   ): Promise<IssuedSession | null> {
     const now = clock.now();

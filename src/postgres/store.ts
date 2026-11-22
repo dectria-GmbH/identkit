@@ -8,6 +8,7 @@ import type {
   IdentkitStore,
   OtpFlowRecord,
   SessionRecord,
+  TotpFactorRecord,
   VerificationRecord,
 } from "../storage/types.js";
 import type { IdentkitDatabase } from "./schema.js";
@@ -40,7 +41,8 @@ function oneOfOrNull<const T extends string>(
 }
 
 const LEVELS = ["low", "substantial", "high"] as const;
-const METHODS = ["email_otp", "passkey"] as const;
+const AUTH_METHODS = ["email_otp", "passkey", "totp"] as const;
+const STEP_UP_METHODS = ["email_otp", "passkey", "totp"] as const;
 
 const toAccount = (r: Row<"identkit_accounts">): AccountRecord => ({
   id: r.id,
@@ -73,13 +75,13 @@ const toSession = (r: Row<"identkit_sessions">): SessionRecord => ({
   accountId: r.account_id,
   tokenDigest: r.token_digest,
   state: oneOf(r.state, ["pending_second_factor", "complete"]),
-  authMethods: r.auth_methods.map((m) => oneOf(m, METHODS)),
+  authMethods: r.auth_methods.map((m) => oneOf(m, AUTH_METHODS)),
   createdAt: r.created_at,
   lastSeenAt: r.last_seen_at,
   absoluteExpiresAt: r.absolute_expires_at,
   stepUp:
     r.step_up_method && r.step_up_at
-      ? { method: oneOf(r.step_up_method, METHODS), at: r.step_up_at }
+      ? { method: oneOf(r.step_up_method, STEP_UP_METHODS), at: r.step_up_at }
       : null,
   revokedAt: r.revoked_at,
   revokeReason: r.revoke_reason,
@@ -101,7 +103,14 @@ const toCredential = (r: Row<"identkit_credentials">): CredentialRecord => ({
 const toChallenge = (r: Row<"identkit_challenges">): ChallengeRecord => ({
   id: r.id,
   challengeDigest: r.challenge_digest,
-  purpose: oneOf(r.purpose, ["registration", "sign_in", "second_factor", "step_up", "approval"]),
+  purpose: oneOf(r.purpose, [
+    "registration",
+    "sign_in",
+    "second_factor",
+    "step_up",
+    "approval",
+    "approval_code",
+  ]),
   accountId: r.account_id,
   sessionId: r.session_id,
   enrollmentTokenDigest: r.enrollment_token_digest,
@@ -109,6 +118,24 @@ const toChallenge = (r: Row<"identkit_challenges">): ChallengeRecord => ({
   nonce: r.nonce,
   createdAt: r.created_at,
   expiresAt: r.expires_at,
+});
+
+function toDigits(value: number): 6 | 8 {
+  if (value === 6 || value === 8) return value;
+  throw new Error(`unexpected value in database: ${value}`);
+}
+
+const toTotpFactor = (r: Row<"identkit_totp_factors">): TotpFactorRecord => ({
+  id: r.id,
+  accountId: r.account_id,
+  sealedSecret: r.sealed_secret,
+  algorithm: oneOf(r.algorithm, ["SHA1", "SHA256", "SHA512"]),
+  digits: toDigits(r.digits),
+  createdAt: r.created_at,
+  enrolmentSessionId: r.enrolment_session_id,
+  activatedAt: r.activated_at,
+  lastUsedStep: r.last_used_step === null ? null : Number(r.last_used_step),
+  lastUsedAt: r.last_used_at,
 });
 
 const toVerification = (r: Row<"identkit_verifications">): VerificationRecord => ({
@@ -526,6 +553,100 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           .returningAll()
           .executeTakeFirst();
         return r ? toChallenge(r) : null;
+      },
+    },
+
+    totp: {
+      async insert(f) {
+        await db
+          .insertInto("identkit_totp_factors")
+          .values({
+            id: f.id,
+            account_id: f.accountId,
+            sealed_secret: f.sealedSecret,
+            algorithm: f.algorithm,
+            digits: f.digits,
+            created_at: f.createdAt,
+            enrolment_session_id: f.enrolmentSessionId,
+            activated_at: f.activatedAt,
+            last_used_step: f.lastUsedStep,
+            last_used_at: f.lastUsedAt,
+          })
+          .execute();
+      },
+      async findPending(id) {
+        const r = await db
+          .selectFrom("identkit_totp_factors")
+          .selectAll()
+          .where("id", "=", id)
+          .where("activated_at", "is", null)
+          .executeTakeFirst();
+        return r ? toTotpFactor(r) : null;
+      },
+      async findActive(accountId) {
+        const r = await db
+          .selectFrom("identkit_totp_factors")
+          .selectAll()
+          .where("account_id", "=", accountId)
+          .where("activated_at", "is not", null)
+          .executeTakeFirst();
+        return r ? toTotpFactor(r) : null;
+      },
+      async activate(id, accountId, step, at) {
+        try {
+          // The unique partial index on active factors refuses a second active factor.
+          const row = await db
+            .updateTable("identkit_totp_factors")
+            .set({ activated_at: at, last_used_step: step, last_used_at: at })
+            .where("id", "=", id)
+            .where("account_id", "=", accountId)
+            .where("activated_at", "is", null)
+            .returning("id")
+            .executeTakeFirst();
+          return row !== undefined;
+        } catch (error) {
+          if (isUniqueViolation(error)) return false;
+          throw error;
+        }
+      },
+      async recordStep(id, accountId, step, at) {
+        const row = await db
+          .updateTable("identkit_totp_factors")
+          .set({ last_used_step: step, last_used_at: at })
+          .where("id", "=", id)
+          .where("account_id", "=", accountId)
+          .where("activated_at", "is not", null)
+          .where((eb) => eb.or([eb("last_used_step", "is", null), eb("last_used_step", "<", step)]))
+          .returning("id")
+          .executeTakeFirst();
+        return row !== undefined;
+      },
+      async delete(id, accountId) {
+        const row = await db
+          .deleteFrom("identkit_totp_factors")
+          .where("id", "=", id)
+          .where("account_id", "=", accountId)
+          .returning("id")
+          .executeTakeFirst();
+        return row !== undefined;
+      },
+      async deleteAllForAccount(accountId) {
+        const rows = await db
+          .deleteFrom("identkit_totp_factors")
+          .where("account_id", "=", accountId)
+          .returning("id")
+          .execute();
+        return rows.length;
+      },
+      async replaceSealedSecret(id, expected, next) {
+        const row = await db
+          .updateTable("identkit_totp_factors")
+          .set({ sealed_secret: next })
+          .where("id", "=", id)
+          .where("sealed_secret", "=", expected)
+          .returning("id")
+          .executeTakeFirst();
+        return row !== undefined;
       },
     },
 

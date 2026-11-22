@@ -5,10 +5,13 @@ import {
   createMemoryStore,
   type SignInPolicy,
 } from "../src/index.js";
+import type { SecretSealer } from "../src/sealer.js";
 import type { IdentkitStore } from "../src/storage/types.js";
 import {
   createFakeClock,
   createFakeIdentityVerificationAdapter,
+  createTestSealer,
+  generateTotpCode,
   createRecordingAuditSink,
   createRecordingMailSender,
   createSoftwareAuthenticator,
@@ -36,12 +39,23 @@ export const testConfig = {
   webauthn: { rpId: RP_ID, rpName: "Example portal", origins: [ORIGIN], challengeTtlSeconds: 300 },
   identityVerification: { timeoutSeconds: 1800 },
   enrollment: { tokenTtlSeconds: 86_400 },
+  totp: {
+    issuer: "Example portal",
+    algorithm: "SHA1" as "SHA1" | "SHA256" | "SHA512",
+    digits: 6 as 6 | 8,
+    driftSteps: 1,
+    enrolmentTtlSeconds: 600,
+    approvalTtlSeconds: 300,
+    lockout: { maxFailures: 10, windowSeconds: 900, lockSeconds: 900, maxLockSeconds: 86_400 },
+  },
 };
 
 export const emailFirstPolicy: SignInPolicy = {
   signInMethods: ["email_otp", "passkey"],
   secondFactor: "none",
-  stepUpMethods: ["passkey", "email_otp"],
+  secondFactorMethods: ["passkey", "totp"],
+  stepUpMethods: ["passkey", "email_otp", "totp"],
+  approvalEvidenceLevels: ["signature"],
   createAccountOnFirstSignIn: true,
 };
 
@@ -50,6 +64,10 @@ export interface SetupOptions {
   store?: IdentkitStore;
   idv?: FakeIdentityVerificationOptions;
   counterStep?: number;
+  /** Accounts the consumer marks as privileged, by e-mail address. */
+  privilegedEmails?: string[];
+  config?: typeof testConfig;
+  sealer?: SecretSealer;
 }
 
 export function setup(options: SetupOptions = {}) {
@@ -59,10 +77,16 @@ export function setup(options: SetupOptions = {}) {
   const store = options.store ?? createMemoryStore();
   const policy = { current: options.policy ?? emailFirstPolicy };
   const idv = createFakeIdentityVerificationAdapter(options.idv ?? { outcome: "succeed" });
+  const hasher = createHmacHasher(randomBytes(32));
+  const testSealer = createTestSealer();
+  const sealer = options.sealer ?? testSealer;
+  const privileged = new Set(options.privilegedEmails ?? []);
   const ik = createIdentkit({
-    config: testConfig,
+    config: options.config ?? testConfig,
+    sealer,
+    isPrivilegedAccount: (account) => privileged.has(account.email),
     store,
-    hasher: createHmacHasher(randomBytes(32)),
+    hasher,
     mail,
     audit,
     clock,
@@ -98,6 +122,24 @@ export function setup(options: SetupOptions = {}) {
     return finish.credentialId;
   }
 
+  /** The code an authenticator app shows for `secret`, `offsetSeconds` from now. */
+  function totpCode(secret: string, offsetSeconds = 0) {
+    const at = new Date(clock.now().getTime() + offsetSeconds * 1000);
+    return generateTotpCode({ secret, at });
+  }
+
+  /** Enrols and confirms TOTP for the session's account. The confirming step is consumed. */
+  async function enrolTotp(token: string) {
+    const start = await ik.totp.startEnrolment(token);
+    if (start.status !== "ok") throw new Error(`enrolment denied: ${start.reason}`);
+    const confirmed = await ik.totp.confirmEnrolment(token, {
+      factorId: start.factorId,
+      code: totpCode(start.secret),
+    });
+    if (confirmed.status !== "enrolled") throw new Error(`enrolment failed: ${confirmed.status}`);
+    return { factorId: start.factorId, secret: start.secret, start };
+  }
+
   /** Signs in by e-mail and registers one passkey. Returns a session with a fresh step-up. */
   async function userWithPasskey(email: string) {
     const session = await signIn(email);
@@ -113,6 +155,12 @@ export function setup(options: SetupOptions = {}) {
     store,
     policy,
     idv,
+    hasher,
+    sealer,
+    testSealer,
+    privileged,
+    totpCode,
+    enrolTotp,
     authenticator,
     codeFor,
     signIn,
@@ -124,4 +172,113 @@ export function setup(options: SetupOptions = {}) {
 /** A code from the same alphabet that differs from `code`. */
 export function otherCode(code: string): string {
   return code === "000000" ? "000001" : "000000";
+}
+
+/** E-mail code first, then a second factor (passkey or TOTP) if the account has one. */
+export const mfaPolicy: SignInPolicy = {
+  signInMethods: ["email_otp", "passkey"],
+  secondFactor: "if_enrolled",
+  secondFactorMethods: ["passkey", "totp"],
+  stepUpMethods: ["passkey", "email_otp", "totp"],
+  approvalEvidenceLevels: ["signature"],
+  createAccountOnFirstSignIn: true,
+};
+
+/** Seconds per TOTP time step. */
+export const STEP = 30;
+
+/** A memory store with hooks that run a concurrent change at the exact point it would hurt. */
+export function hookedTotpStore() {
+  const inner = createMemoryStore();
+  const hooks: {
+    afterRecordStep: (() => Promise<void>) | null;
+    beforeActivate: (() => Promise<void>) | null;
+    /** Number of further revokeAllForAccount calls that throw. */
+    failRevokeAll: number;
+    /** Number of further throttle resets that throw. */
+    failThrottleReset: number;
+    /** Number of further TOTP deletes (single and per account) that throw. */
+    failTotpDelete: number;
+    /** Number of further account status writes that throw. */
+    failSetStatus: number;
+    /** If set, the next activation commits and then throws, as a lost reply would. */
+    activateThrowsAfterCommit: boolean;
+  } = {
+    failSetStatus: 0,
+    activateThrowsAfterCommit: false,
+    afterRecordStep: null,
+    beforeActivate: null,
+    failRevokeAll: 0,
+    failThrottleReset: 0,
+    failTotpDelete: 0,
+  };
+  const store: IdentkitStore = {
+    ...inner,
+    accounts: {
+      ...inner.accounts,
+      setStatus: async (...args) => {
+        if (hooks.failSetStatus > 0) {
+          hooks.failSetStatus -= 1;
+          throw new Error("store unavailable");
+        }
+        return inner.accounts.setStatus(...args);
+      },
+    },
+    throttle: {
+      ...inner.throttle,
+      reset: async (key) => {
+        if (hooks.failThrottleReset > 0) {
+          hooks.failThrottleReset -= 1;
+          throw new Error("store unavailable");
+        }
+        return inner.throttle.reset(key);
+      },
+    },
+    sessions: {
+      ...inner.sessions,
+      revokeAllForAccount: async (...args) => {
+        if (hooks.failRevokeAll > 0) {
+          hooks.failRevokeAll -= 1;
+          throw new Error("store unavailable");
+        }
+        return inner.sessions.revokeAllForAccount(...args);
+      },
+    },
+    totp: {
+      ...inner.totp,
+      recordStep: async (...args) => {
+        const result = await inner.totp.recordStep(...args);
+        const hook = hooks.afterRecordStep;
+        hooks.afterRecordStep = null;
+        if (hook) await hook();
+        return result;
+      },
+      delete: async (...args) => {
+        if (hooks.failTotpDelete > 0) {
+          hooks.failTotpDelete -= 1;
+          throw new Error("store unavailable");
+        }
+        return inner.totp.delete(...args);
+      },
+      deleteAllForAccount: async (accountId) => {
+        if (hooks.failTotpDelete > 0) {
+          hooks.failTotpDelete -= 1;
+          throw new Error("store unavailable");
+        }
+        return inner.totp.deleteAllForAccount(accountId);
+      },
+      activate: async (...args) => {
+        const hook = hooks.beforeActivate;
+        hooks.beforeActivate = null;
+        if (hook) await hook();
+        const result = await inner.totp.activate(...args);
+        if (hooks.activateThrowsAfterCommit) {
+          hooks.activateThrowsAfterCommit = false;
+          throw new Error("connection lost");
+        }
+        return result;
+      },
+    },
+  };
+  return { inner, store, hooks };
 }

@@ -1,4 +1,5 @@
-import type { SignInMethod, StepUpMethod } from "../config.js";
+import type { AuthMethod, StepUpMethod } from "../config.js";
+import type { TotpAlgorithm, TotpDigits } from "../totp-core.js";
 
 export type AccountStatus = "active" | "disabled";
 export type AssuranceLevel = "low" | "substantial" | "high";
@@ -64,7 +65,7 @@ export interface SessionRecord {
   accountId: string;
   tokenDigest: string;
   state: SessionState;
-  authMethods: SignInMethod[];
+  authMethods: AuthMethod[];
   createdAt: Date;
   lastSeenAt: Date;
   absoluteExpiresAt: Date;
@@ -75,7 +76,7 @@ export interface SessionRecord {
 
 export interface SessionUpdate {
   state: SessionState;
-  authMethods: SignInMethod[];
+  authMethods: AuthMethod[];
   stepUp: StepUpRecord | null;
   lastSeenAt: Date;
   absoluteExpiresAt: Date;
@@ -100,8 +101,9 @@ export interface CredentialRecord {
   activatedAt: Date | null;
 }
 
+/** `approval_code`: a pending approval that waits for a TOTP code, not a WebAuthn challenge. */
 export type ChallengePurpose =
-  "registration" | "sign_in" | "second_factor" | "step_up" | "approval";
+  "registration" | "sign_in" | "second_factor" | "step_up" | "approval" | "approval_code";
 
 export interface ChallengeRecord {
   id: string;
@@ -117,6 +119,23 @@ export interface ChallengeRecord {
   nonce: string | null;
   createdAt: Date;
   expiresAt: Date;
+}
+
+export interface TotpFactorRecord {
+  id: string;
+  accountId: string;
+  /** The secret, sealed by the `SecretSealer` for this factor id and account. Never plain. */
+  sealedSecret: string;
+  algorithm: TotpAlgorithm;
+  digits: TotpDigits;
+  createdAt: Date;
+  /** Session that started the enrolment. Only that session can confirm it. */
+  enrolmentSessionId: string | null;
+  /** Null until a first valid code confirmed the enrolment. The store hides pending factors. */
+  activatedAt: Date | null;
+  /** Latest accepted time step. A step at or below it is never accepted again. */
+  lastUsedStep: number | null;
+  lastUsedAt: Date | null;
 }
 
 export interface EnrollmentTokenRecord {
@@ -242,6 +261,32 @@ export interface IdentkitStore {
      * of another purpose stays, so one ceremony cannot destroy another one's challenge.
      */
     consumeByDigest(digest: string, purpose: ChallengePurpose): Promise<ChallengeRecord | null>;
+  };
+  totp: {
+    insert(factor: TotpFactorRecord): Promise<void>;
+    /** A pending (not yet confirmed) factor by id. */
+    findPending(id: string): Promise<TotpFactorRecord | null>;
+    /** The active factor of the account. An account has at most one. */
+    findActive(accountId: string): Promise<TotpFactorRecord | null>;
+    /**
+     * Atomically activates the pending factor and records `step` as its latest used step.
+     * Returns false if it is gone, already active, or the account has another active factor.
+     */
+    activate(id: string, accountId: string, step: number, at: Date): Promise<boolean>;
+    /**
+     * Atomically records `step` as the latest used step of the active factor, only if it is
+     * above the stored one. Returns false otherwise, so a time step is accepted once.
+     */
+    recordStep(id: string, accountId: string, step: number, at: Date): Promise<boolean>;
+    /** Deletes the factor of the account, pending or active. */
+    delete(id: string, accountId: string): Promise<boolean>;
+    /**
+     * Deletes every factor of the account, pending and active, and returns how many went.
+     * A pending factor deleted here can no longer be activated.
+     */
+    deleteAllForAccount(accountId: string): Promise<number>;
+    /** Compare-and-set of the sealed secret, for key rotation. */
+    replaceSealedSecret(id: string, expected: string, next: string): Promise<boolean>;
   };
   enrollment: {
     insert(token: EnrollmentTokenRecord): Promise<void>;

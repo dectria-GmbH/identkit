@@ -10,7 +10,9 @@ export type HashPurpose =
   | "session-token"
   | "webauthn-challenge"
   | "enrollment-token"
-  | "person-key";
+  | "person-key"
+  | "approval-id"
+  | "approval-evidence";
 
 /**
  * Computes keyed one-way hashes of secrets and identifiers. identkit stores only these

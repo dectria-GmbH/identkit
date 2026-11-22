@@ -133,8 +133,10 @@ describe("races with a concurrent revocation", () => {
       store,
       policy: {
         signInMethods: ["email_otp", "passkey"],
-        secondFactor: "passkey_if_enrolled",
+        secondFactor: "if_enrolled",
         stepUpMethods: ["passkey"],
+        secondFactorMethods: ["passkey"],
+        approvalEvidenceLevels: ["signature"],
         createAccountOnFirstSignIn: true,
       },
     });
@@ -162,7 +164,7 @@ describe("races with a concurrent revocation", () => {
     const user = await t.userWithPasskey("person@example.org");
     const payloadHash = hashPayload("release 1");
     const start = await t.ik.approvals.start({ sessionToken: user.token, payloadHash });
-    if (start.status !== "ok") throw new Error("denied");
+    if (start.status !== "ok" || start.level !== "signature") throw new Error("denied");
     const response = t.authenticator.assert(start.options);
     hooks.afterCounterUpdate = async () => {
       await inner.credentials.delete(user.credentialId, user.account.id);
@@ -181,8 +183,10 @@ describe("races with a concurrent revocation", () => {
       store,
       policy: {
         signInMethods: ["email_otp", "passkey"],
-        secondFactor: "passkey_if_enrolled",
+        secondFactor: "if_enrolled",
         stepUpMethods: ["passkey"],
+        secondFactorMethods: ["passkey"],
+        approvalEvidenceLevels: ["signature"],
         createAccountOnFirstSignIn: true,
       },
     });
@@ -431,7 +435,7 @@ describe("challenges of one purpose cannot be destroyed through another", () => 
     const user = await t.userWithPasskey("person@example.org");
     const payloadHash = hashPayload("release 2");
     const start = await t.ik.approvals.start({ sessionToken: user.token, payloadHash });
-    if (start.status !== "ok") throw new Error("denied");
+    if (start.status !== "ok" || start.level !== "signature") throw new Error("denied");
     const response = t.authenticator.assert(start.options);
     expect((await t.ik.passkeys.finishSignIn(response)).status).toBe("failed");
     expect(

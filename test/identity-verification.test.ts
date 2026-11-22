@@ -5,7 +5,11 @@ import {
   createMemoryStore,
   NotConfiguredError,
 } from "../src/index.js";
-import { createRecordingAuditSink, createRecordingMailSender } from "../src/testing/index.js";
+import {
+  createRecordingAuditSink,
+  createRecordingMailSender,
+  createTestSealer,
+} from "../src/testing/index.js";
 import { emailFirstPolicy, setup, testConfig } from "./helpers.js";
 
 describe("identity verification", () => {
@@ -100,6 +104,8 @@ describe("identity verification", () => {
       mail: createRecordingMailSender(),
       audit: createRecordingAuditSink(),
       policy: emailFirstPolicy,
+      sealer: createTestSealer(),
+      isPrivilegedAccount: () => false,
     });
     const created = await ik.accounts.create({ email: "person@example.org" });
     if (created.status !== "created") throw new Error("not created");

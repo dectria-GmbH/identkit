@@ -11,4 +11,18 @@ describe("migrations", () => {
     expect(statements.every((s) => s.startsWith("CREATE "))).toBe(true);
     expect(statements.filter((s) => s.startsWith("CREATE TABLE"))).toHaveLength(9);
   });
+
+  it("splits the TOTP migration into its statements, without editing the first one", () => {
+    const text = readFileSync(join(MIGRATIONS_DIR, "0002_totp.sql"), "utf8");
+    const statements = splitStatements(text);
+    expect(statements.map((s) => s.split(/\s+/).slice(0, 3).join(" "))).toEqual([
+      "ALTER TABLE identkit_sessions",
+      "ALTER TABLE identkit_sessions",
+      "ALTER TABLE identkit_challenges",
+      "ALTER TABLE identkit_challenges",
+      "CREATE TABLE identkit_totp_factors",
+      "CREATE UNIQUE INDEX",
+      "CREATE INDEX identkit_totp_factors_account_idx",
+    ]);
+  });
 });

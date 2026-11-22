@@ -1,4 +1,5 @@
 import { newAccountRecord, toAccountView, type AccountView } from "./accounts.js";
+import type { SecondFactorMethod } from "./config.js";
 import type { Context } from "./context.js";
 import {
   assertMethodAllowed,
@@ -6,12 +7,25 @@ import {
   type OtpEngine,
   type RequestCodeResult,
 } from "./email-otp.js";
+import { enrolledSecondFactors } from "./second-factor.js";
 import type { IssuedSession, SessionInternals } from "./sessions.js";
 import type { AccountRecord } from "./storage/types.js";
 
 export type EmailSignInResult =
   | ({ status: "signed_in"; account: AccountView; accountCreated: boolean } & IssuedSession)
-  | { status: "second_factor_required"; pendingToken: string; expiresAt: Date }
+  | {
+      status: "second_factor_required";
+      pendingToken: string;
+      expiresAt: Date;
+      /** Methods that can complete this sign-in: enrolled and allowed by the policy. */
+      methods: SecondFactorMethod[];
+    }
+  /**
+   * A second factor is due but none can be used: the account is privileged and has none
+   * (`enrolment_required`), or it has one that the policy does not allow (`method_not_allowed`).
+   * Only the holder of a valid code sees this answer.
+   */
+  | { status: "second_factor_unavailable"; reason: "enrolment_required" | "method_not_allowed" }
   | CodeFailure;
 
 export interface EmailSignIn {
@@ -74,11 +88,32 @@ export function createEmailSignIn(
       }
       const { account, created } = found;
 
-      const needsPasskey = async () =>
-        policy.secondFactor === "passkey_if_enrolled" &&
-        (await store.credentials.listByAccount(account.id)).length > 0;
+      // The consumer decides who is privileged; a privileged account always needs a second
+      // factor, whatever the policy says.
+      const privileged = await ctx.isPrivilegedAccount(toAccountView(account));
 
-      async function pendingSession(): Promise<EmailSignInResult> {
+      /** Null if no second factor is due; else the methods that can complete the sign-in. */
+      const secondFactorDue = async (): Promise<SecondFactorMethod[] | null> => {
+        const enrolled = await enrolledSecondFactors(ctx, account.id);
+        const required =
+          privileged || (policy.secondFactor === "if_enrolled" && enrolled.length > 0);
+        if (!required) return null;
+        return enrolled.filter((m) => policy.secondFactorMethods.includes(m));
+      };
+
+      async function pendingSession(methods: SecondFactorMethod[]): Promise<EmailSignInResult> {
+        if (methods.length === 0) {
+          const reason =
+            (await enrolledSecondFactors(ctx, account.id)).length === 0
+              ? "enrolment_required"
+              : "method_not_allowed";
+          await ctx.emit({
+            type: "second_factor.unavailable",
+            accountId: account.id,
+            reason,
+          });
+          return { status: "second_factor_unavailable", reason };
+        }
         const pending = await internals.create({
           accountId: account.id,
           state: "pending_second_factor",
@@ -94,10 +129,12 @@ export function createEmailSignIn(
           status: "second_factor_required",
           pendingToken: pending.token,
           expiresAt: pending.session.expiresAt,
+          methods,
         };
       }
 
-      if (await needsPasskey()) return pendingSession();
+      const due = await secondFactorDue();
+      if (due !== null) return pendingSession(due);
 
       const issued = await internals.create({
         accountId: account.id,
@@ -105,9 +142,10 @@ export function createEmailSignIn(
         authMethods: ["email_otp"],
         stepUp: { method: "email_otp", at: clock.now() },
       });
-      // A first passkey registered while this sign-in ran makes the second factor due: check
-      // again after the insert, so the race cannot yield a full session.
-      if (await needsPasskey()) {
+      // A first second factor enrolled while this sign-in ran makes the second factor due:
+      // check again after the insert, so the race cannot yield a full session.
+      const dueNow = await secondFactorDue();
+      if (dueNow !== null) {
         if (await store.sessions.revoke(issued.session.id, clock.now(), "second_factor_due")) {
           await ctx.emit({
             type: "session.revoked",
@@ -116,7 +154,7 @@ export function createEmailSignIn(
             reason: "second_factor_due",
           });
         }
-        return pendingSession();
+        return pendingSession(dueNow);
       }
       return {
         status: "signed_in",

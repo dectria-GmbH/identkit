@@ -8,6 +8,8 @@ const staffPolicy = {
   signInMethods: ["passkey" as const],
   secondFactor: "none" as const,
   stepUpMethods: ["passkey" as const],
+  secondFactorMethods: ["passkey" as const],
+  approvalEvidenceLevels: ["signature" as const],
   createAccountOnFirstSignIn: false,
 };
 
@@ -327,8 +329,10 @@ describe("passkey sign-in", () => {
 
 const mfaPolicy = {
   signInMethods: ["email_otp" as const, "passkey" as const],
-  secondFactor: "passkey_if_enrolled" as const,
+  secondFactor: "if_enrolled" as const,
   stepUpMethods: ["passkey" as const],
+  secondFactorMethods: ["passkey" as const],
+  approvalEvidenceLevels: ["signature" as const],
   createAccountOnFirstSignIn: true,
 };
 

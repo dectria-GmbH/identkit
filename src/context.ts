@@ -1,8 +1,10 @@
+import type { AccountView } from "./accounts.js";
 import type { AuditEvent, AuditSink } from "./audit.js";
 import type { Clock } from "./clock.js";
 import type { IdentkitConfig, SignInPolicy } from "./config.js";
 import type { SecretHasher } from "./crypto.js";
 import type { IdentityVerificationAdapter } from "./identity-verification.js";
+import type { SecretSealer } from "./sealer.js";
 import type { IdentkitStore } from "./storage/types.js";
 
 export type OtpMailPurpose = "sign_in" | "step_up";
@@ -28,6 +30,9 @@ export interface Context {
   mail: MailSender;
   getPolicy: () => Promise<SignInPolicy>;
   identityVerification: IdentityVerificationAdapter | null;
+  sealer: SecretSealer | null;
+  /** The consumer's decision whether an account needs a second factor whatever the policy says. */
+  isPrivilegedAccount: (account: AccountView) => Promise<boolean>;
   emit(event: Omit<AuditEvent, "at"> & { at?: Date }): Promise<void>;
 }
 

@@ -25,3 +25,13 @@ export class NotConfiguredError extends IdentkitError {
     super("not_configured", `not configured: ${what}`);
   }
 }
+
+/**
+ * A call got arguments of the wrong shape, for example from untyped code written for an
+ * earlier form of the API. identkit throws instead of guessing.
+ */
+export class InvalidArgumentError extends IdentkitError {
+  constructor(message: string) {
+    super("invalid_argument", message);
+  }
+}
