@@ -151,12 +151,17 @@ E-mail codes:
   an authenticator, because anyone who can request codes for an address could then lock its
   owner out for good.
 - A person who can request codes for an address can trigger a lock: it trades a denial of
-  service for brute-force protection.
+  service for brute-force protection. Escalation makes the brute-force bound stronger and a
+  lasting lockout cheaper: once the lock reached `maxLockSeconds`, one burst of failures per
+  `maxLockSeconds` keeps the address locked. Set `maxLockSeconds` equal to `lockSeconds` to turn
+  escalation off.
 - identkit limits per address only. Add rate limits per client and in total in your HTTP layer:
   an attacker who guesses against many addresses at once is not limited by the per-address
   count.
 - A new code for the same address and purpose supersedes the previous one. The resend cooldown
-  applies per address and purpose.
+  applies per address and purpose. Both apply to every address, so they reveal no account, but a
+  `cooldown` answer shows that someone requested a code for the address in the last seconds. The
+  owner always gets the newest code by mail.
 - The mail sender receives only the recipient, the code, the purpose and the lifetime.
 
 Sessions:
@@ -179,7 +184,12 @@ Passkeys:
 - Assertions need user verification, a configured origin and the RP ID. Ceremonies in a
   cross-origin frame are refused. The signature counter must increase unless the authenticator
   always reports zero.
-- A passkey sign-in that races with the revocation of that passkey yields no session.
+- After a passkey ceremony wrote its result, identkit checks again that the same credential (id,
+  account and public key) is still registered and the account is active. A revocation that races
+  with a sign-in, second factor, step-up or approval therefore yields no session, step-up or
+  proof.
+- An e-mail sign-in checks the second-factor rule again after it created the session, so a first
+  passkey registered at the same moment cannot leave a full session from a code alone.
 
 Approval proofs:
 
@@ -196,6 +206,8 @@ One account per person:
 - An address belongs to at most one account.
 - An identity verification result carries a stable person key. identkit stores its HMAC and
   links it to at most one account. A second account for the same person ends as `conflict`.
+- A verification reads `verified` only after the person is linked. If the link fails, it reads
+  `pending` and the next `refresh` completes it.
 
 ## Identity verification port
 
