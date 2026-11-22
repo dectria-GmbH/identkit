@@ -290,14 +290,20 @@ export function runStoreContract(
       expect(await store.credentials.findById(pending.id)).toBeNull();
       expect(await store.credentials.listByAccount(a.id)).toHaveLength(0);
       expect(await store.credentials.updateCounter(pending.id, 0, 1, T0)).toBe(false);
-      expect(await store.credentials.activate(pending.id, "other-account", T0)).toBe(false);
-      expect(await store.credentials.activate(pending.id, a.id, T0)).toBe(true);
+      expect(
+        await store.credentials.activate(pending.id, "other-account", pending.publicKey, T0),
+      ).toBe(false);
+      expect(await store.credentials.activate(pending.id, a.id, new Uint8Array([5]), T0)).toBe(
+        false,
+      );
+      expect(await store.credentials.delete(pending.id, a.id, new Uint8Array([5]))).toBe(false);
+      expect(await store.credentials.activate(pending.id, a.id, pending.publicKey, T0)).toBe(true);
       expect((await store.credentials.findById(pending.id))?.activatedAt?.getTime()).toBe(
         T0.getTime(),
       );
       expect(await store.credentials.listByAccount(a.id)).toHaveLength(1);
-      expect(await store.credentials.delete(pending.id, a.id)).toBe(true);
-      expect(await store.credentials.activate(pending.id, a.id, T0)).toBe(false);
+      expect(await store.credentials.delete(pending.id, a.id, pending.publicKey)).toBe(true);
+      expect(await store.credentials.activate(pending.id, a.id, pending.publicKey, T0)).toBe(false);
     });
 
     it("challenges: consumed once, also under concurrency", async () => {

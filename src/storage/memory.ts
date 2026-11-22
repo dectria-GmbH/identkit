@@ -13,6 +13,9 @@ import type {
 
 const copy = <T>(value: T): T => structuredClone(value);
 
+const sameBytes = (a: Uint8Array, b: Uint8Array) =>
+  a.byteLength === b.byteLength && a.every((byte, i) => byte === b[i]);
+
 function isFlowOpen(flow: OtpFlowRecord, at: Date): boolean {
   return (
     flow.consumedAt === null &&
@@ -201,9 +204,11 @@ export function createMemoryStore(): IdentkitStore {
         credentials.set(credential.id, copy(credential));
         return Promise.resolve("inserted");
       },
-      activate(id, accountId, at) {
+      activate(id, accountId, publicKey, at) {
         const found = credentials.get(id);
-        if (!found || found.accountId !== accountId) return Promise.resolve(false);
+        if (!found || found.accountId !== accountId || !sameBytes(found.publicKey, publicKey)) {
+          return Promise.resolve(false);
+        }
         found.activatedAt ??= at;
         return Promise.resolve(true);
       },
@@ -227,9 +232,10 @@ export function createMemoryStore(): IdentkitStore {
         found.lastUsedAt = usedAt;
         return Promise.resolve(true);
       },
-      delete(id, accountId) {
+      delete(id, accountId, publicKey) {
         const found = credentials.get(id);
         if (!found || found.accountId !== accountId) return Promise.resolve(false);
+        if (publicKey && !sameBytes(found.publicKey, publicKey)) return Promise.resolve(false);
         credentials.delete(id);
         return Promise.resolve(true);
       },

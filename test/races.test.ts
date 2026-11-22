@@ -18,6 +18,8 @@ interface Hooks {
   beforeCredentialInsert: (() => Promise<void>) | null;
   /** Runs once, right after a credential was inserted. */
   afterCredentialInsert: (() => Promise<void>) | null;
+  /** Runs once, right before a pending credential is activated. */
+  beforeActivate: (() => Promise<void>) | null;
 }
 
 function hookedStore() {
@@ -28,6 +30,7 @@ function hookedStore() {
     failNextLink: false,
     beforeCredentialInsert: null,
     afterCredentialInsert: null,
+    beforeActivate: null,
   };
   const store: IdentkitStore = {
     ...inner,
@@ -42,6 +45,12 @@ function hookedStore() {
         hooks.afterCredentialInsert = null;
         if (after) await after();
         return result;
+      },
+      activate: async (...args) => {
+        const hook = hooks.beforeActivate;
+        hooks.beforeActivate = null;
+        if (hook) await hook();
+        return inner.credentials.activate(...args);
       },
       updateCounter: async (...args) => {
         const result = await inner.credentials.updateCounter(...args);
@@ -224,6 +233,27 @@ describe("passkey registration races", () => {
       reason: "no_session",
     });
     expect(await inner.credentials.listByAccount(user.account.id)).toHaveLength(0);
+  });
+
+  it("a session revoked between the re-check and the activation leaves no passkey", async () => {
+    const { inner, store, hooks } = hookedStore();
+    const t = setup({ store });
+    const user = await t.signIn("person@example.org");
+    const start = await t.ik.passkeys.startRegistration({ sessionToken: user.token });
+    if (start.status !== "ok") throw new Error("denied");
+    const response = t.authenticator.register(start.options);
+    hooks.beforeActivate = async () => {
+      await t.ik.sessions.revokeAll(user.account.id);
+    };
+    expect(await t.ik.passkeys.finishRegistration({ sessionToken: user.token }, response)).toEqual({
+      status: "denied",
+      reason: "no_session",
+    });
+    expect(await inner.credentials.listByAccount(user.account.id)).toHaveLength(0);
+    const { options } = await t.ik.passkeys.startSignIn();
+    expect((await t.ik.passkeys.finishSignIn(t.authenticator.assert(options))).status).toBe(
+      "failed",
+    );
   });
 
   it("a passkey cannot sign in before its registration completed", async () => {

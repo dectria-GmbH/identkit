@@ -221,15 +221,19 @@ export interface IdentkitStore {
   credentials: {
     /** Inserts as given. An id that exists, active or not, is a duplicate. */
     insert(credential: CredentialRecord): Promise<"inserted" | "duplicate">;
-    /** Marks a pending credential of the account active. Returns false if it is gone. */
-    activate(id: string, accountId: string, at: Date): Promise<boolean>;
+    /**
+     * Marks the pending credential with this id, account and public key active. Returns false
+     * if it is gone or another registration's row now holds the id.
+     */
+    activate(id: string, accountId: string, publicKey: Uint8Array, at: Date): Promise<boolean>;
     /** Active credentials only. */
     findById(id: string): Promise<CredentialRecord | null>;
     /** Active credentials only. */
     listByAccount(accountId: string): Promise<CredentialRecord[]>;
     /** Compare-and-set of the signature counter of an active credential. */
     updateCounter(id: string, expected: number, next: number, usedAt: Date): Promise<boolean>;
-    delete(id: string, accountId: string): Promise<boolean>;
+    /** Deletes the credential of the account, pending or active; with `publicKey` only that row. */
+    delete(id: string, accountId: string, publicKey?: Uint8Array): Promise<boolean>;
   };
   challenges: {
     insert(challenge: ChallengeRecord): Promise<void>;

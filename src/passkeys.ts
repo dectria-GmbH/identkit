@@ -270,15 +270,39 @@ export function createPasskeys(
       );
       const activated =
         holds === true &&
-        (await store.credentials.activate(verified.credentialId, account.id, clock.now()));
+        (await store.credentials.activate(
+          verified.credentialId,
+          account.id,
+          verified.publicKey,
+          clock.now(),
+        ));
       if (!activated) {
-        await store.credentials.delete(verified.credentialId, account.id);
+        await store.credentials.delete(verified.credentialId, account.id, verified.publicKey);
         await ctx.emit({
           type: "passkey.registration_failed",
           accountId: account.id,
           reason: "grant_changed",
         });
         return holds === true ? { status: "denied", reason: "no_session" } : holds;
+      }
+      // A revocation between the check and the activation would be missed: check once more.
+      // The passkey was usable for a moment, so on failure every session of the account ends;
+      // a sign-in that raced with the delete is caught by its own re-check.
+      const stillHolds = await grantStillHolds(
+        grant,
+        resolved.sessionId,
+        account.id,
+        verified.credentialId,
+      );
+      if (stillHolds !== true) {
+        await store.credentials.delete(verified.credentialId, account.id, verified.publicKey);
+        await sessions.revokeAll(account.id);
+        await ctx.emit({
+          type: "passkey.registration_failed",
+          accountId: account.id,
+          reason: "grant_changed",
+        });
+        return stillHolds;
       }
       // Revoke first: if the audit sink fails afterwards, no other session survives.
       const revokedSessions = await sessions.revokeAll(

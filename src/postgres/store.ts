@@ -448,12 +448,13 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           .executeTakeFirst();
         return row ? "inserted" : "duplicate";
       },
-      async activate(id, accountId, at) {
+      async activate(id, accountId, publicKey, at) {
         const row = await db
           .updateTable("identkit_credentials")
           .set((eb) => ({ activated_at: eb.fn.coalesce("activated_at", eb.val(at)) }))
           .where("id", "=", id)
           .where("account_id", "=", accountId)
+          .where("public_key", "=", Buffer.from(publicKey))
           .returning("id")
           .executeTakeFirst();
         return row !== undefined;
@@ -488,13 +489,13 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           .executeTakeFirst();
         return row !== undefined;
       },
-      async delete(id, accountId) {
-        const row = await db
+      async delete(id, accountId, publicKey) {
+        let query = db
           .deleteFrom("identkit_credentials")
           .where("id", "=", id)
-          .where("account_id", "=", accountId)
-          .returning("id")
-          .executeTakeFirst();
+          .where("account_id", "=", accountId);
+        if (publicKey) query = query.where("public_key", "=", Buffer.from(publicKey));
+        const row = await query.returning("id").executeTakeFirst();
         return row !== undefined;
       },
     },
