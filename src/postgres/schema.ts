@@ -93,6 +93,19 @@ export interface IdentkitDatabase {
     expires_at: Date;
     completed_at: Date | null;
   };
+  identkit_totp_factors: {
+    id: string;
+    account_id: string;
+    sealed_secret: string;
+    algorithm: string;
+    digits: number;
+    created_at: Date;
+    enrolment_session_id: string | null;
+    activated_at: Date | null;
+    /** bigint column; node-postgres returns it as a string. */
+    last_used_step: string | number | null;
+    last_used_at: Date | null;
+  };
   identkit_migrations: {
     name: string;
     applied_at: Date;

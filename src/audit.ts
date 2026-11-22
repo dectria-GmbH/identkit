@@ -1,6 +1,6 @@
 /**
- * Security-relevant events. Events never carry a code, token, challenge, key or e-mail
- * address. `addressDigest` is a keyed hash of the normalized address, so a consumer can
+ * Security-relevant events. Events never carry a code, token, challenge, key, TOTP secret,
+ * sealed secret, provisioning URI or e-mail address. `addressDigest` is a keyed hash of the normalized address, so a consumer can
  * correlate events for one address without identkit writing the address itself.
  */
 export type AuditEventType =
@@ -17,6 +17,7 @@ export type AuditEventType =
   | "session.revoked"
   | "session.expired"
   | "second_factor.required"
+  | "second_factor.unavailable"
   | "step_up.granted"
   | "step_up.failed"
   | "passkey.registered"
@@ -26,7 +27,16 @@ export type AuditEventType =
   | "passkey.counter_regression"
   | "approval.challenge_created"
   | "approval.verified"
+  | "approval.code_confirmation_recorded"
   | "approval.failed"
+  | "totp.enrolment_started"
+  | "totp.enrolled"
+  | "totp.enrolment_failed"
+  | "totp.verified"
+  | "totp.verify_failed"
+  | "totp.locked"
+  | "totp.removed"
+  | "totp.resealed"
   | "enrollment.issued"
   | "enrollment.used"
   | "identity_verification.started"
@@ -42,6 +52,8 @@ export interface AuditEvent {
   sessionId?: string;
   flowId?: string;
   credentialId?: string;
+  /** Id of a TOTP factor. */
+  factorId?: string;
   verificationId?: string;
   challengeId?: string;
   addressDigest?: string;
@@ -50,6 +62,8 @@ export interface AuditEvent {
   reason?: string;
   /** SHA-256 hex of the approved payload, for approval events. */
   payloadHash?: string;
+  /** Approval proof level, for approval events: `signature` or `code-confirmation`. */
+  level?: string;
 }
 
 /**

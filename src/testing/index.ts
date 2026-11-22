@@ -1,8 +1,10 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import type { AuditEvent, AuditSink } from "../audit.js";
 import { addSeconds, type Clock } from "../clock.js";
 import type { MailSender } from "../context.js";
 import type { IdentityVerificationAdapter, VendorResult } from "../identity-verification.js";
+import { createAesGcmSealer, SealedSecretError, type SecretSealer } from "../sealer.js";
+import { base32Decode, totpAt, type TotpAlgorithm, type TotpDigits } from "../totp-core.js";
 import type { AssuranceLevel } from "../storage/types.js";
 
 export {
@@ -11,6 +13,51 @@ export {
   type SoftwareAuthenticatorOptions,
   type AssertOverrides,
 } from "./software-authenticator.js";
+
+export interface TestSealer extends SecretSealer {
+  /** Number of `open` calls so far. */
+  opened(): number;
+  /** Makes the next `open` reject, as a wrong key or a changed value would. */
+  failNextOpen(): void;
+}
+
+/**
+ * Sealer for tests: AES-256-GCM with a random key that lives only in this process, plus a
+ * switch to simulate an unreadable value. Not for production: the key is lost on exit.
+ */
+export function createTestSealer(): TestSealer {
+  const inner = createAesGcmSealer({ keys: { test: randomBytes(32) }, activeKeyId: "test" });
+  let opens = 0;
+  let failNext = false;
+  return {
+    seal: (plaintext, context) => inner.seal(plaintext, context),
+    open: (sealed, context) => {
+      opens += 1;
+      if (failNext) {
+        failNext = false;
+        return Promise.reject(new SealedSecretError());
+      }
+      return inner.open(sealed, context);
+    },
+    opened: () => opens,
+    failNextOpen: () => {
+      failNext = true;
+    },
+  };
+}
+
+/**
+ * Computes the TOTP code an authenticator app would show for a base32 secret at `at`, for
+ * tests and demos.
+ */
+export function generateTotpCode(input: {
+  secret: string;
+  at: Date;
+  algorithm?: TotpAlgorithm;
+  digits?: TotpDigits;
+}): string {
+  return totpAt(base32Decode(input.secret), input.at, input.algorithm ?? "SHA1", input.digits ?? 6);
+}
 
 export interface FakeClock extends Clock {
   set(date: Date): void;

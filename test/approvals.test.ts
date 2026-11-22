@@ -185,23 +185,27 @@ describe("approval proofs", () => {
       rpId: RP_ID,
       origins: [ORIGIN],
     };
-    expect(await verifyApprovalEvidence(result.proof, verifier)).toBe(true);
-    expect(await verifyApprovalEvidence({ ...result.proof, payloadHash: payloadB }, verifier)).toBe(
-      false,
-    );
+    const verified = { status: "verified", level: "signature" };
+    const invalid = { status: "invalid" };
+    expect(result.proof.level).toBe("signature");
+    expect(await verifyApprovalEvidence(result.proof, verifier)).toEqual(verified);
+    expect(
+      await verifyApprovalEvidence({ ...result.proof, payloadHash: payloadB }, verifier),
+    ).toEqual(invalid);
     expect(
       await verifyApprovalEvidence(result.proof, {
         ...verifier,
         origins: ["https://other.example"],
       }),
-    ).toBe(false);
+    ).toEqual(invalid);
+    expect(await verifyApprovalEvidence(result.proof)).toEqual(invalid);
     for (const edited of [
       { ...result.proof, accountId: "another-account" },
       { ...result.proof, origin: "https://other.example" },
       { ...result.proof, counter: result.proof.counter + 1 },
       { ...result.proof, rpId: "other.example" },
     ]) {
-      expect(await verifyApprovalEvidence(edited, verifier)).toBe(false);
+      expect(await verifyApprovalEvidence(edited, verifier)).toEqual(invalid);
     }
   });
 });

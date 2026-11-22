@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { addSeconds } from "../src/clock.js";
-import type { IdentkitStore, OtpFlowRecord, SessionRecord } from "../src/storage/types.js";
+import type {
+  IdentkitStore,
+  OtpFlowRecord,
+  SessionRecord,
+  TotpFactorRecord,
+} from "../src/storage/types.js";
 
 const T0 = new Date("2030-01-01T00:00:00.000Z");
 let seq = 0;
@@ -51,6 +56,25 @@ function session(accountId: string, overrides: Partial<SessionRecord> = {}): Ses
     stepUp: { method: "email_otp", at: T0 },
     revokedAt: null,
     revokeReason: null,
+    ...overrides,
+  };
+}
+
+function totpFactor(
+  accountId: string,
+  overrides: Partial<TotpFactorRecord> = {},
+): TotpFactorRecord {
+  return {
+    id: uid("totp"),
+    accountId,
+    sealedSecret: `v1.k.${uid("sealed")}`,
+    algorithm: "SHA1",
+    digits: 6,
+    createdAt: T0,
+    enrolmentSessionId: null,
+    activatedAt: null,
+    lastUsedStep: null,
+    lastUsedAt: null,
     ...overrides,
   };
 }
@@ -329,6 +353,107 @@ export function runStoreContract(
       const found = results.filter((r) => r !== null);
       expect(found).toHaveLength(1);
       expect(found[0]?.payloadHash).toBe("a".repeat(64));
+    });
+
+    it("totp: a pending factor is invisible; one active factor per account, also under concurrency", async () => {
+      const store = await factory();
+      const a = account();
+      await store.accounts.insert(a);
+      const pending = [totpFactor(a.id), totpFactor(a.id), totpFactor(a.id)];
+      for (const f of pending) await store.totp.insert(f);
+      expect(await store.totp.findActive(a.id)).toBeNull();
+      expect((await store.totp.findPending(pending[0]?.id ?? ""))?.id).toBe(pending[0]?.id);
+      // A pending factor cannot record a step.
+      expect(await store.totp.recordStep(pending[0]?.id ?? "", a.id, 5, T0)).toBe(false);
+      expect(await store.totp.activate(pending[0]?.id ?? "", "other-account", 5, T0)).toBe(false);
+      const results = await Promise.all(
+        pending.map((f, i) => store.totp.activate(f.id, a.id, 10 + i, addSeconds(T0, i))),
+      );
+      expect(results.filter(Boolean)).toHaveLength(1);
+      const active = await store.totp.findActive(a.id);
+      const winner = pending[results.indexOf(true)];
+      expect(active?.id).toBe(winner?.id);
+      expect(active?.lastUsedStep).toBe(10 + results.indexOf(true));
+      expect(await store.totp.findPending(active?.id ?? "")).toBeNull();
+      expect(await store.totp.activate(active?.id ?? "", a.id, 99, T0)).toBe(false);
+    });
+
+    it("totp: a time step is recorded once and only upwards, also under concurrency", async () => {
+      const store = await factory();
+      const a = account();
+      await store.accounts.insert(a);
+      const f = totpFactor(a.id);
+      await store.totp.insert(f);
+      expect(await store.totp.activate(f.id, a.id, 100, T0)).toBe(true);
+      expect(await store.totp.recordStep(f.id, a.id, 100, T0)).toBe(false);
+      expect(await store.totp.recordStep(f.id, a.id, 99, T0)).toBe(false);
+      const results = await Promise.all(
+        Array.from({ length: 10 }, () => store.totp.recordStep(f.id, a.id, 101, T0)),
+      );
+      expect(results.filter(Boolean)).toHaveLength(1);
+      expect(await store.totp.recordStep(f.id, "other-account", 102, T0)).toBe(false);
+      expect(await store.totp.recordStep(f.id, a.id, 102, addSeconds(T0, 30))).toBe(true);
+      const after = await store.totp.findActive(a.id);
+      expect(after?.lastUsedStep).toBe(102);
+      expect(after?.lastUsedAt?.getTime()).toBe(addSeconds(T0, 30).getTime());
+    });
+
+    it("totp: delete is scoped to the account; the sealed secret changes by compare-and-set", async () => {
+      const store = await factory();
+      const a = account();
+      await store.accounts.insert(a);
+      const f = totpFactor(a.id);
+      await store.totp.insert(f);
+      await store.totp.activate(f.id, a.id, 1, T0);
+      expect(await store.totp.replaceSealedSecret(f.id, "wrong", "next")).toBe(false);
+      const swaps = await Promise.all([
+        store.totp.replaceSealedSecret(f.id, f.sealedSecret, "next-1"),
+        store.totp.replaceSealedSecret(f.id, f.sealedSecret, "next-2"),
+      ]);
+      expect(swaps.filter(Boolean)).toHaveLength(1);
+      expect(await store.totp.delete(f.id, "other-account")).toBe(false);
+      expect(await store.totp.delete(f.id, a.id)).toBe(true);
+      expect(await store.totp.findActive(a.id)).toBeNull();
+      // A new factor can be activated after the removal.
+      const g = totpFactor(a.id);
+      await store.totp.insert(g);
+      expect(await store.totp.activate(g.id, a.id, 2, T0)).toBe(true);
+    });
+
+    it("sessions: store a TOTP step-up and auth method", async () => {
+      const store = await factory();
+      const a = account();
+      await store.accounts.insert(a);
+      const s = session(a.id, {
+        authMethods: ["email_otp", "totp"],
+        stepUp: { method: "totp", at: T0 },
+      });
+      await store.sessions.insert(s);
+      const found = await store.sessions.findById(s.id);
+      expect(found?.authMethods).toEqual(["email_otp", "totp"]);
+      expect(found?.stepUp?.method).toBe("totp");
+    });
+
+    it("challenges: a pending code approval is consumed once, only for its purpose", async () => {
+      const store = await factory();
+      const digest = uid("chal");
+      await store.challenges.insert({
+        id: uid("cid"),
+        challengeDigest: digest,
+        purpose: "approval_code",
+        accountId: null,
+        sessionId: null,
+        enrollmentTokenDigest: null,
+        payloadHash: "b".repeat(64),
+        nonce: null,
+        createdAt: T0,
+        expiresAt: addSeconds(T0, 60),
+      });
+      expect(await store.challenges.consumeByDigest(digest, "approval")).toBeNull();
+      const results = await Promise.all(
+        Array.from({ length: 5 }, () => store.challenges.consumeByDigest(digest, "approval_code")),
+      );
+      expect(results.filter((r) => r !== null)).toHaveLength(1);
     });
 
     it("enrollment: consumed once, not after expiry", async () => {

@@ -1,0 +1,716 @@
+import { randomBytes } from "node:crypto";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  createAesGcmSealer,
+  createMemoryStore,
+  MethodNotAllowedError,
+  NotConfiguredError,
+  SealedSecretError,
+  type SecretSealer,
+} from "../src/index.js";
+import type { IdentkitStore } from "../src/storage/types.js";
+import { base32Decode } from "../src/totp-core.js";
+import { emailFirstPolicy, mfaPolicy, setup, STEP, testConfig } from "./helpers.js";
+
+type T = ReturnType<typeof setup>;
+
+/** Everything a value shows when it is logged or serialised. */
+function render(value: unknown): string {
+  return value instanceof Error
+    ? `${value.name} ${value.message} ${value.stack ?? ""} ${JSON.stringify(value)}`
+    : JSON.stringify(value);
+}
+
+/** A well-formed code that is valid at none of the steps in the drift window. */
+function wrongCode(t: T, secret: string): string {
+  const valid = new Set([-1, 0, 1].map((n) => t.totpCode(secret, n * STEP)));
+  for (let i = 0; ; i += 1) {
+    const candidate = String(i).padStart(6, "0");
+    if (!valid.has(candidate)) return candidate;
+  }
+}
+
+async function stepUpTotp(t: T, token: string, code: string) {
+  return t.ik.stepUp.verifyTotp(token, { code });
+}
+
+/** Signs in by e-mail after the resend cooldown. */
+async function signInAgain(t: T, email: string) {
+  t.clock.advanceSeconds(testConfig.emailOtp.resendCooldownSeconds);
+  const { flowId, code } = await t.codeFor(email);
+  return t.ik.emailSignIn.verifyCode({ flowId, code });
+}
+
+function hookedTotpStore() {
+  const inner = createMemoryStore();
+  const hooks: {
+    afterRecordStep: (() => Promise<void>) | null;
+    beforeActivate: (() => Promise<void>) | null;
+  } = { afterRecordStep: null, beforeActivate: null };
+  const store: IdentkitStore = {
+    ...inner,
+    totp: {
+      ...inner.totp,
+      recordStep: async (...args) => {
+        const result = await inner.totp.recordStep(...args);
+        const hook = hooks.afterRecordStep;
+        hooks.afterRecordStep = null;
+        if (hook) await hook();
+        return result;
+      },
+      activate: async (...args) => {
+        const hook = hooks.beforeActivate;
+        hooks.beforeActivate = null;
+        if (hook) await hook();
+        return inner.totp.activate(...args);
+      },
+    },
+  };
+  return { inner, store, hooks };
+}
+
+describe("TOTP enrolment", () => {
+  it("rule: enrolment inactive before confirmation - a pending factor cannot step up, complete a sign-in or approve", async () => {
+    const t = setup({ policy: { ...mfaPolicy, approvalProofLevel: "code-confirmation" } });
+    const user = await t.signIn("person@example.org");
+    const start = await t.ik.totp.startEnrolment(user.token);
+    if (start.status !== "ok") throw new Error("denied");
+    expect(await t.ik.totp.get(user.account.id)).toBeNull();
+    expect(await t.store.totp.findActive(user.account.id)).toBeNull();
+    expect(await stepUpTotp(t, user.token, t.totpCode(start.secret))).toEqual({
+      status: "failed",
+      reason: "invalid",
+    });
+    expect(
+      await t.ik.approvals.start({
+        sessionToken: user.token,
+        payloadHash: "a".repeat(64),
+        level: "code-confirmation",
+      }),
+    ).toEqual({ status: "denied", reason: "no_totp" });
+    // With only a pending factor, the account has no second factor: the e-mail code suffices.
+    expect((await signInAgain(t, "person@example.org")).status).toBe("signed_in");
+  });
+
+  it("rule: enrolment confirmation - a wrong code does not activate; a valid code activates and is consumed", async () => {
+    const t = setup();
+    const user = await t.signIn("person@example.org");
+    const start = await t.ik.totp.startEnrolment(user.token);
+    if (start.status !== "ok") throw new Error("denied");
+    expect(start).toMatchObject({ algorithm: "SHA1", digits: 6, periodSeconds: 30 });
+    expect(base32Decode(start.secret)).toHaveLength(20);
+    expect(start.provisioningUri.startsWith("otpauth://totp/")).toBe(true);
+    expect(
+      await t.ik.totp.confirmEnrolment(user.token, {
+        factorId: start.factorId,
+        code: wrongCode(t, start.secret),
+      }),
+    ).toEqual({ status: "failed", reason: "invalid" });
+    expect(await t.ik.totp.get(user.account.id)).toBeNull();
+
+    const code = t.totpCode(start.secret);
+    const confirmed = await t.ik.totp.confirmEnrolment(user.token, {
+      factorId: start.factorId,
+      code,
+    });
+    expect(confirmed).toEqual({ status: "enrolled", factorId: start.factorId, revokedSessions: 0 });
+    expect((await t.ik.totp.get(user.account.id))?.id).toBe(start.factorId);
+    // The confirming code is consumed: it cannot step up in the same time step.
+    expect((await stepUpTotp(t, user.token, code)).status).toBe("failed");
+    t.clock.advanceSeconds(STEP);
+    expect((await stepUpTotp(t, user.token, t.totpCode(start.secret))).status).toBe("granted");
+  });
+
+  it("enrolment: expires, and only the session that started it can confirm", async () => {
+    const t = setup();
+    const user = await t.signIn("person@example.org");
+    const start = await t.ik.totp.startEnrolment(user.token);
+    if (start.status !== "ok") throw new Error("denied");
+
+    const other = await signInAgain(t, "person@example.org");
+    if (other.status !== "signed_in") throw new Error("no session");
+    expect(
+      await t.ik.totp.confirmEnrolment(other.token, {
+        factorId: start.factorId,
+        code: t.totpCode(start.secret),
+      }),
+    ).toEqual({ status: "failed", reason: "invalid" });
+
+    t.clock.advanceSeconds(
+      testConfig.totp.enrolmentTtlSeconds - testConfig.emailOtp.resendCooldownSeconds,
+    );
+    // The step-up of the session is stale by now as well; refresh it to test the expiry alone.
+    const flow = await t.ik.stepUp.requestEmailCode(user.token);
+    if (flow.status !== "sent") throw new Error("not sent");
+    const refreshed = await t.ik.stepUp.verifyEmailCode(user.token, {
+      flowId: flow.flowId,
+      code: t.mail.last()?.code ?? "",
+    });
+    if (refreshed.status !== "granted") throw new Error("no step-up");
+    expect(
+      await t.ik.totp.confirmEnrolment(refreshed.token, {
+        factorId: start.factorId,
+        code: t.totpCode(start.secret),
+      }),
+    ).toEqual({ status: "failed", reason: "expired" });
+  });
+
+  it("enrolment: needs a fresh step-up; with a passkey, a passkey step-up; a second factor is refused", async () => {
+    const t = setup();
+    const user = await t.userWithPasskey("person@example.org");
+    expect(await t.ik.totp.startEnrolment(user.token)).toEqual({
+      status: "denied",
+      reason: "step_up_required",
+    });
+    const passkeyStart = await t.ik.stepUp.startPasskey(user.token);
+    if (passkeyStart.status !== "ok") throw new Error("denied");
+    const granted = await t.ik.stepUp.finishPasskey(
+      user.token,
+      t.authenticator.assert(passkeyStart.options),
+    );
+    if (granted.status !== "granted") throw new Error("no step-up");
+    await t.enrolTotp(granted.token);
+    expect(await t.ik.totp.startEnrolment(granted.token)).toEqual({
+      status: "denied",
+      reason: "already_enrolled",
+    });
+
+    const fresh = setup();
+    const stale = await fresh.signIn("person@example.org");
+    fresh.clock.advanceSeconds(testConfig.stepUp.validitySeconds);
+    expect(await fresh.ik.totp.startEnrolment(stale.token)).toEqual({
+      status: "denied",
+      reason: "step_up_required",
+    });
+  });
+
+  it("a first passkey on an account with only TOTP needs a TOTP step-up", async () => {
+    const t = setup();
+    const user = await t.signIn("person@example.org");
+    const { secret } = await t.enrolTotp(user.token);
+    expect(await t.ik.passkeys.startRegistration({ sessionToken: user.token })).toEqual({
+      status: "denied",
+      reason: "step_up_required",
+    });
+    t.clock.advanceSeconds(STEP);
+    const granted = await stepUpTotp(t, user.token, t.totpCode(secret));
+    if (granted.status !== "granted") throw new Error("no step-up");
+    await t.registerPasskey(granted.token);
+  });
+
+  it("rule: factor change revokes sessions - enrolment, removal and administrative revocation end other sessions", async () => {
+    const t = setup();
+    const a = await t.signIn("person@example.org");
+    const b = await signInAgain(t, "person@example.org");
+    if (b.status !== "signed_in") throw new Error("no session");
+    const { secret } = await t.enrolTotp(a.token);
+    expect(await t.ik.sessions.validate(b.token)).toBeNull();
+    expect(await t.ik.sessions.validate(a.token)).not.toBeNull();
+
+    const c = await signInAgain(t, "person@example.org");
+    if (c.status !== "signed_in") throw new Error("no session");
+    // Removal needs a fresh step-up with the strongest factor: here TOTP.
+    expect(await t.ik.totp.remove(a.token)).toEqual({
+      status: "denied",
+      reason: "step_up_required",
+    });
+    t.clock.advanceSeconds(STEP);
+    const granted = await stepUpTotp(t, a.token, t.totpCode(secret));
+    if (granted.status !== "granted") throw new Error("no step-up");
+    expect(await t.ik.totp.remove(granted.token)).toEqual({ status: "removed" });
+    expect(await t.ik.sessions.validate(c.token)).toBeNull();
+    expect(await t.ik.sessions.validate(granted.token)).not.toBeNull();
+    expect(await t.ik.totp.get(a.account.id)).toBeNull();
+
+    await t.enrolTotp(granted.token);
+    expect(await t.ik.totp.revoke(a.account.id)).toBe(true);
+    expect(await t.ik.sessions.validate(granted.token)).toBeNull();
+    expect(t.audit.ofType("totp.removed")).toHaveLength(2);
+  });
+
+  it("enrolment: a revocation between the check and the activation leaves no factor", async () => {
+    const { inner, store, hooks } = hookedTotpStore();
+    const t = setup({ store });
+    const user = await t.signIn("person@example.org");
+    const start = await t.ik.totp.startEnrolment(user.token);
+    if (start.status !== "ok") throw new Error("denied");
+    hooks.beforeActivate = async () => {
+      await inner.sessions.revoke(user.session.id, t.clock.now(), "test");
+    };
+    expect(
+      await t.ik.totp.confirmEnrolment(user.token, {
+        factorId: start.factorId,
+        code: t.totpCode(start.secret),
+      }),
+    ).toEqual({ status: "denied", reason: "no_session" });
+    expect(await inner.totp.findActive(user.account.id)).toBeNull();
+  });
+
+  it("the TOTP secret is stored only sealed", async () => {
+    const t = setup();
+    const user = await t.signIn("person@example.org");
+    const { secret, factorId } = await t.enrolTotp(user.token);
+    const row = await t.store.totp.findActive(user.account.id);
+    expect(row?.id).toBe(factorId);
+    const stored = JSON.stringify(row);
+    expect(stored).not.toContain(secret);
+    expect(stored).not.toContain(base32Decode(secret).toString("hex"));
+    expect(stored).not.toContain(base32Decode(secret).toString("base64url"));
+  });
+});
+
+describe("TOTP verification", () => {
+  it("rule: drift window - codes within driftSteps are accepted, codes outside are refused", async () => {
+    const t = setup();
+    const user = await t.signIn("person@example.org");
+    const { secret } = await t.enrolTotp(user.token);
+    t.clock.advanceSeconds(10 * STEP);
+    let token = user.token;
+    expect((await stepUpTotp(t, token, t.totpCode(secret, -2 * STEP))).status).toBe("failed");
+    expect((await stepUpTotp(t, token, t.totpCode(secret, 2 * STEP))).status).toBe("failed");
+    const early = await stepUpTotp(t, token, t.totpCode(secret, -STEP));
+    if (early.status !== "granted") throw new Error(`early: ${early.status}`);
+    token = early.token;
+    expect((await stepUpTotp(t, token, t.totpCode(secret, STEP))).status).toBe("granted");
+
+    const strict = setup({
+      config: { ...testConfig, totp: { ...testConfig.totp, driftSteps: 0 } },
+    });
+    const other = await strict.signIn("person@example.org");
+    const enrolled = await strict.enrolTotp(other.token);
+    strict.clock.advanceSeconds(10 * STEP);
+    expect(
+      (await stepUpTotp(strict, other.token, strict.totpCode(enrolled.secret, -STEP))).status,
+    ).toBe("failed");
+    expect((await stepUpTotp(strict, other.token, strict.totpCode(enrolled.secret))).status).toBe(
+      "granted",
+    );
+  });
+
+  it("rule: replay - a time step accepted once is not accepted again, also for an older step", async () => {
+    const t = setup();
+    const user = await t.signIn("person@example.org");
+    const { secret } = await t.enrolTotp(user.token);
+    t.clock.advanceSeconds(STEP);
+    const code = t.totpCode(secret);
+    const first = await stepUpTotp(t, user.token, code);
+    if (first.status !== "granted") throw new Error("no step-up");
+    expect(await stepUpTotp(t, first.token, code)).toEqual({ status: "failed", reason: "invalid" });
+    // Still inside the drift window, but older than the accepted step.
+    t.clock.advanceSeconds(STEP);
+    expect((await stepUpTotp(t, first.token, t.totpCode(secret, -STEP))).status).toBe("failed");
+    expect(t.audit.ofType("totp.verify_failed").map((e) => e.reason)).toEqual([
+      "replayed",
+      "replayed",
+    ]);
+  });
+
+  it("rule: replay - parallel requests with the same code: exactly one succeeds", async () => {
+    const t = setup();
+    const user = await t.signIn("person@example.org");
+    const { secret } = await t.enrolTotp(user.token);
+    const tokens: string[] = [user.token];
+    for (let i = 0; i < 4; i += 1) {
+      const next = await signInAgain(t, "person@example.org");
+      if (next.status !== "signed_in") throw new Error("no session");
+      tokens.push(next.token);
+    }
+    t.clock.advanceSeconds(STEP);
+    const code = t.totpCode(secret);
+    const results = await Promise.all(tokens.map((token) => stepUpTotp(t, token, code)));
+    expect(results.filter((r) => r.status === "granted")).toHaveLength(1);
+  });
+
+  it("rule: attempt limit and lockout - failures lock TOTP for the account across purposes; the lock ends; a success resets", async () => {
+    const t = setup({ policy: mfaPolicy });
+    const user = await t.signIn("person@example.org");
+    const { secret } = await t.enrolTotp(user.token);
+    const { maxFailures, lockSeconds } = testConfig.totp.lockout;
+    t.clock.advanceSeconds(STEP);
+    const wrong = wrongCode(t, secret);
+    for (let i = 0; i < maxFailures; i += 1) {
+      expect(await stepUpTotp(t, user.token, wrong)).toEqual({
+        status: "failed",
+        reason: "invalid",
+      });
+    }
+    expect(await stepUpTotp(t, user.token, t.totpCode(secret))).toEqual({
+      status: "failed",
+      reason: "locked",
+    });
+    expect(t.audit.ofType("totp.locked")).toHaveLength(1);
+    // The lock is per account, so the second factor of a new sign-in is locked too.
+    const pending = await signInAgain(t, "person@example.org");
+    if (pending.status !== "second_factor_required") throw new Error(pending.status);
+    expect(pending.methods).toEqual(["totp"]);
+    expect(
+      await t.ik.totp.verifySecondFactor(pending.pendingToken, { code: t.totpCode(secret) }),
+    ).toEqual({ status: "failed", reason: "locked" });
+
+    t.clock.advanceSeconds(lockSeconds);
+    const after = await signInAgain(t, "person@example.org");
+    if (after.status !== "second_factor_required") throw new Error(after.status);
+    expect(
+      (await t.ik.totp.verifySecondFactor(after.pendingToken, { code: t.totpCode(secret) })).status,
+    ).toBe("signed_in");
+  });
+
+  it("rule: attempt limit and lockout - parallel guesses cannot exceed the limit", async () => {
+    const t = setup();
+    const user = await t.signIn("person@example.org");
+    const { secret } = await t.enrolTotp(user.token);
+    t.clock.advanceSeconds(STEP);
+    const wrong = wrongCode(t, secret);
+    await Promise.all(Array.from({ length: 25 }, () => stepUpTotp(t, user.token, wrong)));
+    const compared = t.audit.ofType("totp.verify_failed").filter((e) => e.reason === "wrong_code");
+    expect(compared).toHaveLength(testConfig.totp.lockout.maxFailures);
+  });
+
+  it("refuses malformed codes without opening the secret", async () => {
+    const t = setup();
+    const user = await t.signIn("person@example.org");
+    await t.enrolTotp(user.token);
+    const opened = t.testSealer.opened();
+    for (const code of ["12345", "1234567", "12a456", "", " 123456"]) {
+      expect((await stepUpTotp(t, user.token, code)).status).toBe("failed");
+    }
+    expect(t.testSealer.opened()).toBe(opened);
+  });
+
+  it("an unreadable sealed secret fails closed with a SealedSecretError", async () => {
+    const t = setup();
+    const user = await t.signIn("person@example.org");
+    const { secret } = await t.enrolTotp(user.token);
+    t.clock.advanceSeconds(STEP);
+    t.testSealer.failNextOpen();
+    await expect(stepUpTotp(t, user.token, t.totpCode(secret))).rejects.toBeInstanceOf(
+      SealedSecretError,
+    );
+    expect((await t.ik.sessions.validate(user.token))?.stepUp?.method).toBe("email_otp");
+  });
+
+  it("TOTP needs a sealer: a static policy fails at construction, a dynamic one per call", async () => {
+    const { createIdentkit, createHmacHasher } = await import("../src/index.js");
+    const { createRecordingAuditSink, createRecordingMailSender } =
+      await import("../src/testing/index.js");
+    const base = {
+      config: testConfig,
+      store: createMemoryStore(),
+      hasher: createHmacHasher(randomBytes(32)),
+      mail: createRecordingMailSender(),
+      audit: createRecordingAuditSink(),
+      isPrivilegedAccount: () => false,
+    };
+    expect(() => createIdentkit({ ...base, policy: mfaPolicy })).toThrow(NotConfiguredError);
+    // A policy function is read per call, so the missing sealer shows only then.
+    const ik = createIdentkit({ ...base, policy: () => mfaPolicy });
+    await expect(ik.totp.startEnrolment("A".repeat(43))).rejects.toBeInstanceOf(NotConfiguredError);
+  });
+});
+
+describe("TOTP as second factor and step-up", () => {
+  it("e-mail code then TOTP gives a full session with both methods", async () => {
+    const t = setup({ policy: mfaPolicy });
+    const user = await t.signIn("person@example.org");
+    const { secret } = await t.enrolTotp(user.token);
+    t.clock.advanceSeconds(STEP);
+    const pending = await signInAgain(t, "person@example.org");
+    if (pending.status !== "second_factor_required") throw new Error(pending.status);
+    expect(await t.ik.sessions.validate(pending.pendingToken)).toBeNull();
+    const done = await t.ik.totp.verifySecondFactor(pending.pendingToken, {
+      code: t.totpCode(secret),
+    });
+    if (done.status !== "signed_in") throw new Error(done.status);
+    expect(done.session.authMethods).toEqual(["email_otp", "totp"]);
+    expect(done.session.stepUp?.method).toBe("totp");
+    expect((await t.ik.sessions.requireStepUp(done.token, { methods: ["totp"] })).ok).toBe(true);
+  });
+
+  it("a removal during the second-factor check leaves no session", async () => {
+    const { inner, store, hooks } = hookedTotpStore();
+    const t = setup({ store, policy: mfaPolicy });
+    const user = await t.signIn("person@example.org");
+    const { secret, factorId } = await t.enrolTotp(user.token);
+    t.clock.advanceSeconds(STEP);
+    const pending = await signInAgain(t, "person@example.org");
+    if (pending.status !== "second_factor_required") throw new Error(pending.status);
+    hooks.afterRecordStep = async () => {
+      await inner.totp.delete(factorId, user.account.id);
+    };
+    expect(
+      await t.ik.totp.verifySecondFactor(pending.pendingToken, { code: t.totpCode(secret) }),
+    ).toEqual({ status: "failed", reason: "invalid" });
+    expect(
+      (await inner.sessions.revokeAllForAccount(user.account.id, t.clock.now(), "probe")).length,
+    ).toBe(1); // only the enrolling session was still live
+  });
+
+  it("a removal during the step-up check leaves no step-up", async () => {
+    const { inner, store, hooks } = hookedTotpStore();
+    const t = setup({ store });
+    const user = await t.signIn("person@example.org");
+    const { secret, factorId } = await t.enrolTotp(user.token);
+    t.clock.advanceSeconds(STEP);
+    hooks.afterRecordStep = async () => {
+      await inner.totp.delete(factorId, user.account.id);
+    };
+    expect(await stepUpTotp(t, user.token, t.totpCode(secret))).toEqual({
+      status: "failed",
+      reason: "invalid",
+    });
+    expect(await inner.sessions.findById(user.session.id)).toMatchObject({
+      revokeReason: "factor_removed",
+    });
+  });
+
+  it("rule: policy refuses a disallowed factor - enrolment, second factor and step-up by TOTP throw", async () => {
+    const t = setup({ policy: mfaPolicy });
+    const user = await t.signIn("person@example.org");
+    const { secret } = await t.enrolTotp(user.token);
+    t.clock.advanceSeconds(STEP);
+    const pending = await signInAgain(t, "person@example.org");
+    if (pending.status !== "second_factor_required") throw new Error(pending.status);
+
+    t.policy.current = {
+      ...mfaPolicy,
+      secondFactorMethods: ["passkey"],
+      stepUpMethods: ["passkey", "email_otp"],
+    };
+    await expect(
+      t.ik.totp.verifySecondFactor(pending.pendingToken, { code: t.totpCode(secret) }),
+    ).rejects.toBeInstanceOf(MethodNotAllowedError);
+    await expect(stepUpTotp(t, user.token, t.totpCode(secret))).rejects.toBeInstanceOf(
+      MethodNotAllowedError,
+    );
+    await expect(t.ik.totp.startEnrolment(user.token)).rejects.toBeInstanceOf(
+      MethodNotAllowedError,
+    );
+    // The account has a factor the policy does not allow: no session from the e-mail code.
+    expect(await signInAgain(t, "person@example.org")).toEqual({
+      status: "second_factor_unavailable",
+      reason: "method_not_allowed",
+    });
+  });
+
+  it("a passkey second factor is refused when the policy allows only TOTP", async () => {
+    const t = setup({ policy: { ...mfaPolicy, secondFactorMethods: ["totp"] } });
+    await t.userWithPasskey("person@example.org");
+    t.clock.advanceSeconds(testConfig.emailOtp.resendCooldownSeconds);
+    const { flowId, code } = await t.codeFor("person@example.org");
+    expect(await t.ik.emailSignIn.verifyCode({ flowId, code })).toEqual({
+      status: "second_factor_unavailable",
+      reason: "method_not_allowed",
+    });
+  });
+
+  it("rule: privileged accounts need a second factor - secondFactor none does not apply to them", async () => {
+    const t = setup({ policy: emailFirstPolicy, privilegedEmails: ["admin@example.org"] });
+    // A privileged account without a second factor gets no session from an e-mail code.
+    const before = t.audit.ofType("session.created").length;
+    t.clock.advanceSeconds(1);
+    const { flowId, code } = await t.codeFor("admin@example.org");
+    expect(await t.ik.emailSignIn.verifyCode({ flowId, code })).toEqual({
+      status: "second_factor_unavailable",
+      reason: "enrolment_required",
+    });
+    expect(t.audit.ofType("session.created")).toHaveLength(before);
+
+    // A non-privileged account under the same policy signs in with the code alone.
+    const plain = await t.signIn("person@example.org");
+    const { secret } = await t.enrolTotp(plain.token);
+    expect((await signInAgain(t, "person@example.org")).status).toBe("signed_in");
+
+    // Marked privileged, the same account must use its factor.
+    t.privileged.add("person@example.org");
+    t.clock.advanceSeconds(STEP);
+    const pending = await signInAgain(t, "person@example.org");
+    if (pending.status !== "second_factor_required") throw new Error(pending.status);
+    expect(pending.methods).toEqual(["totp"]);
+    expect(
+      (await t.ik.totp.verifySecondFactor(pending.pendingToken, { code: t.totpCode(secret) }))
+        .status,
+    ).toBe("signed_in");
+  });
+
+  it("the privileged hook is required and fails closed", async () => {
+    const { createIdentkit, createHmacHasher } = await import("../src/index.js");
+    const { createRecordingAuditSink, createRecordingMailSender, createTestSealer } =
+      await import("../src/testing/index.js");
+    const base = {
+      config: testConfig,
+      sealer: createTestSealer(),
+      store: createMemoryStore(),
+      hasher: createHmacHasher(randomBytes(32)),
+      mail: createRecordingMailSender(),
+      audit: createRecordingAuditSink(),
+      policy: emailFirstPolicy,
+    };
+    expect(() => createIdentkit(base as unknown as Parameters<typeof createIdentkit>[0])).toThrow(
+      TypeError,
+    );
+    const mail = createRecordingMailSender();
+    const throwing = createIdentkit({
+      ...base,
+      mail,
+      isPrivilegedAccount: () => {
+        throw new Error("directory unavailable");
+      },
+    });
+    const requested = await throwing.emailSignIn.requestCode({ email: "x@example.org" });
+    if (requested.status !== "sent") throw new Error("not sent");
+    await expect(
+      throwing.emailSignIn.verifyCode({ flowId: requested.flowId, code: mail.last()?.code ?? "" }),
+    ).rejects.toThrow("directory unavailable");
+  });
+});
+
+describe("TOTP secrets", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("rule: secret never leaves - audit events, errors, console output and later results hold no secret", async () => {
+    const consoleCalls: unknown[][] = [];
+    for (const method of ["log", "info", "warn", "error", "debug", "trace"] as const) {
+      vi.spyOn(console, method).mockImplementation((...args: unknown[]) => {
+        consoleCalls.push(args);
+      });
+    }
+    const t = setup({ policy: { ...mfaPolicy, approvalProofLevel: "code-confirmation" } });
+    const user = await t.signIn("person@example.org");
+    const start = await t.ik.totp.startEnrolment(user.token);
+    if (start.status !== "ok") throw new Error("denied");
+    const secretBytes = base32Decode(start.secret);
+    const codes: string[] = [];
+    const code = (offset = 0) => {
+      const value = t.totpCode(start.secret, offset);
+      codes.push(value);
+      return value;
+    };
+    const later: unknown[] = [];
+    const errors: unknown[] = [];
+
+    later.push(
+      await t.ik.totp.confirmEnrolment(user.token, {
+        factorId: start.factorId,
+        code: wrongCode(t, start.secret),
+      }),
+    );
+    later.push(
+      await t.ik.totp.confirmEnrolment(user.token, { factorId: start.factorId, code: code() }),
+    );
+    const row = await t.store.totp.findActive(user.account.id);
+    const sealed = row?.sealedSecret ?? "missing";
+    later.push(await t.ik.totp.get(user.account.id));
+    t.clock.advanceSeconds(STEP);
+    later.push(await stepUpTotp(t, user.token, wrongCode(t, start.secret)));
+    const granted = await stepUpTotp(t, user.token, code());
+    later.push(granted);
+    if (granted.status !== "granted") throw new Error("no step-up");
+    later.push(await stepUpTotp(t, granted.token, codes.at(-1) ?? ""));
+
+    t.clock.advanceSeconds(STEP);
+    const pending = await signInAgain(t, "person@example.org");
+    later.push(pending);
+    if (pending.status !== "second_factor_required") throw new Error(pending.status);
+    later.push(await t.ik.totp.verifySecondFactor(pending.pendingToken, { code: code() }));
+
+    t.clock.advanceSeconds(STEP);
+    const approval = await t.ik.approvals.start({
+      sessionToken: granted.token,
+      payloadHash: "c".repeat(64),
+      level: "code-confirmation",
+    });
+    later.push(approval);
+    if (approval.status !== "ok") throw new Error("denied");
+    later.push(
+      await t.ik.approvals.verify({
+        sessionToken: granted.token,
+        payloadHash: "c".repeat(64),
+        approvalId: approval.approvalId,
+        code: code(),
+      }),
+    );
+
+    t.clock.advanceSeconds(STEP);
+    t.testSealer.failNextOpen();
+    errors.push(await stepUpTotp(t, granted.token, code()).catch((e: unknown) => e));
+    errors.push(
+      await t.ik.totp
+        .confirmEnrolment(granted.token, { factorId: "x".repeat(65), code: "1" })
+        .catch((e: unknown) => e),
+    );
+    later.push(await t.ik.totp.reseal(user.account.id));
+    later.push(await t.ik.totp.get(user.account.id));
+
+    const forbidden = [
+      start.secret,
+      start.secret.toLowerCase(),
+      secretBytes.toString("hex"),
+      secretBytes.toString("base64"),
+      secretBytes.toString("base64url"),
+      start.provisioningUri,
+      "otpauth",
+      sealed,
+      sealed.split(".")[3] ?? "missing",
+    ];
+    const surfaces = {
+      audit: t.audit.events.map(render).join("\n"),
+      errors: errors.map(render).join("\n"),
+      console: consoleCalls.map(render).join("\n"),
+      later: later.map(render).join("\n"),
+    };
+    expect(errors[0]).toBeInstanceOf(SealedSecretError);
+    expect(t.audit.events.length).toBeGreaterThan(20);
+    for (const [surface, text] of Object.entries(surfaces)) {
+      for (const value of forbidden) {
+        expect(text.includes(value), `${surface} contains a secret form`).toBe(false);
+      }
+    }
+    for (const value of codes) {
+      expect(surfaces.audit.includes(value), "audit contains a code").toBe(false);
+    }
+  });
+
+  it("reseal: moves a factor to the active key, so the old key can be dropped", async () => {
+    const oldKey = randomBytes(32);
+    const nextKey = randomBytes(32);
+    let current: SecretSealer = createAesGcmSealer({ keys: { old: oldKey }, activeKeyId: "old" });
+    const sealer: SecretSealer = {
+      seal: (plaintext, context) => current.seal(plaintext, context),
+      open: (sealed, context) => current.open(sealed, context),
+    };
+    const t = setup({ sealer });
+    const user = await t.signIn("person@example.org");
+    const { secret } = await t.enrolTotp(user.token);
+    expect((await t.store.totp.findActive(user.account.id))?.sealedSecret).toMatch(/^v1\.old\./);
+
+    current = createAesGcmSealer({ keys: { old: oldKey, next: nextKey }, activeKeyId: "next" });
+    expect(await t.ik.totp.reseal(user.account.id)).toBe(true);
+    expect((await t.store.totp.findActive(user.account.id))?.sealedSecret).toMatch(/^v1\.next\./);
+    expect(t.audit.ofType("totp.resealed")).toHaveLength(1);
+
+    current = createAesGcmSealer({ keys: { next: nextKey }, activeKeyId: "next" });
+    t.clock.advanceSeconds(STEP);
+    expect((await stepUpTotp(t, user.token, t.totpCode(secret))).status).toBe("granted");
+  });
+
+  it("a sealed secret moved to another account does not open", async () => {
+    const t = setup();
+    const a = await t.signIn("a@example.org");
+    const b = await t.signIn("b@example.org");
+    const { secret } = await t.enrolTotp(a.token);
+    await t.enrolTotp(b.token);
+    const rowA = await t.store.totp.findActive(a.account.id);
+    const rowB = await t.store.totp.findActive(b.account.id);
+    if (!rowA || !rowB) throw new Error("missing");
+    // Someone with write access copies A's sealed secret into B's row.
+    expect(
+      await t.store.totp.replaceSealedSecret(rowB.id, rowB.sealedSecret, rowA.sealedSecret),
+    ).toBe(true);
+    t.clock.advanceSeconds(STEP);
+    await expect(stepUpTotp(t, b.token, t.totpCode(secret))).rejects.toBeInstanceOf(
+      SealedSecretError,
+    );
+  });
+});

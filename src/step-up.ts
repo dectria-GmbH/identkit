@@ -6,6 +6,7 @@ import {
   type RequestCodeResult,
 } from "./email-otp.js";
 import type { PasskeyCore } from "./passkey-core.js";
+import type { TotpEngine } from "./totp.js";
 import type { IssuedSession, SessionInternals } from "./sessions.js";
 import {
   authenticationOptions,
@@ -36,12 +37,18 @@ export interface StepUp {
   >;
   /** Verifies a passkey step-up. On success the session gets a new token. */
   finishPasskey(sessionToken: string, response: AuthenticationResponseJSON): Promise<StepUpResult>;
+  /**
+   * Verifies a TOTP step-up. On success the session gets a new token. The code's time step
+   * is consumed: it cannot sign in, step up or approve again.
+   */
+  verifyTotp(sessionToken: string, input: { code: string }): Promise<StepUpResult>;
 }
 
 export function createStepUp(
   ctx: Context,
   otp: OtpEngine,
   core: PasskeyCore,
+  totp: TotpEngine,
   internals: SessionInternals,
 ): StepUp {
   const { store, clock, config } = ctx;
@@ -156,6 +163,55 @@ export function createStepUp(
         accountId: record.accountId,
         method: "passkey",
         credentialId: verified.credential.id,
+      });
+      return { status: "granted", ...issued };
+    },
+
+    async verifyTotp(sessionToken, input) {
+      assertMethodAllowed((await ctx.getPolicy()).stepUpMethods, "totp");
+      const loaded = await internals.load(sessionToken, "complete");
+      if (!loaded) return { status: "denied", reason: "no_session" };
+      const { record } = loaded;
+      const checked = await totp.check({
+        accountId: record.accountId,
+        code: input.code,
+        purpose: "step_up",
+        sessionId: record.id,
+      });
+      if (checked.status !== "accepted") {
+        await ctx.emit({
+          type: "step_up.failed",
+          sessionId: record.id,
+          accountId: record.accountId,
+          method: "totp",
+          reason: checked.reason,
+        });
+        return checked;
+      }
+      const issued = await internals.elevate(
+        loaded,
+        { addMethod: "totp", stepUp: { method: "totp", at: clock.now() } },
+        "step_up",
+      );
+      if (!issued) return failed(record.id, record.accountId, "totp", "rotation");
+      // A removal that raced with this check must not leave a fresh step-up behind.
+      if (!(await totp.isStillCurrent(checked.factor))) {
+        if (await store.sessions.revoke(record.id, clock.now(), "factor_removed")) {
+          await ctx.emit({
+            type: "session.revoked",
+            accountId: record.accountId,
+            sessionId: record.id,
+            reason: "factor_removed",
+          });
+        }
+        return failed(record.id, record.accountId, "totp", "factor_removed");
+      }
+      await ctx.emit({
+        type: "step_up.granted",
+        sessionId: record.id,
+        accountId: record.accountId,
+        method: "totp",
+        factorId: checked.factor.id,
       });
       return { status: "granted", ...issued };
     },

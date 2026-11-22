@@ -8,6 +8,7 @@ import type {
   IdentkitStore,
   OtpFlowRecord,
   SessionRecord,
+  TotpFactorRecord,
   VerificationRecord,
 } from "./types.js";
 
@@ -37,6 +38,7 @@ export function createMemoryStore(): IdentkitStore {
   const credentials = new Map<string, CredentialRecord>();
   const challenges = new Map<string, ChallengeRecord>();
   const enrollment = new Map<string, EnrollmentTokenRecord>();
+  const totpFactors = new Map<string, TotpFactorRecord>();
   const verifications = new Map<string, VerificationRecord>();
 
   return {
@@ -250,6 +252,66 @@ export function createMemoryStore(): IdentkitStore {
         if (!found || found.purpose !== purpose) return Promise.resolve(null);
         challenges.delete(digest);
         return Promise.resolve(found);
+      },
+    },
+    totp: {
+      insert(factor) {
+        if (totpFactors.has(factor.id)) throw new Error("duplicate totp factor id");
+        totpFactors.set(factor.id, copy(factor));
+        return Promise.resolve();
+      },
+      findPending(id) {
+        const found = totpFactors.get(id);
+        return Promise.resolve(found && found.activatedAt === null ? copy(found) : null);
+      },
+      findActive(accountId) {
+        for (const factor of totpFactors.values()) {
+          if (factor.accountId === accountId && factor.activatedAt !== null) {
+            return Promise.resolve(copy(factor));
+          }
+        }
+        return Promise.resolve(null);
+      },
+      activate(id, accountId, step, at) {
+        const found = totpFactors.get(id);
+        if (!found || found.accountId !== accountId || found.activatedAt !== null) {
+          return Promise.resolve(false);
+        }
+        for (const other of totpFactors.values()) {
+          if (other.accountId === accountId && other.activatedAt !== null) {
+            return Promise.resolve(false);
+          }
+        }
+        found.activatedAt = at;
+        found.lastUsedStep = step;
+        found.lastUsedAt = at;
+        return Promise.resolve(true);
+      },
+      recordStep(id, accountId, step, at) {
+        const found = totpFactors.get(id);
+        if (
+          !found ||
+          found.accountId !== accountId ||
+          found.activatedAt === null ||
+          (found.lastUsedStep !== null && found.lastUsedStep >= step)
+        ) {
+          return Promise.resolve(false);
+        }
+        found.lastUsedStep = step;
+        found.lastUsedAt = at;
+        return Promise.resolve(true);
+      },
+      delete(id, accountId) {
+        const found = totpFactors.get(id);
+        if (!found || found.accountId !== accountId) return Promise.resolve(false);
+        totpFactors.delete(id);
+        return Promise.resolve(true);
+      },
+      replaceSealedSecret(id, expected, next) {
+        const found = totpFactors.get(id);
+        if (!found || found.sealedSecret !== expected) return Promise.resolve(false);
+        found.sealedSecret = next;
+        return Promise.resolve(true);
       },
     },
     enrollment: {

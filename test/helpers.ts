@@ -5,10 +5,13 @@ import {
   createMemoryStore,
   type SignInPolicy,
 } from "../src/index.js";
+import type { SecretSealer } from "../src/sealer.js";
 import type { IdentkitStore } from "../src/storage/types.js";
 import {
   createFakeClock,
   createFakeIdentityVerificationAdapter,
+  createTestSealer,
+  generateTotpCode,
   createRecordingAuditSink,
   createRecordingMailSender,
   createSoftwareAuthenticator,
@@ -36,12 +39,23 @@ export const testConfig = {
   webauthn: { rpId: RP_ID, rpName: "Example portal", origins: [ORIGIN], challengeTtlSeconds: 300 },
   identityVerification: { timeoutSeconds: 1800 },
   enrollment: { tokenTtlSeconds: 86_400 },
+  totp: {
+    issuer: "Example portal",
+    algorithm: "SHA1" as "SHA1" | "SHA256" | "SHA512",
+    digits: 6 as 6 | 8,
+    driftSteps: 1,
+    enrolmentTtlSeconds: 600,
+    approvalTtlSeconds: 300,
+    lockout: { maxFailures: 10, windowSeconds: 900, lockSeconds: 900, maxLockSeconds: 86_400 },
+  },
 };
 
 export const emailFirstPolicy: SignInPolicy = {
   signInMethods: ["email_otp", "passkey"],
   secondFactor: "none",
-  stepUpMethods: ["passkey", "email_otp"],
+  secondFactorMethods: ["passkey", "totp"],
+  stepUpMethods: ["passkey", "email_otp", "totp"],
+  approvalProofLevel: "signature",
   createAccountOnFirstSignIn: true,
 };
 
@@ -50,6 +64,10 @@ export interface SetupOptions {
   store?: IdentkitStore;
   idv?: FakeIdentityVerificationOptions;
   counterStep?: number;
+  /** Accounts the consumer marks as privileged, by e-mail address. */
+  privilegedEmails?: string[];
+  config?: typeof testConfig;
+  sealer?: SecretSealer;
 }
 
 export function setup(options: SetupOptions = {}) {
@@ -59,8 +77,13 @@ export function setup(options: SetupOptions = {}) {
   const store = options.store ?? createMemoryStore();
   const policy = { current: options.policy ?? emailFirstPolicy };
   const idv = createFakeIdentityVerificationAdapter(options.idv ?? { outcome: "succeed" });
+  const testSealer = createTestSealer();
+  const sealer = options.sealer ?? testSealer;
+  const privileged = new Set(options.privilegedEmails ?? []);
   const ik = createIdentkit({
-    config: testConfig,
+    config: options.config ?? testConfig,
+    sealer,
+    isPrivilegedAccount: (account) => privileged.has(account.email),
     store,
     hasher: createHmacHasher(randomBytes(32)),
     mail,
@@ -98,6 +121,24 @@ export function setup(options: SetupOptions = {}) {
     return finish.credentialId;
   }
 
+  /** The code an authenticator app shows for `secret`, `offsetSeconds` from now. */
+  function totpCode(secret: string, offsetSeconds = 0) {
+    const at = new Date(clock.now().getTime() + offsetSeconds * 1000);
+    return generateTotpCode({ secret, at });
+  }
+
+  /** Enrols and confirms TOTP for the session's account. The confirming step is consumed. */
+  async function enrolTotp(token: string) {
+    const start = await ik.totp.startEnrolment(token);
+    if (start.status !== "ok") throw new Error(`enrolment denied: ${start.reason}`);
+    const confirmed = await ik.totp.confirmEnrolment(token, {
+      factorId: start.factorId,
+      code: totpCode(start.secret),
+    });
+    if (confirmed.status !== "enrolled") throw new Error(`enrolment failed: ${confirmed.status}`);
+    return { factorId: start.factorId, secret: start.secret, start };
+  }
+
   /** Signs in by e-mail and registers one passkey. Returns a session with a fresh step-up. */
   async function userWithPasskey(email: string) {
     const session = await signIn(email);
@@ -113,6 +154,11 @@ export function setup(options: SetupOptions = {}) {
     store,
     policy,
     idv,
+    sealer,
+    testSealer,
+    privileged,
+    totpCode,
+    enrolTotp,
     authenticator,
     codeFor,
     signIn,
@@ -125,3 +171,16 @@ export function setup(options: SetupOptions = {}) {
 export function otherCode(code: string): string {
   return code === "000000" ? "000001" : "000000";
 }
+
+/** E-mail code first, then a second factor (passkey or TOTP) if the account has one. */
+export const mfaPolicy: SignInPolicy = {
+  signInMethods: ["email_otp", "passkey"],
+  secondFactor: "if_enrolled",
+  secondFactorMethods: ["passkey", "totp"],
+  stepUpMethods: ["passkey", "email_otp", "totp"],
+  approvalProofLevel: "signature",
+  createAccountOnFirstSignIn: true,
+};
+
+/** Seconds per TOTP time step. */
+export const STEP = 30;

@@ -1,4 +1,4 @@
-import { createAccounts, type Accounts } from "./accounts.js";
+import { createAccounts, type Accounts, type AccountView } from "./accounts.js";
 import { createApprovals, type Approvals } from "./approvals.js";
 import type { AuditSink } from "./audit.js";
 import { systemClock, type Clock } from "./clock.js";
@@ -14,9 +14,12 @@ import {
 } from "./identity-verification.js";
 import { createPasskeyCore } from "./passkey-core.js";
 import { createPasskeys, type Passkeys } from "./passkeys.js";
+import { NotConfiguredError } from "./errors.js";
+import type { SecretSealer } from "./sealer.js";
 import { createSessions, type Sessions } from "./sessions.js";
 import { createStepUp, type StepUp } from "./step-up.js";
 import type { IdentkitStore } from "./storage/types.js";
+import { createTotp, createTotpEngine, type Totp } from "./totp.js";
 
 export interface IdentkitOptions {
   /** Validated with `identkitConfigSchema`. Every time and limit value is required. */
@@ -30,6 +33,18 @@ export interface IdentkitOptions {
    * on every policy-dependent call, so a policy change applies at once.
    */
   policy: SignInPolicy | (() => SignInPolicy | Promise<SignInPolicy>);
+  /**
+   * Required. Decides whether an account is privileged. A privileged account always needs a
+   * second factor after an e-mail code, whatever the policy's `secondFactor` says, and is
+   * refused a session if it has none. Pass `() => false` if no account is privileged.
+   * Called on every e-mail code sign-in; if it throws, the sign-in fails.
+   */
+  isPrivilegedAccount: (account: AccountView) => boolean | Promise<boolean>;
+  /**
+   * Encrypts TOTP secrets at rest. Required for every TOTP call; without it they throw
+   * `NotConfiguredError`.
+   */
+  sealer?: SecretSealer;
   clock?: Clock;
   identityVerification?: IdentityVerificationAdapter;
 }
@@ -40,6 +55,7 @@ export interface Identkit {
   stepUp: StepUp;
   sessions: Sessions;
   approvals: Approvals;
+  totp: Totp;
   accounts: Accounts;
   identityVerification: IdentityVerification;
 }
@@ -48,7 +64,18 @@ export function createIdentkit(options: IdentkitOptions): Identkit {
   const config = parseConfig(options.config);
   const clock = options.clock ?? systemClock;
   const policySource = options.policy;
-  if (typeof policySource !== "function") signInPolicySchema.parse(policySource);
+  if (typeof policySource !== "function") {
+    const policy = signInPolicySchema.parse(policySource);
+    const usesTotp =
+      policy.secondFactorMethods.includes("totp") ||
+      policy.stepUpMethods.includes("totp") ||
+      policy.approvalProofLevel === "code-confirmation";
+    if (usesTotp && !options.sealer) throw new NotConfiguredError("sealer");
+  }
+  const isPrivileged = options.isPrivilegedAccount;
+  if (typeof isPrivileged !== "function") {
+    throw new TypeError("isPrivilegedAccount is required: pass () => false if no account is");
+  }
 
   const ctx: Context = {
     config,
@@ -57,6 +84,8 @@ export function createIdentkit(options: IdentkitOptions): Identkit {
     clock,
     mail: options.mail,
     identityVerification: options.identityVerification ?? null,
+    sealer: options.sealer ?? null,
+    isPrivilegedAccount: async (account) => await isPrivileged(account),
     getPolicy: async () =>
       signInPolicySchema.parse(
         typeof policySource === "function" ? await policySource() : policySource,
@@ -67,13 +96,15 @@ export function createIdentkit(options: IdentkitOptions): Identkit {
   const otp = createOtpEngine(ctx);
   const { sessions, internals } = createSessions(ctx);
   const core = createPasskeyCore(ctx);
+  const totpEngine = createTotpEngine(ctx);
 
   return {
     emailSignIn: createEmailSignIn(ctx, otp, internals),
     passkeys: createPasskeys(ctx, core, sessions, internals),
-    stepUp: createStepUp(ctx, otp, core, internals),
+    stepUp: createStepUp(ctx, otp, core, totpEngine, internals),
     sessions,
-    approvals: createApprovals(ctx, core, internals),
+    approvals: createApprovals(ctx, core, totpEngine, internals),
+    totp: createTotp(ctx, totpEngine, sessions, internals),
     accounts: createAccounts(ctx, (accountId) => sessions.revokeAll(accountId)),
     identityVerification: createIdentityVerification(ctx),
   };

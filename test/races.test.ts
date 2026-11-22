@@ -133,8 +133,10 @@ describe("races with a concurrent revocation", () => {
       store,
       policy: {
         signInMethods: ["email_otp", "passkey"],
-        secondFactor: "passkey_if_enrolled",
+        secondFactor: "if_enrolled",
         stepUpMethods: ["passkey"],
+        secondFactorMethods: ["passkey"],
+        approvalProofLevel: "signature",
         createAccountOnFirstSignIn: true,
       },
     });
@@ -181,8 +183,10 @@ describe("races with a concurrent revocation", () => {
       store,
       policy: {
         signInMethods: ["email_otp", "passkey"],
-        secondFactor: "passkey_if_enrolled",
+        secondFactor: "if_enrolled",
         stepUpMethods: ["passkey"],
+        secondFactorMethods: ["passkey"],
+        approvalProofLevel: "signature",
         createAccountOnFirstSignIn: true,
       },
     });
