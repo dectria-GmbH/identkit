@@ -9,7 +9,7 @@ const staffPolicy = {
   secondFactor: "none" as const,
   stepUpMethods: ["passkey" as const],
   secondFactorMethods: ["passkey" as const],
-  approvalProofLevel: "signature" as const,
+  approvalEvidenceLevels: ["signature" as const],
   createAccountOnFirstSignIn: false,
 };
 
@@ -332,7 +332,7 @@ const mfaPolicy = {
   secondFactor: "if_enrolled" as const,
   stepUpMethods: ["passkey" as const],
   secondFactorMethods: ["passkey" as const],
-  approvalProofLevel: "signature" as const,
+  approvalEvidenceLevels: ["signature" as const],
   createAccountOnFirstSignIn: true,
 };
 

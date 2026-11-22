@@ -97,7 +97,7 @@ describe.skipIf(!url)("postgresql", () => {
 
     const payloadHash = "b".repeat(64);
     const approval = await t.ik.approvals.start({ sessionToken: granted.token, payloadHash });
-    if (approval.status !== "ok") throw new Error("denied");
+    if (approval.status !== "ok" || approval.level !== "signature") throw new Error("denied");
     const response = t.authenticator.assert(approval.options);
     expect(
       (await t.ik.approvals.verify({ sessionToken: granted.token, payloadHash, response })).status,
@@ -110,7 +110,7 @@ describe.skipIf(!url)("postgresql", () => {
   it("flows: TOTP enrolment, second factor, replay and code approval against PostgreSQL", async () => {
     const t = setup({
       store: requireStore(),
-      policy: { ...mfaPolicy, approvalProofLevel: "code-confirmation" },
+      policy: { ...mfaPolicy, approvalEvidenceLevels: ["signature", "code-confirmation"] },
     });
     const user = await t.signIn("pg-totp@example.org");
     const { secret } = await t.enrolTotp(user.token);
@@ -149,13 +149,14 @@ describe.skipIf(!url)("postgresql", () => {
         const start = await t.ik.approvals.start({
           sessionToken: live.token,
           payloadHash,
-          level: "code-confirmation",
+          levels: ["code-confirmation"],
         });
-        if (start.status !== "ok") throw new Error("denied");
+        if (start.status !== "ok" || start.level !== "code-confirmation") {
+          throw new Error("denied");
+        }
         return t.ik.approvals.verify({
           sessionToken: live.token,
           payloadHash,
-          level: "code-confirmation",
           approvalId: start.approvalId,
           code: approvalCode,
         });

@@ -69,7 +69,7 @@ export function createIdentkit(options: IdentkitOptions): Identkit {
     const usesTotp =
       policy.secondFactorMethods.includes("totp") ||
       policy.stepUpMethods.includes("totp") ||
-      policy.approvalProofLevel === "code-confirmation";
+      policy.approvalEvidenceLevels.includes("code-confirmation");
     if (usesTotp && !options.sealer) throw new NotConfiguredError("sealer");
   }
   const isPrivileged = options.isPrivilegedAccount;

@@ -137,7 +137,7 @@ async function assertTotpInPolicy(ctx: Context): Promise<void> {
   if (
     !policy.secondFactorMethods.includes("totp") &&
     !policy.stepUpMethods.includes("totp") &&
-    policy.approvalProofLevel !== "code-confirmation"
+    !policy.approvalEvidenceLevels.includes("code-confirmation")
   ) {
     throw new MethodNotAllowedError("totp");
   }
@@ -420,7 +420,6 @@ export function createTotp(
         await enrolmentFailed(record.accountId, "not_activated", factor.id);
         return { status: "failed", reason: "invalid" };
       }
-      await store.throttle.reset(key);
 
       // A revocation or a lost step-up between the check above and the activation would be
       // missed, so check once more. If it fails, or anything throws, the factor goes and every
@@ -459,6 +458,8 @@ export function createTotp(
         await undo().catch(() => undefined);
         throw error;
       }
+      // Only now: a store error here must not skip the check and the revocation above.
+      await store.throttle.reset(key);
       await ctx.emit({
         type: "totp.enrolled",
         accountId: factor.accountId,

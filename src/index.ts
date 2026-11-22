@@ -12,7 +12,7 @@ export {
   type SecondFactorMethod,
   type AuthMethod,
   type StepUpMethod,
-  type ApprovalProofLevel,
+  type ApprovalEvidenceLevel,
 } from "./config.js";
 export {
   createAesGcmSealer,
@@ -47,7 +47,12 @@ export {
 } from "./crypto.js";
 export type { AuditEvent, AuditEventType, AuditSink } from "./audit.js";
 export type { MailSender, OtpMailPurpose } from "./context.js";
-export { IdentkitError, MethodNotAllowedError, NotConfiguredError } from "./errors.js";
+export {
+  IdentkitError,
+  InvalidArgumentError,
+  MethodNotAllowedError,
+  NotConfiguredError,
+} from "./errors.js";
 export { normalizeEmail, InvalidEmailError } from "./email.js";
 export type { RequestCodeResult, CodeFailure } from "./email-otp.js";
 export type { EmailSignIn, EmailSignInResult } from "./email-sign-in.js";
@@ -65,23 +70,18 @@ export type { Sessions, SessionView, IssuedSession, StepUpCheck } from "./sessio
 export {
   approvalChallenge,
   hashPayload,
-  verifyApprovalEvidence,
+  checkApprovalEvidence,
   type Approvals,
   type ApprovalProof,
   type ApprovalEvidence,
   type ApprovalEvidenceCheck,
   type ApprovalEvidenceVerifier,
+  type CheckApprovalEvidenceInput,
   type CodeConfirmationEvidence,
+  type ApprovalStartInput,
+  type ApprovalVerifyInput,
   type StartApprovalResult,
-  type ApprovalStartResult,
-  type ApprovalVerifyResult,
-  type StartCodeConfirmationResult,
   type VerifyApprovalResult,
-  type VerifyCodeConfirmationResult,
-  type SignatureApprovalStart,
-  type CodeConfirmationStart,
-  type SignatureApprovalVerify,
-  type CodeConfirmationVerify,
 } from "./approvals.js";
 export type { Accounts, AccountView, CreateAccountResult } from "./accounts.js";
 export type {

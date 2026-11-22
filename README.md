@@ -3,7 +3,7 @@
 Identity toolkit for TypeScript: accounts, passkeys, OIDC, token issuance and delegated agent identities.
 
 Status: early development, not released. It covers sign-in by e-mail code, passkeys, TOTP
-(authenticator apps), sessions, step-up, approval proofs at two levels, an identity
+(authenticator apps), sessions, step-up, approval evidence at two levels, an identity
 verification port and storage. See "Not built" for what comes later.
 
 identkit is a library, not a server. The core has no HTTP framework dependency: you call it from
@@ -28,7 +28,7 @@ const identkit = createIdentkit({
     secondFactor: "if_enrolled",
     secondFactorMethods: ["passkey", "totp"],
     stepUpMethods: ["passkey", "totp"],
-    approvalProofLevel: "signature",
+    approvalEvidenceLevels: ["signature"],
     createAccountOnFirstSignIn: true,
   },
   isPrivilegedAccount: (account) => adminEmails.has(account.email), // or () => false
@@ -66,11 +66,9 @@ const session = await identkit.sessions.validate(tokenFromCookie);
   `verifyTotp(sessionToken, { code })`.
 - `sessions`: `validate(token)`, `requireStepUp(token, { methods })`, `rotate(token)`,
   `revoke(token)`, `revokeById(id)`, `revokeAll(accountId, { exceptSessionId })`.
-- `approvals`: `start({ sessionToken, payloadHash, level? })`,
-  `verify({ sessionToken, payloadHash, response })` for level `signature`,
-  `verify({ sessionToken, payloadHash, level: "code-confirmation", approvalId, code })` for
-  level `code-confirmation`,
-  `checkRecordedEvidence(evidence)`.
+- `approvals`: `start({ sessionToken, payloadHash, levels? })`,
+  `verify({ sessionToken, payloadHash, levels?, response })` or
+  `verify({ sessionToken, payloadHash, levels?, approvalId, code })`.
 - `accounts`: `create({ email })`, `get(id)`, `findByEmail(email)`, `disable(id)`.
 - `identityVerification`: `start({ accountId, returnUrl })`, `handleCallback(payload)`,
   `refresh(verificationId)`, `get(verificationId)`.
@@ -82,16 +80,21 @@ or check ownership yourself before you pass client input: all of `accounts`,
 `sessions.revokeAll`, `identityVerification.start`, `identityVerification.refresh` and
 `identityVerification.get`.
 
-Standalone functions: `verifyApprovalEvidence({ evidence, verifier })`, `hashPayload(payload)`,
+Standalone functions: `checkApprovalEvidence({ evidence, verifier | hasher })`, `hashPayload(payload)`,
 `approvalChallenge(nonce, payloadHash, accountId)`, `normalizeEmail(input)`, `parseConfig(input)`,
 `createAesGcmSealer({ keys, activeKeyId })`. Constant `TOTP_INTEROPERABLE_PARAMETERS`
 (`{ algorithm: "SHA1", digits: 6 }`).
 
-`verifyApprovalEvidence({ evidence, verifier })` returns an object, not a boolean: compare
-`status === "verified"`. It takes one options object, so code written for the earlier
-two-argument boolean form does not compile. `approvals.verify` returns a result whose type
-does not depend on the input: check `proof.level` before you show or use a proof, and pass
-`level: "code-confirmation"` explicitly for a code confirmation.
+`checkApprovalEvidence` returns an object with a `status`. Switch on the exact status and
+accept only the one you mean: the object is always truthy, so never use it as a boolean, and
+never accept on `status !== "invalid"`. It takes exactly one options object and throws
+`InvalidArgumentError` (code `invalid_argument`) for any other shape, also from untyped
+JavaScript. It replaces `verifyApprovalEvidence` from the first increment, which is gone
+without an alias, so an old call site fails instead of accepting.
+
+`approvals.verify` returns `{ status: "approved", evidence }`. `evidence.level` comes from the
+pending approval that `start` stored, never from the verify input; check it before you show or
+use the evidence.
 
 Subpath `identkit/postgres`: `createPostgresStore(db)`, `migrateIdentkit(db)`, `MIGRATIONS_DIR`.
 
@@ -110,14 +113,14 @@ the policy or decide who may change it. Pass a function to apply policy changes 
 
 Every field is required; there is no default.
 
-| Field                        | Values                           | Effect                                                                                                                                        |
-| ---------------------------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `signInMethods`              | `email_otp`, `passkey`           | Methods that may start a session. TOTP never starts a session on its own.                                                                     |
-| `secondFactor`               | `none`, `if_enrolled`            | After an e-mail code: full session, or a pending state that needs a second factor if the account has one (passkey or TOTP).                   |
-| `secondFactorMethods`        | `passkey`, `totp` (one or both)  | Methods that may complete the pending state.                                                                                                  |
-| `stepUpMethods`              | `email_otp`, `passkey`, `totp`   | Methods that may satisfy a step-up. `requireStepUp` can narrow the list, never widen it.                                                      |
-| `approvalProofLevel`         | `signature`, `code-confirmation` | The weakest approval proof accepted. `signature` refuses code confirmations; `code-confirmation` accepts both, since a signature is stronger. |
-| `createAccountOnFirstSignIn` | `true`, `false`                  | If false, an e-mail code sign-in for an unknown address fails like a wrong code.                                                              |
+| Field                        | Values                                         | Effect                                                                                                                                                                                     |
+| ---------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `signInMethods`              | `email_otp`, `passkey`                         | Methods that may start a session. TOTP never starts a session on its own.                                                                                                                  |
+| `secondFactor`               | `none`, `if_enrolled`                          | After an e-mail code: full session, or a pending state that needs a second factor if the account has one (passkey or TOTP).                                                                |
+| `secondFactorMethods`        | `passkey`, `totp` (one or both)                | Methods that may complete the pending state.                                                                                                                                               |
+| `stepUpMethods`              | `email_otp`, `passkey`, `totp`                 | Methods that may satisfy a step-up. `requireStepUp` can narrow the list, never widen it.                                                                                                   |
+| `approvalEvidenceLevels`     | `signature`, `code-confirmation` (one or both) | Approval evidence levels accepted, exactly as listed. `["signature"]` refuses code confirmations; a code-only list refuses signatures. A call can narrow it with `levels`, never widen it. |
+| `createAccountOnFirstSignIn` | `true`, `false`                                | If false, an e-mail code sign-in for an unknown address fails like a wrong code.                                                                                                           |
 
 Second factor after an e-mail code:
 
@@ -134,7 +137,7 @@ Second factor after an e-mail code:
   its factors. A change of `secondFactor` to `none` does: non-privileged accounts then sign in
   with the e-mail code alone, whatever factors they have.
 - A TOTP factor counts at sign-in even if the policy names TOTP only through
-  `approvalProofLevel`. With `if_enrolled` and no `totp` in `secondFactorMethods`, such an
+  `approvalEvidenceLevels`. With `if_enrolled` and no `totp` in `secondFactorMethods`, such an
   account gets `method_not_allowed`; list `totp` in `secondFactorMethods` if you let accounts
   enrol TOTP.
 - `second_factor_required` lists the `methods` that can complete the sign-in. Only the holder of
@@ -192,7 +195,7 @@ Fixed values:
 
 Options that are not configuration but are required: `isPrivilegedAccount` (see "Sign-in
 policy"), and `sealer` whenever the policy names TOTP (`secondFactorMethods`, `stepUpMethods`,
-or `approvalProofLevel: "code-confirmation"`). With a policy object, a missing sealer fails at
+or `code-confirmation` in `approvalEvidenceLevels`). With a policy object, a missing sealer fails at
 `createIdentkit`; with a policy function, at the first TOTP call.
 
 `webauthn` also needs `rpId` (your host name), `rpName` and `origins` (full origins, https only,
@@ -331,32 +334,41 @@ Secret storage and rotation:
   JavaScript strings it returned once cannot be wiped.
 - Implement `SecretSealer` yourself to keep the key in a key management service.
 
-Approval proofs:
+Approval evidence:
 
-Two levels. Every evidence carries `level`, so you can show and report it.
+Two levels. Every evidence and every approval event carries `level`, so you can show and
+report it. A signature is a proof; a code confirmation is a server record, not a proof.
+
+Choosing the level:
+
+- The policy lists the accepted levels (`approvalEvidenceLevels`). A call can pass `levels` to
+  narrow them for one action, for example `levels: ["signature"]` for a high-value payment. Set
+  `levels` in your server code, never from client input. A filter that leaves no level throws
+  `MethodNotAllowedError`; a malformed one throws `InvalidArgumentError`.
+- `start` picks the level, never the client: the strongest one that is allowed and that the
+  account can use. That is `signature` if the account has a passkey, else `code-confirmation`
+  if it has a TOTP factor.
+- `verify` consumes only a pending approval that `start` stored, and the evidence gets that
+  approval's level. The level must still be allowed by the policy and `levels` at that moment.
 
 Level `signature`:
 
 - The challenge is `SHA-256("identkit/approval/v1" || nonce || payloadHash || accountId)`. The
   person signs it with a passkey of the session's account. `verify` recomputes the challenge from
   the payload hash it receives, so a signature for one payload cannot approve another.
-- The proof holds the raw assertion and the nonce. `verifyApprovalEvidence` checks it again
-  later with a public key you supply: challenge, signature, RP ID, origin and counter, and
-  returns `{ status: "verified", level: "signature" }`. It cannot check `verifiedAt`, and it
-  cannot know that `credentialId` belonged to `accountId`: take the public key from your own
-  record of that account's credentials.
-- Always accepted, under either `approvalProofLevel`.
+- The evidence holds the raw assertion and the nonce. `checkApprovalEvidence({ evidence,
+verifier })` checks it again later with a public key you supply: challenge, signature, RP ID,
+  origin and counter, and returns `{ status: "verified", level: "signature" }`. It cannot check
+  `verifiedAt`, and it cannot know that `credentialId` belonged to `accountId`: take the public
+  key from your own record of that account's credentials.
 
 Level `code-confirmation`:
 
-- Allowed only if the policy says `approvalProofLevel: "code-confirmation"`; otherwise `start`
-  and `verify` throw `MethodNotAllowedError`.
-- `start({ sessionToken, payloadHash, level: "code-confirmation" })` creates one pending
-  approval for the session's account and returns an `approvalId`. `verify` with the
-  `approvalId` and a current TOTP code consumes the pending approval (one attempt) and the
-  code's time step. It succeeds only for the same session, account and payload hash. After the
-  code is accepted, identkit checks again that the factor is still active and the session still
-  live, so a removal or revocation that raced with the check yields no evidence.
+- `start` returns an `approvalId` for one pending approval of the session's account. `verify`
+  with the `approvalId` and a current TOTP code consumes the pending approval (one attempt) and
+  the code's time step. It succeeds only for the same session, account and payload hash. After
+  the code is accepted, identkit checks again that the factor is still active and the session
+  still live, so a removal or revocation that raced with the check yields no evidence.
 - The evidence holds `version`, `level`, `accountId`, `payloadHash`, `recordedAt`, the accepted
   `timeStep` and `mac`: an HMAC over these fields with the `SecretHasher` key. It holds no code.
 - What this level does not give:
@@ -364,12 +376,10 @@ Level `code-confirmation`:
     entered a current code while the approval was pending, not that the person saw the payload.
   - The server holds the TOTP secret too, so the server, or anyone with its sealed store and
     key, could produce the same record.
-  - A third party cannot check it. `verifyApprovalEvidence` returns
-    `{ status: "recorded_not_independently_verifiable" }` for any record of the right shape,
-    forged or not, and never `verified`. Check a record with
-    `approvals.checkRecordedEvidence` before you accept it.
-    `approvals.checkRecordedEvidence` checks the HMAC with your key; `intact` means only that
-    this deployment wrote the record and nobody changed it since.
+  - A third party cannot check it. `checkApprovalEvidence({ evidence, hasher })` needs the
+    deployment's `SecretHasher`, rejects a record whose HMAC does not match as `invalid`, and
+    reports a matching one as `recorded_not_independently_verifiable`, never `verified`. That
+    status means only that this deployment wrote the record and nobody changed it since.
 - Use it where an authenticator app is the only second factor and a server record is enough.
   For evidence that others must be able to check, require level `signature`.
 

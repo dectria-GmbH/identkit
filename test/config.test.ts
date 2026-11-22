@@ -87,11 +87,11 @@ describe("configuration", () => {
       secondFactor: "if_enrolled",
       secondFactorMethods: ["totp"],
       stepUpMethods: ["totp"],
-      approvalProofLevel: "signature",
+      approvalEvidenceLevels: ["signature"],
       createAccountOnFirstSignIn: true,
     };
     expect(() => signInPolicySchema.parse(base)).not.toThrow();
-    for (const key of ["secondFactorMethods", "approvalProofLevel"]) {
+    for (const key of ["secondFactorMethods", "approvalEvidenceLevels"]) {
       const copy: Record<string, unknown> = { ...base };
       delete copy[key];
       expect(() => signInPolicySchema.parse(copy), key).toThrow();
@@ -100,7 +100,8 @@ describe("configuration", () => {
     expect(() =>
       signInPolicySchema.parse({ ...base, secondFactor: "passkey_if_enrolled" }),
     ).toThrow();
-    expect(() => signInPolicySchema.parse({ ...base, approvalProofLevel: "none" })).toThrow();
+    expect(() => signInPolicySchema.parse({ ...base, approvalEvidenceLevels: ["none"] })).toThrow();
+    expect(() => signInPolicySchema.parse({ ...base, approvalEvidenceLevels: [] })).toThrow();
   });
 
   it("refuses a hash key shorter than 32 bytes", () => {
@@ -114,7 +115,7 @@ describe("configuration", () => {
         secondFactor: "none",
         stepUpMethods: ["passkey"],
         secondFactorMethods: ["passkey"],
-        approvalProofLevel: "signature",
+        approvalEvidenceLevels: ["signature"],
         createAccountOnFirstSignIn: true,
       }),
     ).toThrow();

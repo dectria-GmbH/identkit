@@ -142,7 +142,7 @@ export type StepUpMethod = "email_otp" | "passkey" | "totp";
  * the public key can check it again. `code-confirmation`: a TOTP code, recorded by the
  * server. It is not bound to the payload and cannot be checked by a third party.
  */
-export type ApprovalProofLevel = "signature" | "code-confirmation";
+export type ApprovalEvidenceLevel = "signature" | "code-confirmation";
 
 /**
  * Operator policy for sign-in. The consumer owns where the policy is stored, who may change
@@ -163,11 +163,10 @@ export const signInPolicySchema = z
     /** Methods that may satisfy a step-up. A call may narrow this list further. */
     stepUpMethods: z.array(z.enum(["email_otp", "passkey", "totp"])).min(1),
     /**
-     * The weakest approval proof accepted. `signature` refuses code confirmations.
-     * `code-confirmation` accepts code confirmations and signatures, since a signature is
-     * the stronger proof.
+     * Approval evidence levels accepted, exactly as listed. `["signature"]` refuses code
+     * confirmations; list both to accept both. A call can narrow this list, never widen it.
      */
-    approvalProofLevel: z.enum(["signature", "code-confirmation"]),
+    approvalEvidenceLevels: z.array(z.enum(["signature", "code-confirmation"])).min(1),
     /** If false, an e-mail code sign-in for an unknown address fails like a wrong code. */
     createAccountOnFirstSignIn: z.boolean(),
   })

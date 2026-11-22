@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { hashPayload, verifyApprovalEvidence } from "../src/index.js";
+import { hashPayload, checkApprovalEvidence } from "../src/index.js";
 import { ORIGIN, RP_ID, setup, testConfig } from "./helpers.js";
 
 const payloadA = hashPayload(JSON.stringify({ request: "release", amount: 100 }));
@@ -7,7 +7,7 @@ const payloadB = hashPayload(JSON.stringify({ request: "release", amount: 100000
 
 async function startApproval(t: ReturnType<typeof setup>, token: string, payloadHash: string) {
   const start = await t.ik.approvals.start({ sessionToken: token, payloadHash });
-  if (start.status !== "ok") throw new Error(`denied: ${start.reason}`);
+  if (start.status !== "ok" || start.level !== "signature") throw new Error("denied");
   return start.options;
 }
 
@@ -23,7 +23,7 @@ describe("approval proofs", () => {
     });
     expect(result.status).toBe("approved");
     if (result.status !== "approved") return;
-    expect(result.proof).toMatchObject({
+    expect(result.evidence).toMatchObject({
       accountId: user.account.id,
       credentialId: user.credentialId,
       payloadHash: payloadA,
@@ -178,7 +178,7 @@ describe("approval proofs", () => {
       payloadHash: payloadA,
       response: t.authenticator.assert(options),
     });
-    if (result.status !== "approved" || result.proof.level !== "signature") {
+    if (result.status !== "approved" || result.evidence.level !== "signature") {
       throw new Error("not approved");
     }
     const credential = await t.store.credentials.findById(user.credentialId);
@@ -189,28 +189,31 @@ describe("approval proofs", () => {
     };
     const verified = { status: "verified", level: "signature" };
     const invalid = { status: "invalid" };
-    expect(result.proof.level).toBe("signature");
-    expect(await verifyApprovalEvidence({ evidence: result.proof, verifier })).toEqual(verified);
+    expect(result.evidence.level).toBe("signature");
+    expect(await checkApprovalEvidence({ evidence: result.evidence, verifier })).toEqual(verified);
     expect(
-      await verifyApprovalEvidence({
-        evidence: { ...result.proof, payloadHash: payloadB },
+      await checkApprovalEvidence({
+        evidence: { ...result.evidence, payloadHash: payloadB },
         verifier,
       }),
     ).toEqual(invalid);
     expect(
-      await verifyApprovalEvidence({
-        evidence: result.proof,
+      await checkApprovalEvidence({
+        evidence: result.evidence,
         verifier: { ...verifier, origins: ["https://other.example"] },
       }),
     ).toEqual(invalid);
-    expect(await verifyApprovalEvidence({ evidence: result.proof })).toEqual(invalid);
+    // Without the public key there is nothing to check: the call fails instead of answering.
+    await expect(checkApprovalEvidence({ evidence: result.evidence })).rejects.toMatchObject({
+      code: "invalid_argument",
+    });
     for (const edited of [
-      { ...result.proof, accountId: "another-account" },
-      { ...result.proof, origin: "https://other.example" },
-      { ...result.proof, counter: result.proof.counter + 1 },
-      { ...result.proof, rpId: "other.example" },
+      { ...result.evidence, accountId: "another-account" },
+      { ...result.evidence, origin: "https://other.example" },
+      { ...result.evidence, counter: result.evidence.counter + 1 },
+      { ...result.evidence, rpId: "other.example" },
     ]) {
-      expect(await verifyApprovalEvidence({ evidence: edited, verifier })).toEqual(invalid);
+      expect(await checkApprovalEvidence({ evidence: edited, verifier })).toEqual(invalid);
     }
   });
 });

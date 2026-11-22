@@ -49,7 +49,9 @@ async function signInAgain(t: T, email: string) {
 
 describe("TOTP enrolment", () => {
   it("rule: enrolment inactive before confirmation - a pending factor cannot step up, complete a sign-in or approve", async () => {
-    const t = setup({ policy: { ...mfaPolicy, approvalProofLevel: "code-confirmation" } });
+    const t = setup({
+      policy: { ...mfaPolicy, approvalEvidenceLevels: ["signature", "code-confirmation"] },
+    });
     const user = await t.signIn("person@example.org");
     const start = await t.ik.totp.startEnrolment(user.token);
     if (start.status !== "ok") throw new Error("denied");
@@ -63,7 +65,7 @@ describe("TOTP enrolment", () => {
       await t.ik.approvals.start({
         sessionToken: user.token,
         payloadHash: "a".repeat(64),
-        level: "code-confirmation",
+        levels: ["code-confirmation"],
       }),
     ).toEqual({ status: "denied", reason: "no_totp" });
     // With only a pending factor, the account has no second factor: the e-mail code suffices.
@@ -324,6 +326,48 @@ describe("TOTP enrolment", () => {
       status: "denied",
       reason: "step_up_required",
     });
+  });
+
+  it("rule: a store error after activation cannot skip the second check - a revoked session leaves no factor", async () => {
+    const { inner, store, hooks } = hookedTotpStore();
+    const t = setup({ store });
+    const user = await t.signIn("person@example.org");
+    const other = await signInAgain(t, "person@example.org");
+    if (other.status !== "signed_in") throw new Error("no session");
+    const start = await t.ik.totp.startEnrolment(user.token);
+    if (start.status !== "ok") throw new Error("denied");
+    // The owner revokes the enrolling session while the confirmation runs, and the store
+    // fails on the next throttle write.
+    hooks.beforeActivate = async () => {
+      await inner.sessions.revoke(user.session.id, t.clock.now(), "test");
+    };
+    hooks.failThrottleReset = 1;
+    expect(
+      await t.ik.totp.confirmEnrolment(user.token, {
+        factorId: start.factorId,
+        code: t.totpCode(start.secret),
+      }),
+    ).toEqual({ status: "denied", reason: "no_session" });
+    expect(await inner.totp.findActive(user.account.id)).toBeNull();
+    expect(await t.ik.sessions.validate(other.token)).toBeNull();
+    // The denied path wrote no throttle reset at all.
+    expect(hooks.failThrottleReset).toBe(1);
+    hooks.failThrottleReset = 0;
+
+    // On the success path a failing reset comes after the check and the revocation.
+    const fresh = await signInAgain(t, "person@example.org");
+    const bystander = await signInAgain(t, "person@example.org");
+    if (fresh.status !== "signed_in" || bystander.status !== "signed_in") throw new Error("no");
+    const again = await t.ik.totp.startEnrolment(fresh.token);
+    if (again.status !== "ok") throw new Error("denied");
+    hooks.failThrottleReset = 1;
+    await expect(
+      t.ik.totp.confirmEnrolment(fresh.token, {
+        factorId: again.factorId,
+        code: t.totpCode(again.secret),
+      }),
+    ).rejects.toThrow("store unavailable");
+    expect(await t.ik.sessions.validate(bystander.token)).toBeNull();
   });
 
   it("the TOTP secret is stored only sealed", async () => {
@@ -656,7 +700,9 @@ describe("TOTP secrets", () => {
         consoleCalls.push(args);
       });
     }
-    const t = setup({ policy: { ...mfaPolicy, approvalProofLevel: "code-confirmation" } });
+    const t = setup({
+      policy: { ...mfaPolicy, approvalEvidenceLevels: ["signature", "code-confirmation"] },
+    });
     const user = await t.signIn("person@example.org");
     const start = await t.ik.totp.startEnrolment(user.token);
     if (start.status !== "ok") throw new Error("denied");
@@ -699,15 +745,16 @@ describe("TOTP secrets", () => {
     const approval = await t.ik.approvals.start({
       sessionToken: granted.token,
       payloadHash: "c".repeat(64),
-      level: "code-confirmation",
+      levels: ["code-confirmation"],
     });
     later.push(approval);
-    if (approval.status !== "ok") throw new Error("denied");
+    if (approval.status !== "ok" || approval.level !== "code-confirmation") {
+      throw new Error("denied");
+    }
     later.push(
       await t.ik.approvals.verify({
         sessionToken: granted.token,
         payloadHash: "c".repeat(64),
-        level: "code-confirmation",
         approvalId: approval.approvalId,
         code: code(),
       }),

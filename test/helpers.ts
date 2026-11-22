@@ -55,7 +55,7 @@ export const emailFirstPolicy: SignInPolicy = {
   secondFactor: "none",
   secondFactorMethods: ["passkey", "totp"],
   stepUpMethods: ["passkey", "email_otp", "totp"],
-  approvalProofLevel: "signature",
+  approvalEvidenceLevels: ["signature"],
   createAccountOnFirstSignIn: true,
 };
 
@@ -77,6 +77,7 @@ export function setup(options: SetupOptions = {}) {
   const store = options.store ?? createMemoryStore();
   const policy = { current: options.policy ?? emailFirstPolicy };
   const idv = createFakeIdentityVerificationAdapter(options.idv ?? { outcome: "succeed" });
+  const hasher = createHmacHasher(randomBytes(32));
   const testSealer = createTestSealer();
   const sealer = options.sealer ?? testSealer;
   const privileged = new Set(options.privilegedEmails ?? []);
@@ -85,7 +86,7 @@ export function setup(options: SetupOptions = {}) {
     sealer,
     isPrivilegedAccount: (account) => privileged.has(account.email),
     store,
-    hasher: createHmacHasher(randomBytes(32)),
+    hasher,
     mail,
     audit,
     clock,
@@ -154,6 +155,7 @@ export function setup(options: SetupOptions = {}) {
     store,
     policy,
     idv,
+    hasher,
     sealer,
     testSealer,
     privileged,
@@ -178,7 +180,7 @@ export const mfaPolicy: SignInPolicy = {
   secondFactor: "if_enrolled",
   secondFactorMethods: ["passkey", "totp"],
   stepUpMethods: ["passkey", "email_otp", "totp"],
-  approvalProofLevel: "signature",
+  approvalEvidenceLevels: ["signature"],
   createAccountOnFirstSignIn: true,
 };
 
@@ -193,9 +195,21 @@ export function hookedTotpStore() {
     beforeActivate: (() => Promise<void>) | null;
     /** Number of further revokeAllForAccount calls that throw. */
     failRevokeAll: number;
-  } = { afterRecordStep: null, beforeActivate: null, failRevokeAll: 0 };
+    /** Number of further throttle resets that throw. */
+    failThrottleReset: number;
+  } = { afterRecordStep: null, beforeActivate: null, failRevokeAll: 0, failThrottleReset: 0 };
   const store: IdentkitStore = {
     ...inner,
+    throttle: {
+      ...inner.throttle,
+      reset: async (key) => {
+        if (hooks.failThrottleReset > 0) {
+          hooks.failThrottleReset -= 1;
+          throw new Error("store unavailable");
+        }
+        return inner.throttle.reset(key);
+      },
+    },
     sessions: {
       ...inner.sessions,
       revokeAllForAccount: async (...args) => {
