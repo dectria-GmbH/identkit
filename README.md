@@ -235,8 +235,10 @@ E-mail codes:
     A new window starts this count again.
   - Consecutive: after `maxConsecutiveFailures` failures since the last success, the address
     locks, whatever the windows. A new window does not start this count again. While the count
-    is at the limit, the end of each lock lets exactly one attempt through; if it fails, the
-    address locks again.
+    is at the limit, the end of each lock lets exactly one attempt through. The attempt after
+    it locks the address again, whatever its code; a correct code in that one attempt resets
+    the counts. Between the two attempts the address does not show as locked, so a code request
+    still gets a code.
 - Each further lock without a success in between lasts twice as long, up to `maxLockSeconds`. A
   success resets both counts and the lock length. An attacker who stays just under the window
   limit is locked at the consecutive limit. Example with the values above: 100 wrong codes in
@@ -282,8 +284,10 @@ Passkeys:
   registration. Adding or removing a passkey revokes the other sessions of the account.
 - Enrollment tokens can be revoked. A new token revokes every earlier token of the account, and
   so do `passkeys.revoke` and `passkeys.revokeEnrollmentTokens`. A registration that is using a
-  token at that moment fails its check after the insert and leaves no passkey. For a recovery,
-  revoke the lost passkey first and issue the token after it.
+  token at that moment fails its next check after the insert and its passkey goes. A
+  registration that passed its last check before the revocation keeps its passkey, so list the
+  account's passkeys after a revocation. For a recovery, revoke the lost passkey first and issue
+  the token after it.
 - Every challenge is single use, bound to its purpose, and expires. The challenges of
   registration, second factor, step-up and approval are also bound to a session. The challenge
   of the discoverable sign-in (`startSignIn`) has no session: any client can complete it with a
@@ -491,7 +495,9 @@ identkit leaves these to the consumer:
 
 - Purge old rows. identkit does not delete them (see "Storage"). Each `passkeys.startSignIn` and
   each `emailSignIn.requestCode` writes rows without authentication (a challenge; a flow, a send
-  gate and a mail), so without a scheduled job these tables grow with every call.
+  gate and a mail), so without a scheduled job these tables grow with every call. Never purge
+  `identkit_throttles` by age: a deleted row resets the failure counts and the lock length of
+  its address or account, and gives an attacker a fresh set of guesses.
 - Limit unauthenticated calls in your HTTP layer: per client and in total, for `requestCode`,
   `startSignIn` and every verify route. identkit limits per address and per account only.
 - Treat audit events as personal data where the payload is. Approval events carry

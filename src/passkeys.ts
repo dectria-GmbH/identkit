@@ -94,12 +94,13 @@ export interface Passkeys {
   /**
    * Administrative: issues a single-use registration token for the account. Deliver it out
    * of band. identkit stores only its keyed hash. Every earlier token of the account stops
-   * working, also one that a registration is using at this moment.
+   * working; a registration that is using one fails at its next check after the insert.
    */
   issueEnrollmentToken(accountId: string): Promise<{ token: string; expiresAt: Date }>;
   /**
    * Administrative: revokes every enrollment token of the account and returns how many it
-   * revoked. A registration that is using one of them fails.
+   * revoked. A registration that is using one of them fails at its next check after the
+   * insert; one that passed its last check keeps its passkey.
    */
   revokeEnrollmentTokens(accountId: string): Promise<number>;
 }
