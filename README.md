@@ -96,7 +96,7 @@ or check ownership yourself before you pass client input: all of `accounts`,
 
 Standalone functions: `checkApprovalEvidence({ evidence, verifier | hasher })`, `hashPayload(payload)`,
 `approvalChallenge(nonce, payloadHash, accountId)`, `normalizeEmail(input)`, `parseConfig(input)`,
-`createAesGcmSealer({ keys, activeKeyId })`, `applyThrottle(state, at, rule)` (for custom stores). Constant `TOTP_INTEROPERABLE_PARAMETERS`
+`createAesGcmSealer({ keys, activeKeyId })`, `applyThrottle(state, at, rule)`, `lockDuration(rule, lockCount)` and the type `ThrottleState` (for custom stores). Constant `TOTP_INTEROPERABLE_PARAMETERS`
 (`{ algorithm: "SHA1", digits: 6 }`).
 
 `checkApprovalEvidence` returns an object with a `status`. Switch on the exact status and
@@ -511,9 +511,11 @@ identkit leaves these to the consumer:
 - Purge `identkit_throttles` only by this rule, or not at all. A deleted row resets the failure
   counts and the lock length of its address or account, and gives an attacker a fresh set of
   guesses. The rule deletes only rows whose last window started and whose last lock ended more
-  than `N` days ago, so a purge adds at most `maxConsecutiveFailures` attempts per key every `N`
-  days. Choose `N` from
-  your risk analysis (30 days is an example, not a recommendation from a standard):
+  than `N` days ago. After a purge the key starts from zero: `maxConsecutiveFailures` attempts,
+  then one per lock end while the lock length grows back to `maxLockSeconds` (with the example
+  values, 106 attempts in the first day). A purge can give that much at most once per key every
+  `N` days. Choose `N` from your risk analysis (30 days is an example, not a recommendation from
+  a standard):
 
   ```sql
   DELETE FROM identkit_throttles

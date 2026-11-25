@@ -309,7 +309,9 @@ export interface IdentkitStore {
     consume(digest: string, at: Date): Promise<EnrollmentTokenRecord | null>;
     /**
      * Revokes every token of the account that is not revoked yet, also consumed ones, and
-     * returns how many it revoked. Serialized with `issue` for the same account.
+     * returns how many it revoked. Serialize it with `issue` for the same account (the
+     * PostgreSQL store locks the account row); otherwise a token issued at the same moment
+     * can stay usable.
      */
     revokeAllForAccount(accountId: string, at: Date): Promise<number>;
   };

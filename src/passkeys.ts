@@ -355,7 +355,17 @@ export function createPasskeys(
           }
           throw error;
         } finally {
-          await sessions.revokeAll(account.id);
+          await sessions.revokeAll(account.id).catch(async (error: unknown) => {
+            // Other sessions may survive: record it, then fail.
+            await ctx
+              .emit({
+                type: "passkey.registration_failed",
+                accountId: account.id,
+                reason: "cleanup_failed",
+              })
+              .catch(() => undefined);
+            throw error;
+          });
         }
       };
       let activated = false;

@@ -392,6 +392,55 @@ describe("passkey registration races", () => {
     );
   });
 
+  it("a session revocation that fails in the cleanup is recorded", async () => {
+    const inner = createMemoryStore();
+    let revokeFailures = 0;
+    let afterActivate: (() => Promise<void>) | null = null;
+    const store: IdentkitStore = {
+      ...inner,
+      credentials: {
+        ...inner.credentials,
+        activate: async (...args) => {
+          const result = await inner.credentials.activate(...args);
+          const hook = afterActivate;
+          afterActivate = null;
+          if (hook) await hook();
+          return result;
+        },
+      },
+      sessions: {
+        ...inner.sessions,
+        revokeAllForAccount: async (...args) => {
+          if (revokeFailures > 0) {
+            revokeFailures -= 1;
+            throw new Error("store unavailable");
+          }
+          return inner.sessions.revokeAllForAccount(...args);
+        },
+      },
+    };
+    const t = setup({ store });
+    const created = await t.ik.accounts.create({ email: "staff@example.org" });
+    if (created.status !== "created") throw new Error("not created");
+    const { token } = await t.ik.passkeys.issueEnrollmentToken(created.account.id);
+    const start = await t.ik.passkeys.startRegistration({ enrollmentToken: token });
+    if (start.status !== "ok") throw new Error("denied");
+    afterActivate = async () => {
+      await t.ik.passkeys.revokeEnrollmentTokens(created.account.id);
+      revokeFailures = 1;
+    };
+    await expect(
+      t.ik.passkeys.finishRegistration(
+        { enrollmentToken: token },
+        t.authenticator.register(start.options),
+      ),
+    ).rejects.toThrow("store unavailable");
+    expect(await inner.credentials.listByAccount(created.account.id)).toHaveLength(0);
+    expect(t.audit.ofType("passkey.registration_failed").map((e) => e.reason)).toContain(
+      "cleanup_failed",
+    );
+  });
+
   it("a pending row removed before its activation ends no session", async () => {
     const { inner, store, hooks } = hookedStore();
     const t = setup({ store });
