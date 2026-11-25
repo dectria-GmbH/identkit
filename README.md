@@ -2,7 +2,7 @@
 
 Identity toolkit for TypeScript: accounts, e-mail codes, passkeys, TOTP, sessions, step-up and approval evidence.
 
-Status: early development, first public release 0.1.0. It covers sign-in by e-mail code, passkeys, TOTP
+Status: early development, release 0.1.1. It covers sign-in by e-mail code, passkeys, TOTP
 (authenticator apps), sessions, step-up, approval evidence at two levels, an identity
 verification port and storage. See "Not built" for what comes later.
 
@@ -81,7 +81,8 @@ const session = await identkit.sessions.validate(tokenFromCookie);
 - `approvals`: `start({ sessionToken, payloadHash, levels? })`,
   `verify({ sessionToken, payloadHash, levels?, response })` or
   `verify({ sessionToken, payloadHash, levels?, approvalId, code })`.
-- `accounts`: `create({ email })`, `get(id)`, `findByEmail(email)`, `disable(id)`.
+- `accounts`: `create({ email })`, `get(id)`, `findByEmail(email)`, `disable(id)`, `unlock(id)`,
+  `unlockAddress(email)`.
 - `identityVerification`: `start({ accountId, returnUrl })`, `handleCallback(payload)`,
   `refresh(verificationId)`, `get(verificationId)`.
 
@@ -95,7 +96,7 @@ or check ownership yourself before you pass client input: all of `accounts`,
 
 Standalone functions: `checkApprovalEvidence({ evidence, verifier | hasher })`, `hashPayload(payload)`,
 `approvalChallenge(nonce, payloadHash, accountId)`, `normalizeEmail(input)`, `parseConfig(input)`,
-`createAesGcmSealer({ keys, activeKeyId })`. Constant `TOTP_INTEROPERABLE_PARAMETERS`
+`createAesGcmSealer({ keys, activeKeyId })`, `applyThrottle(state, at, rule)` (for custom stores). Constant `TOTP_INTEROPERABLE_PARAMETERS`
 (`{ algorithm: "SHA1", digits: 6 }`).
 
 `checkApprovalEvidence` returns an object with a `status`. Switch on the exact status and
@@ -242,17 +243,26 @@ E-mail codes:
 - Each further lock without a success in between lasts twice as long, up to `maxLockSeconds`. A
   success resets both counts and the lock length. An attacker who stays just under the window
   limit is locked at the consecutive limit. Example with the values above: 100 wrong codes in
-  the first 2.5 hours, then 6 more in the rest of the day, then about one per day.
-- identkit does not disable an address for good at the consecutive limit, and it has no unlock
-  call: every lock ends on time. NIST SP 800-63B-4 asks that an authenticator allows at most 100
-  consecutive failed attempts. identkit holds that bound until the first consecutive lock; after
-  it, one more attempt is allowed per lock, at most one per `maxLockSeconds` once the lock length
-  reached it. The reason is the trade-off below: a lock that only an operator can lift would let
-  anyone who can request codes for an address lock its owner out for good.
+  the first 2.5 hours, then 6 more in the rest of the day, then about one per day. That rate
+  holds only while nobody enters a correct code. Each success by the owner resets the counts and
+  gives the attacker `maxConsecutiveFailures` new attempts: an owner who signs in every day
+  allows about 100 wrong codes per day.
+- identkit does not disable an address for good at the consecutive limit: every lock ends on
+  time. NIST SP 800-63B-4 asks that an authenticator allows at most 100 consecutive failed
+  attempts. identkit holds that bound until the first consecutive lock; after it, one more
+  attempt is allowed per lock, at most one per `maxLockSeconds` once the lock length reached it.
+  The timed release lets the owner back in once the attacker stops. It does not stop a
+  persistent attacker: two attempts at the end of each lock keep the address locked for as long
+  as the attacker goes on.
+- The way out is the operator call `accounts.unlock(accountId)`, or `accounts.unlockAddress(email)`
+  for an address without an account. It clears the lock, the lock length and both counts of the
+  address (sign-in and step-up) and, for `unlock`, of the account's TOTP, and writes the audit
+  event `lockout.released`. Restrict it to an operator role: whoever can call it can guess
+  without limit. A passkey sign-in is not affected by the e-mail or TOTP locks.
 - A person who can request codes for an address can trigger a lock: it trades a denial of
   service for brute-force protection. Escalation makes the brute-force bound stronger and a
-  lasting lockout cheaper: once the consecutive limit is reached, one wrong code at the end of
-  each lock keeps the address locked. Set `maxLockSeconds` equal to `lockSeconds` to turn
+  lasting lockout cheaper: once the consecutive limit is reached, two attempts at the end of
+  each lock keep the address locked. Set `maxLockSeconds` equal to `lockSeconds` to turn
   escalation off; the consecutive limit still applies.
 - identkit limits per address only. Add rate limits per client and in total in your HTTP layer:
   an attacker who guesses against many addresses at once is not limited by the per-address
@@ -349,7 +359,9 @@ TOTP:
   exceed the limit. The lock and its escalation work like the e-mail address lock; a success
   resets the count. Confirmation attempts count separately per account. Anyone who holds the
   first factor (a pending session) or a session can trigger the lock: a denial of service traded
-  for brute-force protection.
+  for brute-force protection. As for e-mail codes, every success (a second factor, a step-up or a
+  code approval by the owner) gives a guesser `maxConsecutiveFailures` new attempts, and a
+  persistent guesser keeps TOTP locked; `accounts.unlock(accountId)` lifts the lock.
 - Adding or removing a second factor needs a fresh step-up with the strongest factor the
   account has: passkey, else TOTP; with no factor, any fresh step-up. So a first passkey on an
   account with only TOTP needs a TOTP step-up. Removing a passkey still needs a passkey step-up.
@@ -495,9 +507,27 @@ identkit leaves these to the consumer:
 
 - Purge old rows. identkit does not delete them (see "Storage"). Each `passkeys.startSignIn` and
   each `emailSignIn.requestCode` writes rows without authentication (a challenge; a flow, a send
-  gate and a mail), so without a scheduled job these tables grow with every call. Never purge
-  `identkit_throttles` by age: a deleted row resets the failure counts and the lock length of
-  its address or account, and gives an attacker a fresh set of guesses.
+  gate and a mail), so without a scheduled job these tables grow with every call.
+- Purge `identkit_throttles` only by this rule, or not at all. A deleted row resets the failure
+  counts and the lock length of its address or account, and gives an attacker a fresh set of
+  guesses. The rule deletes only rows whose last window started and whose last lock ended more
+  than `N` days ago, so a purge adds at most `maxConsecutiveFailures` attempts per key every `N`
+  days. Choose `N` from
+  your risk analysis (30 days is an example, not a recommendation from a standard):
+
+  ```sql
+  DELETE FROM identkit_throttles
+  WHERE window_start < now() - interval '30 days'
+    AND (locked_until IS NULL OR locked_until < now() - interval '30 days');
+  ```
+
+- Restrict `accounts.unlock` and `accounts.unlockAddress` to an operator role, like every other
+  administrative call.
+- A custom store (your own `IdentkitStore`) must apply the throttle rules in
+  `throttle.reserve`: call `applyThrottle(state, at, rule)` from `identkit` on the stored state
+  inside one atomic section, and store every field of `next`. A store that skips a field
+  compiles, but skips a limit. The PostgreSQL store expects the isolation level READ COMMITTED,
+  the PostgreSQL default.
 - Limit unauthenticated calls in your HTTP layer: per client and in total, for `requestCode`,
   `startSignIn` and every verify route. identkit limits per address and per account only.
 - Treat audit events as personal data where the payload is. Approval events carry

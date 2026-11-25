@@ -190,6 +190,43 @@ describe("e-mail code sign-in", () => {
     expect(compared()).toBe(maxConsecutiveFailures + 6);
   });
 
+  it("rule: address lockout - an operator unlock lets the owner sign in while the attacker's lock runs", async () => {
+    const t = setup();
+    const email = "victim@example.org";
+    const owner = await t.signIn(email);
+    const { maxFailures } = testConfig.emailOtp.addressLockout;
+    async function attack(target: string) {
+      let failures = 0;
+      while (failures <= maxFailures) {
+        t.clock.advanceSeconds(testConfig.emailOtp.resendCooldownSeconds);
+        const { flowId, code } = await t.codeFor(target);
+        for (
+          let i = 0;
+          i < testConfig.emailOtp.maxAttemptsPerCode - 1 && failures <= maxFailures;
+          i += 1
+        ) {
+          await t.ik.emailSignIn.verifyCode({ flowId, code: otherCode(code) });
+          failures += 1;
+        }
+      }
+      t.clock.advanceSeconds(testConfig.emailOtp.resendCooldownSeconds);
+      expect((await t.ik.emailSignIn.requestCode({ email: target })).status).toBe("locked");
+    }
+
+    await attack(email);
+    expect(await t.ik.accounts.unlock(owner.account.id)).toBe(true);
+    expect(t.audit.ofType("lockout.released")).toMatchObject([
+      { accountId: owner.account.id, reason: "administrative" },
+    ]);
+    expect((await t.signIn(email)).status).toBe("signed_in");
+    expect(await t.ik.accounts.unlock("missing")).toBe(false);
+
+    // An address without an account is unlocked by address.
+    await attack("newcomer@example.org");
+    await t.ik.accounts.unlockAddress(" Newcomer@Example.org");
+    expect((await t.signIn("newcomer@example.org")).status).toBe("signed_in");
+  });
+
   it("rule: address lockout - sign-in and step-up failures are counted apart", async () => {
     const t = setup();
     const session = await t.signIn("person@example.org");

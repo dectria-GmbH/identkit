@@ -720,14 +720,23 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
         return r ? toEnrollmentToken(r) : null;
       },
       async revokeAllForAccount(accountId, at) {
-        const rows = await db
-          .updateTable("identkit_enrollment_tokens")
-          .set({ revoked_at: at })
-          .where("account_id", "=", accountId)
-          .where("revoked_at", "is", null)
-          .returning("token_digest")
-          .execute();
-        return rows.length;
+        return db.transaction().execute(async (trx) => {
+          // The same lock as `issue`: a revocation and an issue run one after the other.
+          await trx
+            .selectFrom("identkit_accounts")
+            .select("id")
+            .where("id", "=", accountId)
+            .forUpdate()
+            .executeTakeFirst();
+          const rows = await trx
+            .updateTable("identkit_enrollment_tokens")
+            .set({ revoked_at: at })
+            .where("account_id", "=", accountId)
+            .where("revoked_at", "is", null)
+            .returning("token_digest")
+            .execute();
+          return rows.length;
+        });
       },
     },
 

@@ -123,8 +123,8 @@ export interface TotpEngine {
 export const sealContext = (factorId: string, accountId: string) =>
   `identkit/totp-secret\u0000${factorId}\u0000${accountId}`;
 
-const throttleKey = (accountId: string) => `totp:${accountId}`;
-const enrolmentThrottleKey = (accountId: string) => `totp-enrolment:${accountId}`;
+export const throttleKey = (accountId: string) => `totp:${accountId}`;
+export const enrolmentThrottleKey = (accountId: string) => `totp-enrolment:${accountId}`;
 const FACTOR_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
 function codeShapeMatches(code: unknown, digits: TotpDigits): code is string {

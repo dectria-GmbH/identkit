@@ -15,7 +15,7 @@ export type CodeFailure = { status: "failed"; reason: "invalid" | "expired" | "l
 export type CheckCodeResult = { status: "verified"; flow: OtpFlowRecord } | CodeFailure;
 
 /** Failures count per address and purpose, so step-up use does not affect sign-in. */
-const throttleKey = (purpose: OtpPurpose, addressDigest: string) =>
+export const throttleKey = (purpose: OtpPurpose, addressDigest: string) =>
   `otp:${purpose}:${addressDigest}`;
 
 const CODE_PATTERN = new RegExp(`^[0-9]{${OTP_DIGITS}}$`);

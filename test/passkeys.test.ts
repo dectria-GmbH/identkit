@@ -525,8 +525,10 @@ describe("passkey step-up and removal", () => {
     await expect(t.ik.passkeys.revoke(user.account.id, user.credentialId)).rejects.toThrow(
       "store unavailable",
     );
-    // The passkey is gone, so the retry finds nothing to delete.
+    // The passkey is gone, so the retry finds nothing to delete. The failed call recorded it.
+    expect(t.audit.ofType("passkey.removed")).toHaveLength(1);
     expect(await t.ik.passkeys.revoke(user.account.id, user.credentialId)).toBe(false);
+    expect(t.audit.ofType("passkey.removed")).toHaveLength(1);
     expect(await t.ik.sessions.validate(thief.token)).toBeNull();
     expect(await t.ik.sessions.validate(user.token)).toBeNull();
   });
@@ -552,6 +554,7 @@ describe("passkey step-up and removal", () => {
       status: "denied",
       reason: "not_found",
     });
+    expect(t.audit.ofType("passkey.removed")).toHaveLength(1);
     expect(await t.ik.sessions.validate(thief.token)).toBeNull();
     expect(await t.ik.sessions.validate(granted.token)).not.toBeNull();
   });

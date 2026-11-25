@@ -97,4 +97,5 @@ export type {
   PasskeyRequestOptions,
 } from "./webauthn.js";
 export { createMemoryStore } from "./storage/memory.js";
+export { applyThrottle, lockDuration, type ThrottleState } from "./storage/throttle-logic.js";
 export type * from "./storage/types.js";

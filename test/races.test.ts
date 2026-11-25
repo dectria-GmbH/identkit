@@ -5,7 +5,7 @@
 import { describe, expect, it } from "vitest";
 import { createMemoryStore, hashPayload } from "../src/index.js";
 import type { IdentkitStore, SessionRecord } from "../src/storage/types.js";
-import { setup, testConfig } from "./helpers.js";
+import { emailFirstPolicy, setup, testConfig } from "./helpers.js";
 
 interface Hooks {
   /** Runs once, right after the signature counter of an assertion was written. */
@@ -337,6 +337,59 @@ describe("passkey registration races", () => {
       expect(finish, point).toEqual({ status: "denied", reason: "invalid_enrollment" });
       expect(await t.ik.passkeys.list(created.account.id), point).toHaveLength(0);
     }
+  });
+
+  it("a revoked token whose cleanup fails twice disables the account", async () => {
+    const inner = createMemoryStore();
+    let deleteFailures = 0;
+    let afterActivate: (() => Promise<void>) | null = null;
+    const store: IdentkitStore = {
+      ...inner,
+      credentials: {
+        ...inner.credentials,
+        activate: async (...args) => {
+          const result = await inner.credentials.activate(...args);
+          const hook = afterActivate;
+          afterActivate = null;
+          if (hook) await hook();
+          return result;
+        },
+        delete: async (...args) => {
+          if (deleteFailures > 0) {
+            deleteFailures -= 1;
+            throw new Error("connection reset");
+          }
+          return inner.credentials.delete(...args);
+        },
+      },
+    };
+    const t = setup({ store, policy: { ...emailFirstPolicy, createAccountOnFirstSignIn: false } });
+    const created = await t.ik.accounts.create({ email: "staff@example.org" });
+    if (created.status !== "created") throw new Error("not created");
+    const { token } = await t.ik.passkeys.issueEnrollmentToken(created.account.id);
+    const start = await t.ik.passkeys.startRegistration({ enrollmentToken: token });
+    if (start.status !== "ok") throw new Error("denied");
+    afterActivate = async () => {
+      await t.ik.passkeys.revokeEnrollmentTokens(created.account.id);
+      deleteFailures = 2;
+    };
+    await expect(
+      t.ik.passkeys.finishRegistration(
+        { enrollmentToken: token },
+        t.authenticator.register(start.options),
+      ),
+    ).rejects.toThrow("connection reset");
+    // The passkey survived both deletes, so the account is disabled and the passkey is useless.
+    expect(await inner.credentials.listByAccount(created.account.id)).toHaveLength(1);
+    expect((await t.ik.accounts.get(created.account.id))?.status).toBe("disabled");
+    expect(t.audit.ofType("passkey.registration_failed").map((e) => e.reason)).toContain(
+      "cleanup_failed_account_disabled",
+    );
+    expect(t.audit.ofType("account.disabled")).toHaveLength(1);
+    const { options } = await t.ik.passkeys.startSignIn();
+    expect((await t.ik.passkeys.finishSignIn(t.authenticator.assert(options))).status).toBe(
+      "failed",
+    );
   });
 
   it("a pending row removed before its activation ends no session", async () => {

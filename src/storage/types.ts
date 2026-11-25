@@ -212,7 +212,12 @@ export interface IdentkitStore {
     consume(id: string, at: Date): Promise<boolean>;
   };
   throttle: {
-    /** Atomically counts one attempt for `key` under `rule`. */
+    /**
+     * Atomically counts one attempt for `key` under `rule`: both limits, the timed release and
+     * the doubling lock. A custom store must call `applyThrottle` (exported by identkit) on the
+     * stored state inside its own atomic section and save every field of the result; a store
+     * that skips a field skips a limit.
+     */
     reserve(key: string, at: Date, rule: ThrottleRule): Promise<ThrottleResult>;
     peek(key: string, at: Date): Promise<Date | null>;
     reset(key: string): Promise<void>;
@@ -304,7 +309,7 @@ export interface IdentkitStore {
     consume(digest: string, at: Date): Promise<EnrollmentTokenRecord | null>;
     /**
      * Revokes every token of the account that is not revoked yet, also consumed ones, and
-     * returns how many it revoked.
+     * returns how many it revoked. Serialized with `issue` for the same account.
      */
     revokeAllForAccount(accountId: string, at: Date): Promise<number>;
   };
