@@ -5,6 +5,7 @@ import type {
   AccountRecord,
   ChallengeRecord,
   CredentialRecord,
+  EnrollmentTokenRecord,
   IdentkitStore,
   OtpFlowRecord,
   SessionRecord,
@@ -136,6 +137,15 @@ const toTotpFactor = (r: Row<"identkit_totp_factors">): TotpFactorRecord => ({
   activatedAt: r.activated_at,
   lastUsedStep: r.last_used_step === null ? null : Number(r.last_used_step),
   lastUsedAt: r.last_used_at,
+});
+
+const toEnrollmentToken = (r: Row<"identkit_enrollment_tokens">): EnrollmentTokenRecord => ({
+  tokenDigest: r.token_digest,
+  accountId: r.account_id,
+  createdAt: r.created_at,
+  expiresAt: r.expires_at,
+  consumedAt: r.consumed_at,
+  revokedAt: r.revoked_at,
 });
 
 const toVerification = (r: Row<"identkit_verifications">): VerificationRecord => ({
@@ -321,10 +331,18 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
       async reserve(key, at, rule) {
         return db.transaction().execute(async (trx) => {
           // The no-op update makes the upsert return the row and hold its lock until commit,
-          // also when a concurrent reset deleted it in between.
+          // also when a concurrent reset deleted it in between. The read, the decision and the
+          // write below all run under that lock, so parallel attempts count one after another.
           const row = await trx
             .insertInto("identkit_throttles")
-            .values({ key, window_start: at, attempts: 0, locked_until: null, lock_count: 0 })
+            .values({
+              key,
+              window_start: at,
+              attempts: 0,
+              locked_until: null,
+              lock_count: 0,
+              consecutive_failures: 0,
+            })
             .onConflict((oc) =>
               oc.column("key").doUpdateSet((eb) => ({ key: eb.ref("excluded.key") })),
             )
@@ -336,6 +354,7 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
               attempts: row.attempts,
               lockedUntil: row.locked_until,
               lockCount: row.lock_count,
+              consecutiveFailures: row.consecutive_failures,
             },
             at,
             rule,
@@ -347,6 +366,7 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
               attempts: next.attempts,
               locked_until: next.lockedUntil,
               lock_count: next.lockCount,
+              consecutive_failures: next.consecutiveFailures,
             })
             .where("key", "=", key)
             .execute();
@@ -651,17 +671,33 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
     },
 
     enrollment: {
-      async insert(t) {
-        await db
-          .insertInto("identkit_enrollment_tokens")
-          .values({
-            token_digest: t.tokenDigest,
-            account_id: t.accountId,
-            created_at: t.createdAt,
-            expires_at: t.expiresAt,
-            consumed_at: t.consumedAt,
-          })
-          .execute();
+      async issue(t) {
+        await db.transaction().execute(async (trx) => {
+          // The account row lock serializes concurrent issues, so at most one token stays.
+          await trx
+            .selectFrom("identkit_accounts")
+            .select("id")
+            .where("id", "=", t.accountId)
+            .forUpdate()
+            .executeTakeFirst();
+          await trx
+            .updateTable("identkit_enrollment_tokens")
+            .set({ revoked_at: t.createdAt })
+            .where("account_id", "=", t.accountId)
+            .where("revoked_at", "is", null)
+            .execute();
+          await trx
+            .insertInto("identkit_enrollment_tokens")
+            .values({
+              token_digest: t.tokenDigest,
+              account_id: t.accountId,
+              created_at: t.createdAt,
+              expires_at: t.expiresAt,
+              consumed_at: t.consumedAt,
+              revoked_at: t.revokedAt,
+            })
+            .execute();
+        });
       },
       async findByDigest(digest) {
         const r = await db
@@ -669,15 +705,7 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           .selectAll()
           .where("token_digest", "=", digest)
           .executeTakeFirst();
-        return r
-          ? {
-              tokenDigest: r.token_digest,
-              accountId: r.account_id,
-              createdAt: r.created_at,
-              expiresAt: r.expires_at,
-              consumedAt: r.consumed_at,
-            }
-          : null;
+        return r ? toEnrollmentToken(r) : null;
       },
       async consume(digest, at) {
         const r = await db
@@ -685,18 +713,21 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           .set({ consumed_at: at })
           .where("token_digest", "=", digest)
           .where("consumed_at", "is", null)
+          .where("revoked_at", "is", null)
           .where("expires_at", ">", at)
           .returningAll()
           .executeTakeFirst();
-        return r
-          ? {
-              tokenDigest: r.token_digest,
-              accountId: r.account_id,
-              createdAt: r.created_at,
-              expiresAt: r.expires_at,
-              consumedAt: r.consumed_at,
-            }
-          : null;
+        return r ? toEnrollmentToken(r) : null;
+      },
+      async revokeAllForAccount(accountId, at) {
+        const rows = await db
+          .updateTable("identkit_enrollment_tokens")
+          .set({ revoked_at: at })
+          .where("account_id", "=", accountId)
+          .where("revoked_at", "is", null)
+          .returning("token_digest")
+          .execute();
+        return rows.length;
       },
     },
 

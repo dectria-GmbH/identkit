@@ -158,7 +158,13 @@ export function runStoreContract(
     it("throttle: locks after the limit, unlocks after the lock time, resets", async () => {
       const store = await factory();
       const key = uid("thr");
-      const rule = { maxFailures: 2, windowSeconds: 60, lockSeconds: 120, maxLockSeconds: 600 };
+      const rule = {
+        maxFailures: 2,
+        windowSeconds: 60,
+        maxConsecutiveFailures: 100,
+        lockSeconds: 120,
+        maxLockSeconds: 600,
+      };
       expect((await store.throttle.reserve(key, T0, rule)).allowed).toBe(true);
       expect((await store.throttle.reserve(key, T0, rule)).allowed).toBe(true);
       const locked = await store.throttle.reserve(key, T0, rule);
@@ -179,7 +185,13 @@ export function runStoreContract(
     it("throttle: repeated locks double up to the maximum, a reset clears the count", async () => {
       const store = await factory();
       const key = uid("thr");
-      const rule = { maxFailures: 1, windowSeconds: 60, lockSeconds: 100, maxLockSeconds: 300 };
+      const rule = {
+        maxFailures: 1,
+        windowSeconds: 60,
+        maxConsecutiveFailures: 100,
+        lockSeconds: 100,
+        maxLockSeconds: 300,
+      };
       let at = T0;
       const lockLengths: number[] = [];
       for (let i = 0; i < 4; i += 1) {
@@ -199,11 +211,84 @@ export function runStoreContract(
     it("throttle: concurrent attempts cannot exceed the limit", async () => {
       const store = await factory();
       const key = uid("thr");
-      const rule = { maxFailures: 3, windowSeconds: 60, lockSeconds: 60, maxLockSeconds: 60 };
+      const rule = {
+        maxFailures: 3,
+        windowSeconds: 60,
+        maxConsecutiveFailures: 100,
+        lockSeconds: 60,
+        maxLockSeconds: 60,
+      };
       const results = await Promise.all(
         Array.from({ length: 10 }, () => store.throttle.reserve(key, T0, rule)),
       );
       expect(results.filter((r) => r.allowed)).toHaveLength(3);
+    });
+
+    it("throttle: the consecutive limit holds across windows; past it, each lock lets one attempt through", async () => {
+      const store = await factory();
+      const key = uid("thr");
+      const rule = {
+        maxFailures: 2,
+        windowSeconds: 60,
+        maxConsecutiveFailures: 5,
+        lockSeconds: 100,
+        maxLockSeconds: 400,
+      };
+      // Exactly `maxFailures` attempts per window: the window limit never locks.
+      let at = T0;
+      let allowed = 0;
+      let locked = null;
+      for (let window = 0; window < 10 && !locked; window += 1) {
+        at = addSeconds(T0, window * rule.windowSeconds);
+        for (let i = 0; i < rule.maxFailures && !locked; i += 1) {
+          const result = await store.throttle.reserve(key, at, rule);
+          if (result.allowed) allowed += 1;
+          else locked = result;
+        }
+      }
+      expect(allowed).toBe(rule.maxConsecutiveFailures);
+      expect(locked).toMatchObject({ allowed: false, lockedNow: true });
+      expect(locked?.lockedUntil?.getTime()).toBe(addSeconds(at, 100).getTime());
+      // A new window does not release the lock.
+      expect((await store.throttle.reserve(key, addSeconds(at, 99), rule)).allowed).toBe(false);
+
+      // Past the limit: one attempt per lock end, and each lock lasts twice as long.
+      const lockLengths: number[] = [];
+      for (let i = 0; i < 3; i += 1) {
+        at = locked?.lockedUntil ?? at;
+        expect((await store.throttle.reserve(key, at, rule)).allowed).toBe(true);
+        locked = await store.throttle.reserve(key, at, rule);
+        expect(locked).toMatchObject({ allowed: false, lockedNow: true });
+        lockLengths.push(((locked.lockedUntil?.getTime() ?? 0) - at.getTime()) / 1000);
+      }
+      expect(lockLengths).toEqual([200, 400, 400]);
+
+      // A success clears both counts.
+      await store.throttle.reset(key);
+      for (let i = 0; i < rule.maxFailures; i += 1) {
+        expect((await store.throttle.reserve(key, at, rule)).allowed).toBe(true);
+      }
+    });
+
+    it("throttle: concurrent attempts cannot exceed the consecutive limit in a new window", async () => {
+      const store = await factory();
+      const key = uid("thr");
+      const rule = {
+        maxFailures: 10,
+        windowSeconds: 60,
+        maxConsecutiveFailures: 12,
+        lockSeconds: 60,
+        maxLockSeconds: 60,
+      };
+      for (let i = 0; i < 8; i += 1) {
+        expect((await store.throttle.reserve(key, T0, rule)).allowed).toBe(true);
+      }
+      const next = addSeconds(T0, rule.windowSeconds);
+      const results = await Promise.all(
+        Array.from({ length: 10 }, () => store.throttle.reserve(key, next, rule)),
+      );
+      expect(results.filter((r) => r.allowed)).toHaveLength(4);
+      expect(results.filter((r) => r.lockedNow)).toHaveLength(1);
     });
 
     it("sessions: rotation is compare-and-set, revocation happens once", async () => {
@@ -473,12 +558,13 @@ export function runStoreContract(
       const a = account();
       await store.accounts.insert(a);
       const digest = uid("enr");
-      await store.enrollment.insert({
+      await store.enrollment.issue({
         tokenDigest: digest,
         accountId: a.id,
         createdAt: T0,
         expiresAt: addSeconds(T0, 60),
         consumedAt: null,
+        revokedAt: null,
       });
       expect(await store.enrollment.consume(digest, addSeconds(T0, 60))).toBeNull();
       const results = await Promise.all([
@@ -487,6 +573,57 @@ export function runStoreContract(
       ]);
       expect(results.filter((r) => r !== null)).toHaveLength(1);
       expect((await store.enrollment.findByDigest(digest))?.consumedAt).not.toBeNull();
+    });
+
+    it("enrollment: a new token revokes the earlier ones of the account; revocation is per account", async () => {
+      const store = await factory();
+      const a = account();
+      const b = account();
+      await store.accounts.insert(a);
+      await store.accounts.insert(b);
+      const token = (accountId: string, digest: string) => ({
+        tokenDigest: digest,
+        accountId,
+        createdAt: T0,
+        expiresAt: addSeconds(T0, 600),
+        consumedAt: null,
+        revokedAt: null,
+      });
+      const [first, used, second, other] = [uid("enr"), uid("enr"), uid("enr"), uid("enr")];
+      await store.enrollment.issue(token(a.id, first));
+      await store.enrollment.issue(token(a.id, used));
+      expect(await store.enrollment.consume(first, T0)).toBeNull();
+      expect((await store.enrollment.findByDigest(first))?.revokedAt).not.toBeNull();
+      expect(await store.enrollment.consume(used, T0)).not.toBeNull();
+      await store.enrollment.issue(token(b.id, other));
+      await store.enrollment.issue(token(a.id, second));
+      // Also a consumed token is marked, so a registration that is using it can see it.
+      expect((await store.enrollment.findByDigest(used))?.revokedAt).not.toBeNull();
+      expect(await store.enrollment.revokeAllForAccount(a.id, T0)).toBe(1);
+      expect(await store.enrollment.revokeAllForAccount(a.id, T0)).toBe(0);
+      expect(await store.enrollment.consume(second, T0)).toBeNull();
+      expect(await store.enrollment.consume(other, T0)).not.toBeNull();
+    });
+
+    it("enrollment: concurrent issues leave at most one usable token", async () => {
+      const store = await factory();
+      const a = account();
+      await store.accounts.insert(a);
+      const digests = Array.from({ length: 5 }, () => uid("enr"));
+      await Promise.all(
+        digests.map((digest) =>
+          store.enrollment.issue({
+            tokenDigest: digest,
+            accountId: a.id,
+            createdAt: T0,
+            expiresAt: addSeconds(T0, 600),
+            consumedAt: null,
+            revokedAt: null,
+          }),
+        ),
+      );
+      const usable = await Promise.all(digests.map((d) => store.enrollment.consume(d, T0)));
+      expect(usable.filter((r) => r !== null)).toHaveLength(1);
     });
 
     it("verifications: a pending verification completes once", async () => {

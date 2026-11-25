@@ -30,6 +30,7 @@ export const testConfig = {
     addressLockout: {
       maxFailures: 10,
       windowSeconds: 900,
+      maxConsecutiveFailures: 100,
       lockSeconds: 900,
       maxLockSeconds: 86_400,
     },
@@ -46,7 +47,13 @@ export const testConfig = {
     driftSteps: 1,
     enrolmentTtlSeconds: 600,
     approvalTtlSeconds: 300,
-    lockout: { maxFailures: 10, windowSeconds: 900, lockSeconds: 900, maxLockSeconds: 86_400 },
+    lockout: {
+      maxFailures: 10,
+      windowSeconds: 900,
+      maxConsecutiveFailures: 100,
+      lockSeconds: 900,
+      maxLockSeconds: 86_400,
+    },
   },
 };
 

@@ -47,8 +47,11 @@ export interface ThrottleResult {
 }
 
 export interface ThrottleRule {
+  /** Attempts per window. */
   maxFailures: number;
   windowSeconds: number;
+  /** Attempts since the last reset, across windows. */
+  maxConsecutiveFailures: number;
   lockSeconds: number;
   maxLockSeconds: number;
 }
@@ -144,6 +147,8 @@ export interface EnrollmentTokenRecord {
   createdAt: Date;
   expiresAt: Date;
   consumedAt: Date | null;
+  /** Set when a newer token or an administrative revocation replaced it. Never cleared. */
+  revokedAt: Date | null;
 }
 
 /** `processing`: the vendor reported success and identkit is linking the person. */
@@ -289,10 +294,19 @@ export interface IdentkitStore {
     replaceSealedSecret(id: string, expected: string, next: string): Promise<boolean>;
   };
   enrollment: {
-    insert(token: EnrollmentTokenRecord): Promise<void>;
+    /**
+     * Atomically revokes every earlier token of the account, also consumed ones, and inserts
+     * this one. Two concurrent calls leave at most one token that is not revoked.
+     */
+    issue(token: EnrollmentTokenRecord): Promise<void>;
     findByDigest(digest: string): Promise<EnrollmentTokenRecord | null>;
-    /** Atomically consumes an unexpired, unconsumed token. */
+    /** Atomically consumes an unexpired, unconsumed token that is not revoked. */
     consume(digest: string, at: Date): Promise<EnrollmentTokenRecord | null>;
+    /**
+     * Revokes every token of the account that is not revoked yet, also consumed ones, and
+     * returns how many it revoked.
+     */
+    revokeAllForAccount(accountId: string, at: Date): Promise<number>;
   };
   verifications: {
     insert(record: VerificationRecord): Promise<void>;

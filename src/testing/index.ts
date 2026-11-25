@@ -126,7 +126,10 @@ export interface FakeIdentityVerificationOptions {
   assuranceLevel?: AssuranceLevel;
   /** Person key that a successful verification reports. Default: one key per verification. */
   personKey?: string | ((verificationId: string) => string);
-  /** Secret for the fake callback signature. */
+  /**
+   * Secret for the fake callback signature. Default: 32 random bytes per adapter, so no
+   * known value can sign a callback. `callbackFor` signs with the secret in use.
+   */
   callbackSecret?: string;
 }
 
@@ -140,11 +143,14 @@ export interface FakeIdentityVerificationAdapter extends IdentityVerificationAda
 /**
  * Identity verification adapter for tests and demos. It contacts nothing. A verification
  * succeeds, fails, or never completes (`time_out`), as configured.
+ *
+ * Unsafe for production: it verifies nobody. With `outcome: "succeed"` every verification
+ * succeeds and links whatever person key it reports. Never wire it into a deployment.
  */
 export function createFakeIdentityVerificationAdapter(
   options: FakeIdentityVerificationOptions,
 ): FakeIdentityVerificationAdapter {
-  const secret = options.callbackSecret ?? "fake-callback-secret";
+  const secret = options.callbackSecret ?? randomBytes(32).toString("base64url");
   const state = new Map<string, { outcome: FakeOutcome; personKey: string }>();
   let counter = 0;
 

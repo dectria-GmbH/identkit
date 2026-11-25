@@ -34,6 +34,7 @@ export interface IdentkitDatabase {
     attempts: number;
     locked_until: Date | null;
     lock_count: number;
+    consecutive_failures: number;
   };
   identkit_sessions: {
     id: string;
@@ -80,6 +81,7 @@ export interface IdentkitDatabase {
     created_at: Date;
     expires_at: Date;
     consumed_at: Date | null;
+    revoked_at: Date | null;
   };
   identkit_verifications: {
     id: string;

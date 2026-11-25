@@ -85,13 +85,24 @@ export interface Passkeys {
     | { status: "removed" }
     | { status: "denied"; reason: "no_session" | "step_up_required" | "not_found" }
   >;
-  /** Administrative removal after loss or theft. Revokes all sessions of the account. */
+  /**
+   * Administrative removal after loss or theft. Revokes all sessions and all enrollment
+   * tokens of the account, on every call: also when the passkey is already gone, so a retry
+   * after an error completes the revocation. Returns false if no passkey was removed.
+   */
   revoke(accountId: string, credentialId: string): Promise<boolean>;
   /**
    * Administrative: issues a single-use registration token for the account. Deliver it out
-   * of band. identkit stores only its keyed hash.
+   * of band. identkit stores only its keyed hash. Every earlier token of the account stops
+   * working; a registration that is using one fails at its next check after the insert.
    */
   issueEnrollmentToken(accountId: string): Promise<{ token: string; expiresAt: Date }>;
+  /**
+   * Administrative: revokes every enrollment token of the account and returns how many it
+   * revoked. A registration that is using one of them fails at its next check after the
+   * insert; one that passed its last check keeps its passkey.
+   */
+  revokeEnrollmentTokens(accountId: string): Promise<number>;
 }
 
 export function createPasskeys(
@@ -138,7 +149,12 @@ export function createPasskeys(
     }
     const digest = await hasher.digest("enrollment-token", grant.enrollmentToken);
     const token = await store.enrollment.findByDigest(digest);
-    if (!token || token.consumedAt !== null || clock.now().getTime() >= token.expiresAt.getTime()) {
+    if (
+      !token ||
+      token.consumedAt !== null ||
+      token.revokedAt !== null ||
+      clock.now().getTime() >= token.expiresAt.getTime()
+    ) {
       return { status: "denied", reason: "invalid_enrollment" };
     }
     const account = await store.accounts.findById(token.accountId);
@@ -151,13 +167,24 @@ export function createPasskeys(
   /** Applies the registration grant again, counting only the passkeys other than `newId`. */
   async function grantStillHolds(
     grant: RegistrationGrant,
-    sessionId: string | null,
+    resolved: { sessionId: string | null; enrollmentTokenDigest: string | null },
     accountId: string,
     newId: string,
   ): Promise<true | RegistrationDenied> {
+    const { sessionId, enrollmentTokenDigest } = resolved;
     const account = await store.accounts.findById(accountId);
     if (!account || account.status !== "active") return { status: "denied", reason: "no_session" };
-    if (!("sessionToken" in grant)) return true;
+    if (!("sessionToken" in grant)) {
+      // The token is consumed by now. A newer token or a revocation since then ends the grant.
+      const token =
+        enrollmentTokenDigest === null
+          ? null
+          : await store.enrollment.findByDigest(enrollmentTokenDigest);
+      if (!token || token.accountId !== accountId || token.revokedAt !== null) {
+        return { status: "denied", reason: "invalid_enrollment" };
+      }
+      return true;
+    }
     // By id: a token rotation in another tab is not a lost grant.
     const live = sessionId === null ? null : await internals.loadById(sessionId, "complete");
     if (!live) return { status: "denied", reason: "no_session" };
@@ -265,12 +292,7 @@ export function createPasskeys(
       // The grant was checked before the insert. A revocation, a removed step-up passkey or a
       // concurrent first registration in between must not leave this passkey behind. Until
       // the activation the passkey cannot sign in, step up or approve.
-      const holds = await grantStillHolds(
-        grant,
-        resolved.sessionId,
-        account.id,
-        verified.credentialId,
-      );
+      const holds = await grantStillHolds(grant, resolved, account.id, verified.credentialId);
       if (holds !== true) {
         await store.credentials.delete(verified.credentialId, account.id, verified.publicKey);
         await ctx.emit({
@@ -305,7 +327,7 @@ export function createPasskeys(
           clock.now(),
         );
         outcome = activated
-          ? await grantStillHolds(grant, resolved.sessionId, account.id, verified.credentialId)
+          ? await grantStillHolds(grant, resolved, account.id, verified.credentialId)
           : { status: "denied", reason: "no_session" };
       } catch (error) {
         try {
@@ -453,9 +475,10 @@ export function createPasskeys(
       if (!(await hasFreshStepUp(ctx, loaded.record, ["passkey"])))
         return { status: "denied", reason: "step_up_required" };
       const removed = await store.credentials.delete(credentialId, loaded.record.accountId);
-      if (!removed) return { status: "denied", reason: "not_found" };
-      // Revoke first: if the audit sink fails afterwards, no other session survives.
+      // Always, also when the passkey is gone: a retry after a failed revocation must still
+      // end the other sessions. Revoke before the audit event, so a failing sink skips nothing.
       await sessions.revokeAll(loaded.record.accountId, { exceptSessionId: loaded.record.id });
+      if (!removed) return { status: "denied", reason: "not_found" };
       await ctx.emit({
         type: "passkey.removed",
         accountId: loaded.record.accountId,
@@ -466,10 +489,16 @@ export function createPasskeys(
     },
 
     async revoke(accountId, credentialId) {
+      // Tokens first: a registration that runs with one of them fails its check after the insert.
+      const revokedTokens = await store.enrollment.revokeAllForAccount(accountId, clock.now());
       const removed = await store.credentials.delete(credentialId, accountId);
-      if (!removed) return false;
-      // Revoke first: if the audit sink fails afterwards, no session survives.
+      // Always, also when the passkey is gone: a retry after a failed revocation must still
+      // end the sessions. Revoke before the audit events, so a failing sink skips nothing.
       await sessions.revokeAll(accountId);
+      if (revokedTokens > 0) {
+        await ctx.emit({ type: "enrollment.revoked", accountId, reason: "passkey_revoked" });
+      }
+      if (!removed) return false;
       await ctx.emit({
         type: "passkey.removed",
         accountId,
@@ -485,15 +514,24 @@ export function createPasskeys(
       const token = randomToken();
       const now = clock.now();
       const expiresAt = addSeconds(now, config.enrollment.tokenTtlSeconds);
-      await store.enrollment.insert({
+      await store.enrollment.issue({
         tokenDigest: await hasher.digest("enrollment-token", token),
         accountId,
         createdAt: now,
         expiresAt,
         consumedAt: null,
+        revokedAt: null,
       });
       await ctx.emit({ type: "enrollment.issued", accountId });
       return { token, expiresAt };
+    },
+
+    async revokeEnrollmentTokens(accountId) {
+      const revoked = await store.enrollment.revokeAllForAccount(accountId, clock.now());
+      if (revoked > 0) {
+        await ctx.emit({ type: "enrollment.revoked", accountId, reason: "administrative" });
+      }
+      return revoked;
     },
   };
 }
