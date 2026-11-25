@@ -36,11 +36,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # fetch-depth 0 fetches all branches, so origin/main exists.
       - name: Check that the tagged commit is on main
         env:
           TAG_SHA: ${{ github.sha }}
         run: |
-          git fetch --no-tags origin main
           if ! git merge-base --is-ancestor "$TAG_SHA" origin/main; then
             echo "Commit $TAG_SHA is not on origin/main. Release tags must point to a commit on main." >&2
             exit 1
@@ -87,7 +87,6 @@ jobs:
         with:
           node-version: 24
       # Trusted publishing needs npm CLI 11.5.1 or later (npm docs, "Trusted publishing").
-      # The npm bundled with Node 24 is newer (11.19.1 with Node 24.22.3). Fail if it is not.
       - name: Check the npm version
         run: |
           CURRENT="$(npm --version)"
@@ -109,4 +108,4 @@ jobs:
             echo "Expected one tarball in pack/, found $#" >&2
             exit 1
           fi
-          npm publish "$1" --provenance --access public
+          npm publish "./$1" --provenance --access public

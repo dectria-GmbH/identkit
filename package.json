@@ -17,7 +17,6 @@
     "passkeys",
     "webauthn",
     "totp",
-    "oidc",
     "sessions",
     "typescript",
     "postgresql"
