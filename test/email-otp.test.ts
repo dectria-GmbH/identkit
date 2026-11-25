@@ -145,6 +145,51 @@ describe("e-mail code sign-in", () => {
     expect((await t.ik.emailSignIn.requestCode({ email })).status).toBe("sent");
   });
 
+  it("rule: address lockout - an attacker who stays at the window limit is locked at the consecutive limit", async () => {
+    const t = setup();
+    const email = "victim@example.org";
+    const { maxFailures, windowSeconds, maxConsecutiveFailures, lockSeconds } =
+      testConfig.emailOtp.addressLockout;
+    const compared = () =>
+      t.audit.ofType("otp.verify_failed").filter((e) => e.reason === "wrong_code").length;
+    const end = t.clock.now().getTime() + 86_400_000;
+    let comparedAtFirstLock: number | null = null;
+    // 24 hours of exactly `maxFailures` wrong codes per window, and a wait whenever locked.
+    while (t.clock.now().getTime() < end) {
+      const windowStart = t.clock.now().getTime();
+      let inWindow = 0;
+      while (inWindow < maxFailures) {
+        const requested = await t.ik.emailSignIn.requestCode({ email });
+        if (requested.status === "locked") {
+          t.clock.advanceSeconds(requested.retryAfterSeconds);
+          break;
+        }
+        if (requested.status !== "sent") throw new Error(requested.status);
+        const code = t.mail.last()?.code ?? "";
+        for (
+          let i = 0;
+          i < testConfig.emailOtp.maxAttemptsPerCode && inWindow < maxFailures;
+          i += 1
+        ) {
+          await t.ik.emailSignIn.verifyCode({ flowId: requested.flowId, code: otherCode(code) });
+          inWindow += 1;
+          if (comparedAtFirstLock === null && t.audit.ofType("address.locked").length > 0) {
+            comparedAtFirstLock = compared();
+          }
+        }
+        t.clock.advanceSeconds(testConfig.emailOtp.resendCooldownSeconds);
+      }
+      t.clock.set(new Date(Math.max(t.clock.now().getTime(), windowStart + windowSeconds * 1000)));
+    }
+    // The window limit alone never locks this attacker; the consecutive limit does.
+    expect(comparedAtFirstLock).toBe(maxConsecutiveFailures);
+    // The first lock comes after 10 windows (9000 s). Each later lock lets one code through
+    // and lasts twice as long: lock ends at 900, 2700, 6300, 13500, 27900 and 56700 s after
+    // it fit into the remaining 77400 s; the next one (114300 s) does not.
+    expect(lockSeconds).toBe(900);
+    expect(compared()).toBe(maxConsecutiveFailures + 6);
+  });
+
   it("rule: address lockout - sign-in and step-up failures are counted apart", async () => {
     const t = setup();
     const session = await t.signIn("person@example.org");

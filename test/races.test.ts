@@ -318,6 +318,27 @@ describe("passkey registration races", () => {
     expect(await liveSessions(inner, user.account.id, t.clock.now())).toBe(0);
   });
 
+  it("an enrollment token revoked while its registration runs leaves no passkey", async () => {
+    for (const point of ["afterCredentialInsert", "beforeActivate"] as const) {
+      const { store, hooks } = hookedStore();
+      const t = setup({ store });
+      const created = await t.ik.accounts.create({ email: "staff@example.org" });
+      if (created.status !== "created") throw new Error("not created");
+      const { token } = await t.ik.passkeys.issueEnrollmentToken(created.account.id);
+      const start = await t.ik.passkeys.startRegistration({ enrollmentToken: token });
+      if (start.status !== "ok") throw new Error("denied");
+      hooks[point] = async () => {
+        await t.ik.passkeys.issueEnrollmentToken(created.account.id);
+      };
+      const finish = await t.ik.passkeys.finishRegistration(
+        { enrollmentToken: token },
+        t.authenticator.register(start.options),
+      );
+      expect(finish, point).toEqual({ status: "denied", reason: "invalid_enrollment" });
+      expect(await t.ik.passkeys.list(created.account.id), point).toHaveLength(0);
+    }
+  });
+
   it("a pending row removed before its activation ends no session", async () => {
     const { inner, store, hooks } = hookedStore();
     const t = setup({ store });

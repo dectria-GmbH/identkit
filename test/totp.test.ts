@@ -574,6 +574,39 @@ describe("TOTP verification", () => {
     ).toBe("signed_in");
   });
 
+  it("rule: attempt limit and lockout - a guesser who stays at the window limit is locked at the consecutive limit", async () => {
+    const lockout = {
+      maxFailures: 10,
+      windowSeconds: 60,
+      maxConsecutiveFailures: 30,
+      lockSeconds: 300,
+      maxLockSeconds: 86_400,
+    };
+    const t = setup({ config: { ...testConfig, totp: { ...testConfig.totp, lockout } } });
+    const user = await t.signIn("person@example.org");
+    const { secret } = await t.enrolTotp(user.token);
+    const compared = () =>
+      t.audit.ofType("totp.verify_failed").filter((e) => e.reason === "wrong_code").length;
+    for (let window = 1; window <= 5; window += 1) {
+      t.clock.advanceSeconds(lockout.windowSeconds);
+      const wrong = wrongCode(t, secret);
+      for (let i = 0; i < lockout.maxFailures; i += 1) {
+        await stepUpTotp(t, user.token, wrong);
+      }
+      // The window limit is never passed, so only the consecutive limit can lock.
+      if (window === 3) expect(t.audit.ofType("totp.locked")).toHaveLength(0);
+    }
+    expect(compared()).toBe(lockout.maxConsecutiveFailures);
+    expect(t.audit.ofType("totp.locked")).toHaveLength(1);
+    expect(await stepUpTotp(t, user.token, t.totpCode(secret))).toEqual({
+      status: "failed",
+      reason: "locked",
+    });
+    // After the lock, one code is compared; a right one succeeds and resets the counts.
+    t.clock.advanceSeconds(lockout.lockSeconds);
+    expect((await stepUpTotp(t, user.token, t.totpCode(secret))).status).toBe("granted");
+  });
+
   it("rule: attempt limit and lockout - parallel guesses cannot exceed the limit", async () => {
     const t = setup();
     const user = await t.signIn("person@example.org");

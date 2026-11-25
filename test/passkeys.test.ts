@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createMemoryStore, MethodNotAllowedError } from "../src/index.js";
 import type { IdentkitStore } from "../src/storage/types.js";
 import { createSoftwareAuthenticator } from "../src/testing/index.js";
-import { ORIGIN, setup, testConfig } from "./helpers.js";
+import { hookedTotpStore, ORIGIN, setup, testConfig } from "./helpers.js";
 
 const staffPolicy = {
   signInMethods: ["passkey" as const],
@@ -133,6 +133,46 @@ describe("passkey registration", () => {
       status: "denied",
       reason: "invalid_enrollment",
     });
+  });
+
+  it("enrollment token: a new token revokes the earlier one", async () => {
+    const t = setup({ policy: staffPolicy });
+    const created = await t.ik.accounts.create({ email: "staff@example.org" });
+    if (created.status !== "created") throw new Error("not created");
+    const first = await t.ik.passkeys.issueEnrollmentToken(created.account.id);
+    const second = await t.ik.passkeys.issueEnrollmentToken(created.account.id);
+    expect(await t.ik.passkeys.startRegistration({ enrollmentToken: first.token })).toEqual({
+      status: "denied",
+      reason: "invalid_enrollment",
+    });
+    const start = await t.ik.passkeys.startRegistration({ enrollmentToken: second.token });
+    if (start.status !== "ok") throw new Error("denied");
+    const response = t.authenticator.register(start.options);
+    expect(
+      (await t.ik.passkeys.finishRegistration({ enrollmentToken: second.token }, response)).status,
+    ).toBe("registered");
+  });
+
+  it("enrollment token: a passkey revoke and an explicit revocation end the open tokens", async () => {
+    const t = setup();
+    const user = await t.userWithPasskey("person@example.org");
+    const lost = await t.ik.passkeys.issueEnrollmentToken(user.account.id);
+    expect(await t.ik.passkeys.revoke(user.account.id, user.credentialId)).toBe(true);
+    expect(await t.ik.passkeys.startRegistration({ enrollmentToken: lost.token })).toEqual({
+      status: "denied",
+      reason: "invalid_enrollment",
+    });
+    const next = await t.ik.passkeys.issueEnrollmentToken(user.account.id);
+    expect(await t.ik.passkeys.revokeEnrollmentTokens(user.account.id)).toBe(1);
+    expect(await t.ik.passkeys.revokeEnrollmentTokens(user.account.id)).toBe(0);
+    expect(await t.ik.passkeys.startRegistration({ enrollmentToken: next.token })).toEqual({
+      status: "denied",
+      reason: "invalid_enrollment",
+    });
+    expect(t.audit.ofType("enrollment.revoked").map((e) => e.reason)).toEqual([
+      "passkey_revoked",
+      "administrative",
+    ]);
   });
 
   it("one address, one account: a second account for the same address is refused", async () => {
@@ -473,5 +513,46 @@ describe("passkey step-up and removal", () => {
     expect(await t.ik.passkeys.revoke(user.account.id, user.credentialId)).toBe(true);
     expect(await t.ik.sessions.validate(user.token)).toBeNull();
     expect((await passkeySignIn(t)).status).toBe("failed");
+  });
+
+  it("an administrative revoke retried after a failed session revocation still ends the sessions", async () => {
+    const { store, hooks } = hookedTotpStore();
+    const t = setup({ store });
+    const user = await t.userWithPasskey("person@example.org");
+    const thief = await passkeySignIn(t);
+    if (thief.status !== "signed_in") throw new Error(thief.status);
+    hooks.failRevokeAll = 1;
+    await expect(t.ik.passkeys.revoke(user.account.id, user.credentialId)).rejects.toThrow(
+      "store unavailable",
+    );
+    // The passkey is gone, so the retry finds nothing to delete.
+    expect(await t.ik.passkeys.revoke(user.account.id, user.credentialId)).toBe(false);
+    expect(await t.ik.sessions.validate(thief.token)).toBeNull();
+    expect(await t.ik.sessions.validate(user.token)).toBeNull();
+  });
+
+  it("a removal retried after a failed session revocation still ends the other sessions", async () => {
+    const { store, hooks } = hookedTotpStore();
+    const t = setup({ store });
+    const user = await t.userWithPasskey("person@example.org");
+    const thief = await passkeySignIn(t);
+    if (thief.status !== "signed_in") throw new Error(thief.status);
+    const start = await t.ik.stepUp.startPasskey(user.token);
+    if (start.status !== "ok") throw new Error("denied");
+    const granted = await t.ik.stepUp.finishPasskey(
+      user.token,
+      t.authenticator.assert(start.options),
+    );
+    if (granted.status !== "granted") throw new Error("not granted");
+    hooks.failRevokeAll = 1;
+    await expect(t.ik.passkeys.remove(granted.token, user.credentialId)).rejects.toThrow(
+      "store unavailable",
+    );
+    expect(await t.ik.passkeys.remove(granted.token, user.credentialId)).toEqual({
+      status: "denied",
+      reason: "not_found",
+    });
+    expect(await t.ik.sessions.validate(thief.token)).toBeNull();
+    expect(await t.ik.sessions.validate(granted.token)).not.toBeNull();
   });
 });

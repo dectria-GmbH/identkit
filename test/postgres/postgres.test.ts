@@ -41,7 +41,11 @@ describe.skipIf(!url)("postgresql", () => {
       }),
     });
     const applied = await migrateIdentkit(db);
-    expect(applied).toEqual(["0001_initial.sql", "0002_totp.sql"]);
+    expect(applied).toEqual([
+      "0001_initial.sql",
+      "0002_totp.sql",
+      "0003_lockout_and_enrollment_revocation.sql",
+    ]);
     expect(await migrateIdentkit(db)).toEqual([]);
     store = createPostgresStore(db);
   });

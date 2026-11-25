@@ -39,6 +39,7 @@ export type AuditEventType =
   | "totp.resealed"
   | "enrollment.issued"
   | "enrollment.used"
+  | "enrollment.revoked"
   | "identity_verification.started"
   | "identity_verification.completed"
   | "identity_verification.failed"

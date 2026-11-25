@@ -41,6 +41,17 @@ export function createMemoryStore(): IdentkitStore {
   const totpFactors = new Map<string, TotpFactorRecord>();
   const verifications = new Map<string, VerificationRecord>();
 
+  function revokeEnrollment(accountId: string, at: Date): number {
+    let revoked = 0;
+    for (const token of enrollment.values()) {
+      if (token.accountId === accountId && token.revokedAt === null) {
+        token.revokedAt = at;
+        revoked += 1;
+      }
+    }
+    return revoked;
+  }
+
   return {
     accounts: {
       insert(account) {
@@ -325,9 +336,13 @@ export function createMemoryStore(): IdentkitStore {
       },
     },
     enrollment: {
-      insert(token) {
+      issue(token) {
+        revokeEnrollment(token.accountId, token.createdAt);
         enrollment.set(token.tokenDigest, copy(token));
         return Promise.resolve();
+      },
+      revokeAllForAccount(accountId, at) {
+        return Promise.resolve(revokeEnrollment(accountId, at));
       },
       findByDigest(digest) {
         const found = enrollment.get(digest);
@@ -335,7 +350,12 @@ export function createMemoryStore(): IdentkitStore {
       },
       consume(digest, at) {
         const found = enrollment.get(digest);
-        if (!found || found.consumedAt !== null || at.getTime() >= found.expiresAt.getTime()) {
+        if (
+          !found ||
+          found.consumedAt !== null ||
+          found.revokedAt !== null ||
+          at.getTime() >= found.expiresAt.getTime()
+        ) {
           return Promise.resolve(null);
         }
         found.consumedAt = at;

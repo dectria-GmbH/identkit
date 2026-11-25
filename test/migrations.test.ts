@@ -25,4 +25,17 @@ describe("migrations", () => {
       "CREATE INDEX identkit_totp_factors_account_idx",
     ]);
   });
+
+  it("splits the lockout and enrollment migration into its statements", () => {
+    const text = readFileSync(
+      join(MIGRATIONS_DIR, "0003_lockout_and_enrollment_revocation.sql"),
+      "utf8",
+    );
+    const statements = splitStatements(text);
+    expect(statements.map((s) => s.split(/\s+/).slice(0, 3).join(" "))).toEqual([
+      "ALTER TABLE identkit_throttles",
+      "ALTER TABLE identkit_enrollment_tokens",
+      "CREATE INDEX identkit_enrollment_tokens_account_idx",
+    ]);
+  });
 });

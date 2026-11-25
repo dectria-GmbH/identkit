@@ -6,7 +6,10 @@ import { z } from "zod";
  */
 export const MAX_CODE_TTL_SECONDS = 600;
 
-/** NIST SP 800-63B-4 caps consecutive failed attempts per authenticator at 100. */
+/**
+ * Upper bound for `maxFailures` and `maxConsecutiveFailures`. NIST SP 800-63B-4 limits
+ * consecutive failed attempts on one account to at most 100.
+ */
 export const MAX_ADDRESS_FAILURES = 100;
 
 const seconds = (min: number, max: number) => z.number().int().min(min).max(max);
@@ -31,17 +34,25 @@ const originSchema = z
     { message: "origin must be an https origin (http only for localhost) without path" },
   );
 
-/** Failure counting with escalating locks, shared by e-mail codes and TOTP. */
+/**
+ * Failure counting with escalating locks, shared by e-mail codes and TOTP. Two limits apply:
+ * `maxFailures` per window, and `maxConsecutiveFailures` since the last success, across
+ * windows. After the consecutive limit, each lock lets one attempt through.
+ */
 const lockoutSchema = z
   .object({
     maxFailures: z.number().int().min(1).max(MAX_ADDRESS_FAILURES),
     windowSeconds: seconds(60, DAY),
+    maxConsecutiveFailures: z.number().int().min(1).max(MAX_ADDRESS_FAILURES),
     lockSeconds: seconds(60, DAY),
     maxLockSeconds: seconds(60, 30 * DAY),
   })
   .strict()
   .refine((value) => value.maxLockSeconds >= value.lockSeconds, {
     message: "maxLockSeconds must be at least lockSeconds",
+  })
+  .refine((value) => value.maxConsecutiveFailures >= value.maxFailures, {
+    message: "maxConsecutiveFailures must be at least maxFailures",
   });
 
 /** RFC 6238 section 5.2 recommends at most one time step of tolerance. */

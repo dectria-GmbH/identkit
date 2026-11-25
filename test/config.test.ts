@@ -35,6 +35,21 @@ describe("configuration", () => {
     }
   });
 
+  it("requires the consecutive-failure limit: at most 100, at least the window limit", () => {
+    for (const section of ["addressLockout", "lockout"] as const) {
+      const missing = structuredClone(testConfig);
+      const rules = section === "lockout" ? missing.totp.lockout : missing.emailOtp.addressLockout;
+      delete (rules as Partial<typeof rules>).maxConsecutiveFailures;
+      expect(() => parseConfig(missing), `${section} missing`).toThrow();
+      for (const value of [101, 9, 0]) {
+        const config = structuredClone(testConfig);
+        const target = section === "lockout" ? config.totp.lockout : config.emailOtp.addressLockout;
+        target.maxConsecutiveFailures = value;
+        expect(() => parseConfig(config), `${section}=${value}`).toThrow();
+      }
+    }
+  });
+
   it("refuses a code lifetime above 10 minutes", () => {
     const config = structuredClone(testConfig);
     config.emailOtp.codeTtlSeconds = 601;
