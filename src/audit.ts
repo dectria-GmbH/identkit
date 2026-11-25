@@ -10,6 +10,7 @@ export type AuditEventType =
   | "otp.verify_failed"
   | "otp.locked"
   | "address.locked"
+  | "lockout.released"
   | "account.created"
   | "account.disabled"
   | "session.created"

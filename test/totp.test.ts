@@ -607,6 +607,25 @@ describe("TOTP verification", () => {
     expect((await stepUpTotp(t, user.token, t.totpCode(secret))).status).toBe("granted");
   });
 
+  it("rule: attempt limit and lockout - an operator unlock lets the owner use TOTP while the lock runs", async () => {
+    const t = setup();
+    const user = await t.signIn("person@example.org");
+    const { secret } = await t.enrolTotp(user.token);
+    t.clock.advanceSeconds(STEP);
+    const wrong = wrongCode(t, secret);
+    for (let i = 0; i <= testConfig.totp.lockout.maxFailures; i += 1) {
+      await stepUpTotp(t, user.token, wrong);
+    }
+    expect(t.audit.ofType("totp.locked")).toHaveLength(1);
+    expect(await stepUpTotp(t, user.token, t.totpCode(secret))).toEqual({
+      status: "failed",
+      reason: "locked",
+    });
+    expect(await t.ik.accounts.unlock(user.account.id)).toBe(true);
+    t.clock.advanceSeconds(STEP);
+    expect((await stepUpTotp(t, user.token, t.totpCode(secret))).status).toBe("granted");
+  });
+
   it("rule: attempt limit and lockout - parallel guesses cannot exceed the limit", async () => {
     const t = setup();
     const user = await t.signIn("person@example.org");

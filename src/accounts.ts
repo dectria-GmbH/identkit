@@ -2,6 +2,8 @@ import type { Context } from "./context.js";
 import { randomBytes } from "node:crypto";
 import { randomId } from "./crypto.js";
 import { normalizeEmail } from "./email.js";
+import { throttleKey as otpThrottleKey } from "./email-otp.js";
+import { enrolmentThrottleKey, throttleKey as totpThrottleKey } from "./totp.js";
 import type { AccountRecord } from "./storage/types.js";
 
 export interface AccountView {
@@ -31,6 +33,18 @@ export interface Accounts {
   findByEmail(email: string): Promise<AccountView | null>;
   /** Disables the account and revokes all its sessions. */
   disable(accountId: string): Promise<void>;
+  /**
+   * Lifts the failure locks of the account: e-mail codes of its address (sign-in and step-up)
+   * and TOTP (checks and enrolment confirmation). Clears the lock, the lock length and both
+   * failure counts, as a success would. Returns false if the account does not exist.
+   * Operator only: a caller who can unlock can guess without limit.
+   */
+  unlock(accountId: string): Promise<boolean>;
+  /**
+   * Lifts the e-mail code locks of an address (sign-in and step-up), also for an address
+   * without an account. Operator only, like `unlock`.
+   */
+  unlockAddress(email: string): Promise<void>;
 }
 
 export function toAccountView(record: AccountRecord): AccountView {
@@ -61,7 +75,16 @@ export function createAccounts(
   ctx: Context,
   revokeAll: (accountId: string) => Promise<number>,
 ): Accounts {
-  const { store, clock } = ctx;
+  const { store, clock, hasher } = ctx;
+
+  /** Resets the e-mail code throttles of a normalized address. Returns its digest. */
+  async function releaseAddress(email: string): Promise<string> {
+    const addressDigest = await hasher.digest("address", email);
+    await store.throttle.reset(otpThrottleKey("sign_in", addressDigest));
+    await store.throttle.reset(otpThrottleKey("step_up", addressDigest));
+    return addressDigest;
+  }
+
   return {
     async create(input) {
       const email = normalizeEmail(input.email);
@@ -78,6 +101,24 @@ export function createAccounts(
     async findByEmail(email) {
       const record = await store.accounts.findByEmail(normalizeEmail(email));
       return record ? toAccountView(record) : null;
+    },
+    async unlock(accountId) {
+      const record = await store.accounts.findById(accountId);
+      if (!record) return false;
+      const addressDigest = await releaseAddress(record.email);
+      await store.throttle.reset(totpThrottleKey(accountId));
+      await store.throttle.reset(enrolmentThrottleKey(accountId));
+      await ctx.emit({
+        type: "lockout.released",
+        accountId,
+        addressDigest,
+        reason: "administrative",
+      });
+      return true;
+    },
+    async unlockAddress(email) {
+      const addressDigest = await releaseAddress(normalizeEmail(email));
+      await ctx.emit({ type: "lockout.released", addressDigest, reason: "administrative" });
     },
     async disable(accountId) {
       const record = await store.accounts.findById(accountId);
