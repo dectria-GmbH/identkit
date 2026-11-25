@@ -7,8 +7,8 @@ import { z } from "zod";
 export const MAX_CODE_TTL_SECONDS = 600;
 
 /**
- * Upper bound for `maxFailures` and `maxConsecutiveFailures`. NIST SP 800-63B-4 limits
- * consecutive failed attempts on one account to at most 100.
+ * Upper bound for `maxFailures` and `maxConsecutiveFailures`, taken from NIST SP 800-63B-4
+ * (at most 100 consecutive failed attempts per authenticator).
  */
 export const MAX_ADDRESS_FAILURES = 100;
 

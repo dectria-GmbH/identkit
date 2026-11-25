@@ -1,7 +1,7 @@
 {
   "name": "identkit",
   "version": "0.1.0",
-  "description": "Identity toolkit for TypeScript: accounts, passkeys, OIDC, token issuance and delegated agent identities.",
+  "description": "Identity toolkit for TypeScript: accounts, e-mail codes, passkeys, TOTP, sessions, step-up and approval evidence.",
   "license": "MIT",
   "repository": {
     "type": "git",

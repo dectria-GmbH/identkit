@@ -1,6 +1,6 @@
 # identkit
 
-Identity toolkit for TypeScript: accounts, passkeys, OIDC, token issuance and delegated agent identities.
+Identity toolkit for TypeScript: accounts, e-mail codes, passkeys, TOTP, sessions, step-up and approval evidence.
 
 Status: early development, first public release 0.1.0. It covers sign-in by e-mail code, passkeys, TOTP
 (authenticator apps), sessions, step-up, approval evidence at two levels, an identity
@@ -69,7 +69,7 @@ const session = await identkit.sessions.validate(tokenFromCookie);
 - `passkeys`: `startRegistration(grant)`, `finishRegistration(grant, response)`,
   `startSignIn()`, `finishSignIn(response)`, `startSecondFactor(pendingToken)`,
   `finishSecondFactor(pendingToken, response)`, `list(accountId)`, `remove(sessionToken, id)`,
-  `revoke(accountId, id)`, `issueEnrollmentToken(accountId)`.
+  `revoke(accountId, id)`, `issueEnrollmentToken(accountId)`, `revokeEnrollmentTokens(accountId)`.
 - `totp`: `startEnrolment(sessionToken)`, `confirmEnrolment(sessionToken, { factorId, code })`,
   `verifySecondFactor(pendingToken, { code })`, `get(accountId)`, `remove(sessionToken)`,
   `revoke(accountId)` (also deletes pending enrolments), `reseal(accountId)`.
@@ -87,7 +87,8 @@ const session = await identkit.sessions.validate(tokenFromCookie);
 
 Administrative calls take bare ids and trust their caller. Expose them only to privileged code,
 or check ownership yourself before you pass client input: all of `accounts`,
-`passkeys.list`, `passkeys.revoke`, `passkeys.issueEnrollmentToken`, `totp.get`, `totp.revoke`,
+`passkeys.list`, `passkeys.revoke`, `passkeys.issueEnrollmentToken`,
+`passkeys.revokeEnrollmentTokens`, `totp.get`, `totp.revoke`,
 `totp.reseal`, `sessions.revokeById`,
 `sessions.revokeAll`, `identityVerification.start`, `identityVerification.refresh` and
 `identityVerification.get`.
@@ -169,32 +170,34 @@ Every time and limit value is required configuration. identkit has no hidden def
 example values below are what the tests use. Values marked "assumption" are not confirmed by a
 standard or an owner decision; choose your own from your risk analysis.
 
-| Setting                                  | Example | Bounds enforced                          | Source                                                                                                                   |
-| ---------------------------------------- | ------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `emailOtp.codeTtlSeconds`                | 600     | 60 to 600                                | Upper bound: OWASP ASVS 5.0.0 6.5.5 (out-of-band codes at most 10 minutes). Value: assumption at the bound.              |
-| `emailOtp.maxAttemptsPerCode`            | 5       | 1 to 10                                  | Assumption                                                                                                               |
-| `emailOtp.resendCooldownSeconds`         | 30      | 1 to 3600                                | Assumption                                                                                                               |
-| `emailOtp.addressLockout.maxFailures`    | 10      | 1 to 100                                 | Upper bound taken from NIST SP 800-63B-4 (at most 100 consecutive failed attempts per authenticator). Value: assumption. |
-| `emailOtp.addressLockout.windowSeconds`  | 900     | 60 to 86400                              | Assumption                                                                                                               |
-| `emailOtp.addressLockout.lockSeconds`    | 900     | 60 to 86400                              | Assumption                                                                                                               |
-| `emailOtp.addressLockout.maxLockSeconds` | 86400   | 60 to 30 days, at least `lockSeconds`    | Assumption                                                                                                               |
-| `sessions.idleTimeoutSeconds`            | 900     | 60 to 86400                              | Assumption (ASVS 7.3.1 asks for a documented inactivity timeout, no value)                                               |
-| `sessions.absoluteTimeoutSeconds`        | 43200   | 60 to 30 days, at least the idle timeout | Assumption (ASVS 7.3.2 asks for a documented maximum lifetime, no value)                                                 |
-| `sessions.pendingTimeoutSeconds`         | 300     | 30 to 3600                               | Assumption                                                                                                               |
-| `stepUp.validitySeconds`                 | 300     | 30 to 3600                               | Assumption                                                                                                               |
-| `webauthn.challengeTtlSeconds`           | 300     | 30 to 600                                | Assumption                                                                                                               |
-| `identityVerification.timeoutSeconds`    | 1800    | 60 to 7 days                             | Assumption                                                                                                               |
-| `enrollment.tokenTtlSeconds`             | 86400   | 60 to 7 days                             | Assumption                                                                                                               |
-| `totp.issuer`                            | text    | 1 to 64 characters, no colon             | Design choice: the name the authenticator app shows                                                                      |
-| `totp.algorithm`                         | `SHA1`  | `SHA1`, `SHA256`, `SHA512`               | RFC 6238 allows all three. `SHA1` is the interoperable value (assumption, see "TOTP")                                    |
-| `totp.digits`                            | 6       | 6 or 8                                   | RFC 4226 allows 6 to 8 digits. 6 is the interoperable value (assumption, see "TOTP")                                     |
-| `totp.driftSteps`                        | 1       | 0 to 1                                   | Upper bound: RFC 6238 section 5.2 recommends at most one time step. Value: assumption at the bound.                      |
-| `totp.enrolmentTtlSeconds`               | 600     | 60 to 900                                | Assumption                                                                                                               |
-| `totp.approvalTtlSeconds`                | 300     | 30 to 600                                | Assumption                                                                                                               |
-| `totp.lockout.maxFailures`               | 10      | 1 to 100                                 | Upper bound taken from NIST SP 800-63B-4 (at most 100 consecutive failed attempts per authenticator). Value: assumption. |
-| `totp.lockout.windowSeconds`             | 900     | 60 to 86400                              | Assumption                                                                                                               |
-| `totp.lockout.lockSeconds`               | 900     | 60 to 86400                              | Assumption                                                                                                               |
-| `totp.lockout.maxLockSeconds`            | 86400   | 60 to 30 days, at least `lockSeconds`    | Assumption                                                                                                               |
+| Setting                                          | Example | Bounds enforced                          | Source                                                                                                                                                                    |
+| ------------------------------------------------ | ------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `emailOtp.codeTtlSeconds`                        | 600     | 60 to 600                                | Upper bound: OWASP ASVS 5.0.0 6.5.5 (out-of-band codes at most 10 minutes). Value: assumption at the bound.                                                               |
+| `emailOtp.maxAttemptsPerCode`                    | 5       | 1 to 10                                  | Assumption                                                                                                                                                                |
+| `emailOtp.resendCooldownSeconds`                 | 30      | 1 to 3600                                | Assumption                                                                                                                                                                |
+| `emailOtp.addressLockout.maxFailures`            | 10      | 1 to 100                                 | Failures per window. Assumption.                                                                                                                                          |
+| `emailOtp.addressLockout.maxConsecutiveFailures` | 100     | 1 to 100, at least `maxFailures`         | Failures since the last success, across windows. Upper bound taken from NIST SP 800-63B-4 (at most 100 consecutive failed attempts per authenticator). Value: assumption. |
+| `emailOtp.addressLockout.windowSeconds`          | 900     | 60 to 86400                              | Assumption                                                                                                                                                                |
+| `emailOtp.addressLockout.lockSeconds`            | 900     | 60 to 86400                              | Assumption                                                                                                                                                                |
+| `emailOtp.addressLockout.maxLockSeconds`         | 86400   | 60 to 30 days, at least `lockSeconds`    | Assumption                                                                                                                                                                |
+| `sessions.idleTimeoutSeconds`                    | 900     | 60 to 86400                              | Assumption (ASVS 7.3.1 asks for a documented inactivity timeout, no value)                                                                                                |
+| `sessions.absoluteTimeoutSeconds`                | 43200   | 60 to 30 days, at least the idle timeout | Assumption (ASVS 7.3.2 asks for a documented maximum lifetime, no value)                                                                                                  |
+| `sessions.pendingTimeoutSeconds`                 | 300     | 30 to 3600                               | Assumption                                                                                                                                                                |
+| `stepUp.validitySeconds`                         | 300     | 30 to 3600                               | Assumption                                                                                                                                                                |
+| `webauthn.challengeTtlSeconds`                   | 300     | 30 to 600                                | Assumption                                                                                                                                                                |
+| `identityVerification.timeoutSeconds`            | 1800    | 60 to 7 days                             | Assumption                                                                                                                                                                |
+| `enrollment.tokenTtlSeconds`                     | 86400   | 60 to 7 days                             | Assumption                                                                                                                                                                |
+| `totp.issuer`                                    | text    | 1 to 64 characters, no colon             | Design choice: the name the authenticator app shows                                                                                                                       |
+| `totp.algorithm`                                 | `SHA1`  | `SHA1`, `SHA256`, `SHA512`               | RFC 6238 allows all three. `SHA1` is the interoperable value (assumption, see "TOTP")                                                                                     |
+| `totp.digits`                                    | 6       | 6 or 8                                   | RFC 4226 allows 6 to 8 digits. 6 is the interoperable value (assumption, see "TOTP")                                                                                      |
+| `totp.driftSteps`                                | 1       | 0 to 1                                   | Upper bound: RFC 6238 section 5.2 recommends at most one time step. Value: assumption at the bound.                                                                       |
+| `totp.enrolmentTtlSeconds`                       | 600     | 60 to 900                                | Assumption                                                                                                                                                                |
+| `totp.approvalTtlSeconds`                        | 300     | 30 to 600                                | Assumption                                                                                                                                                                |
+| `totp.lockout.maxFailures`                       | 10      | 1 to 100                                 | Failures per window. Assumption.                                                                                                                                          |
+| `totp.lockout.maxConsecutiveFailures`            | 100     | 1 to 100, at least `maxFailures`         | Failures since the last success, across windows. Upper bound taken from NIST SP 800-63B-4 (at most 100 consecutive failed attempts per authenticator). Value: assumption. |
+| `totp.lockout.windowSeconds`                     | 900     | 60 to 86400                              | Assumption                                                                                                                                                                |
+| `totp.lockout.lockSeconds`                       | 900     | 60 to 86400                              | Assumption                                                                                                                                                                |
+| `totp.lockout.maxLockSeconds`                    | 86400   | 60 to 30 days, at least `lockSeconds`    | Assumption                                                                                                                                                                |
 
 Fixed values:
 
@@ -226,18 +229,29 @@ E-mail codes:
 - A code is stored as an HMAC over the flow id, purpose, address, session and code. It works
   once, for the flow that requested it, until it expires. Attempts are counted before the
   comparison, so concurrent guesses cannot exceed the limit. After the limit the flow locks.
-- Failed attempts are also counted per address and purpose across flows. After `maxFailures`
-  in one window the address locks for `lockSeconds`, for known and unknown addresses alike. Each
-  further lock without a success in between lasts twice as long, up to `maxLockSeconds`. A
-  success resets the count. So guesses per address shrink over time, but they never reach zero:
-  identkit does not disable an address for good after 100 failures, as NIST SP 800-63B-4 asks of
-  an authenticator, because anyone who can request codes for an address could then lock its
-  owner out for good.
+- Failed attempts are also counted per address and purpose across flows, for known and unknown
+  addresses alike, with two limits:
+  - Per window: after `maxFailures` failures in one window, the address locks for `lockSeconds`.
+    A new window starts this count again.
+  - Consecutive: after `maxConsecutiveFailures` failures since the last success, the address
+    locks, whatever the windows. A new window does not start this count again. While the count
+    is at the limit, the end of each lock lets exactly one attempt through; if it fails, the
+    address locks again.
+- Each further lock without a success in between lasts twice as long, up to `maxLockSeconds`. A
+  success resets both counts and the lock length. An attacker who stays just under the window
+  limit is locked at the consecutive limit. Example with the values above: 100 wrong codes in
+  the first 2.5 hours, then 6 more in the rest of the day, then about one per day.
+- identkit does not disable an address for good at the consecutive limit, and it has no unlock
+  call: every lock ends on time. NIST SP 800-63B-4 asks that an authenticator allows at most 100
+  consecutive failed attempts. identkit holds that bound until the first consecutive lock; after
+  it, one more attempt is allowed per lock, at most one per `maxLockSeconds` once the lock length
+  reached it. The reason is the trade-off below: a lock that only an operator can lift would let
+  anyone who can request codes for an address lock its owner out for good.
 - A person who can request codes for an address can trigger a lock: it trades a denial of
   service for brute-force protection. Escalation makes the brute-force bound stronger and a
-  lasting lockout cheaper: once the lock reached `maxLockSeconds`, one burst of failures per
-  `maxLockSeconds` keeps the address locked. Set `maxLockSeconds` equal to `lockSeconds` to turn
-  escalation off.
+  lasting lockout cheaper: once the consecutive limit is reached, one wrong code at the end of
+  each lock keeps the address locked. Set `maxLockSeconds` equal to `lockSeconds` to turn
+  escalation off; the consecutive limit still applies.
 - identkit limits per address only. Add rate limits per client and in total in your HTTP layer:
   an attacker who guesses against many addresses at once is not limited by the per-address
   count.
@@ -266,7 +280,14 @@ Passkeys:
 - The first passkey needs a full session with a fresh step-up. A further passkey needs a fresh
   passkey step-up. An enrollment token (single use, for onboarding or recovery) also allows
   registration. Adding or removing a passkey revokes the other sessions of the account.
-- Every challenge is single use, bound to its purpose and session, and expires.
+- Enrollment tokens can be revoked. A new token revokes every earlier token of the account, and
+  so do `passkeys.revoke` and `passkeys.revokeEnrollmentTokens`. A registration that is using a
+  token at that moment fails its check after the insert and leaves no passkey. For a recovery,
+  revoke the lost passkey first and issue the token after it.
+- Every challenge is single use, bound to its purpose, and expires. The challenges of
+  registration, second factor, step-up and approval are also bound to a session. The challenge
+  of the discoverable sign-in (`startSignIn`) has no session: any client can complete it with a
+  registered passkey. Origin and RP ID checks protect it, as in plain WebAuthn.
 - Assertions need user verification, a configured origin and the RP ID. Ceremonies in a
   cross-origin frame are refused. The signature counter must increase unless the authenticator
   always reports zero.
@@ -423,7 +444,8 @@ Implement `IdentityVerificationAdapter` for a vendor: `start`, `parseCallback` (
 callback, throw if it is not authentic) and `fetchResult`. A result reports `verified` with an
 assurance level (`low`, `substantial`, `high`), an evidence reference and a person key, or
 `failed`, or `pending`. identkit applies the timeout. `createFakeIdentityVerificationAdapter`
-succeeds, fails or never answers, for tests and demos.
+succeeds, fails or never answers, for tests and demos. It is unsafe for production: it verifies
+nobody. Without `callbackSecret` it signs callbacks with a random secret per instance.
 
 ## Audit events
 
@@ -458,6 +480,25 @@ older than `totp.enrolmentTtlSeconds`, with a scheduled job if you need to.
 
 Migration `0002_totp.sql` adds the TOTP factor table and widens two check constraints (step-up
 method `totp`, challenge purpose `approval_code`). It does not change `0001_initial.sql`.
+
+Migration `0003_lockout_and_enrollment_revocation.sql` adds the consecutive failure count to
+`identkit_throttles` (existing rows start at 0) and `revoked_at` to
+`identkit_enrollment_tokens`. It does not change the earlier files.
+
+## Operator duties
+
+identkit leaves these to the consumer:
+
+- Purge old rows. identkit does not delete them (see "Storage"). Each `passkeys.startSignIn` and
+  each `emailSignIn.requestCode` writes rows without authentication (a challenge; a flow, a send
+  gate and a mail), so without a scheduled job these tables grow with every call.
+- Limit unauthenticated calls in your HTTP layer: per client and in total, for `requestCode`,
+  `startSignIn` and every verify route. identkit limits per address and per account only.
+- Treat audit events as personal data where the payload is. Approval events carry
+  `payloadHash`, a plain SHA-256 of the approved payload. If the payload has low entropy (for
+  example an account number and an amount), a reader of the audit log can find it by trying
+  values. Put a random id into every payload that you hash.
+- Keep `identkit/testing` out of production code. Its fake adapters verify nobody.
 
 ## Development
 
