@@ -1,9 +1,26 @@
 {
   "name": "identkit",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
   "description": "Identity toolkit for TypeScript: accounts, passkeys, OIDC, token issuance and delegated agent identities.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dectria-GmbH/identkit.git"
+  },
+  "homepage": "https://github.com/dectria-GmbH/identkit#readme",
+  "bugs": {
+    "url": "https://github.com/dectria-GmbH/identkit/issues"
+  },
+  "keywords": [
+    "identity",
+    "authentication",
+    "passkeys",
+    "webauthn",
+    "totp",
+    "sessions",
+    "typescript",
+    "postgresql"
+  ],
   "type": "module",
   "engines": {
     "node": ">=24"
@@ -29,6 +46,10 @@
       "default": "./dist/testing/index.js"
     }
   },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -37,6 +58,7 @@
     "format:check": "prettier --check .",
     "test": "vitest run --maxWorkers=2",
     "test:postgres": "vitest run --maxWorkers=2 test/postgres",
+    "prepublishOnly": "pnpm build",
     "check": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test && pnpm build"
   },
   "peerDependencies": {

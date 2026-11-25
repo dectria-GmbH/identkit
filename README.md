@@ -2,18 +2,30 @@
 
 Identity toolkit for TypeScript: accounts, passkeys, OIDC, token issuance and delegated agent identities.
 
-Status: early development, not released. It covers sign-in by e-mail code, passkeys, TOTP
+Status: early development, first public release 0.1.0. It covers sign-in by e-mail code, passkeys, TOTP
 (authenticator apps), sessions, step-up, approval evidence at two levels, an identity
 verification port and storage. See "Not built" for what comes later.
 
 identkit is a library, not a server. The core has no HTTP framework dependency: you call it from
 your own routes and set cookies yourself.
 
+## Install
+
+```sh
+pnpm add identkit
+```
+
+For the PostgreSQL store, also install Kysely and a PostgreSQL driver such as `pg`:
+
+```sh
+pnpm add kysely pg
+```
+
 ## Requirements
 
 - Node.js 24 or later, ESM only.
-- For the PostgreSQL store: PostgreSQL and [Kysely](https://kysely.dev) 0.29 (optional peer
-  dependency).
+- For the PostgreSQL store: PostgreSQL 17 (the version the test suite runs against) and
+  [Kysely](https://kysely.dev) 0.29 (optional peer dependency).
 
 ## Quick start
 
@@ -476,6 +488,12 @@ Without `DATABASE_URL` the PostgreSQL suite is reported as skipped.
   sign-in after an e-mail code only.
 - Tests with real authenticator apps and real devices. The TOTP code is checked against the RFC
   test vectors and a software generator only.
+
+## Security
+
+To report a vulnerability, use GitHub private vulnerability reporting: open the "Security" tab of
+the repository and choose "Report a vulnerability". Do not open a public issue for a
+vulnerability. See [SECURITY.md](SECURITY.md).
 
 ## Licence
 
