@@ -59,6 +59,7 @@
     "format:check": "prettier --check .",
     "test": "vitest run --maxWorkers=2",
     "test:postgres": "vitest run --maxWorkers=2 test/postgres",
+    "prepublishOnly": "pnpm build",
     "check": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test && pnpm build"
   },
   "peerDependencies": {
