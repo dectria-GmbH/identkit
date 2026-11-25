@@ -1,0 +1,64 @@
+name: release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: check and publish to npm
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: identkit
+          POSTGRES_PASSWORD: identkit
+          POSTGRES_DB: identkit_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U identkit"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://identkit:identkit@localhost:5432/identkit_test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Check that the tag equals the package version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "Tag $TAG does not match package.json version $VERSION" >&2
+            exit 1
+          fi
+      # npm trusted publishing needs npm CLI 11.5.1 or later (npm docs, "Trusted publishing").
+      - name: Make sure npm is 11.5.1 or later
+        run: |
+          CURRENT="$(npm --version)"
+          if [ "$(printf '%s\n' 11.5.1 "$CURRENT" | sort -V | head -n 1)" != "11.5.1" ]; then
+            npm install -g npm@11
+          fi
+          npm --version
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      # No NPM_TOKEN: npm exchanges the GitHub OIDC token for a short-lived publish credential.
+      # Provenance comes from publishConfig and the trusted publisher.
+      - run: npm publish

@@ -1,9 +1,27 @@
 {
   "name": "identkit",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
   "description": "Identity toolkit for TypeScript: accounts, passkeys, OIDC, token issuance and delegated agent identities.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dectria-GmbH/identkit.git"
+  },
+  "homepage": "https://github.com/dectria-GmbH/identkit#readme",
+  "bugs": {
+    "url": "https://github.com/dectria-GmbH/identkit/issues"
+  },
+  "keywords": [
+    "identity",
+    "authentication",
+    "passkeys",
+    "webauthn",
+    "totp",
+    "oidc",
+    "sessions",
+    "typescript",
+    "postgresql"
+  ],
   "type": "module",
   "engines": {
     "node": ">=24"
@@ -28,6 +46,10 @@
       "types": "./dist/testing/index.d.ts",
       "default": "./dist/testing/index.js"
     }
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
