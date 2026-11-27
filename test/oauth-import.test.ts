@@ -458,7 +458,7 @@ describe("oauth importGrant", () => {
   });
 });
 
-describe("oauth import after an end (review a2 B r1 M1)", () => {
+describe("oauth import after an end", () => {
   /**
    * Ends the imported grant one way, then runs the same import again: it answers `revoked`, and
    * the earlier legacy refresh token stays dead.
@@ -772,7 +772,7 @@ describe("oauth legacy access tokens", () => {
     expect(await refusal(g.accessToken)).toMatchObject({ reason: "unknown" });
   });
 
-  it("refuses an audience other than the grant's resource, also a configured one (review a2 B r1 L1)", async () => {
+  it("refuses an audience other than the grant's resource, also a configured one", async () => {
     const t = importSetup();
     const g = await importedGrant(t);
     // ISSUER is the second configured resource; the grant was imported for RESOURCE.
@@ -795,7 +795,7 @@ describe("oauth legacy access tokens", () => {
     ).toBe("valid");
   });
 
-  it("never shows a verifier a token with the API token prefix (review a2 B r1 L2)", async () => {
+  it("never shows a verifier a token with the API token prefix", async () => {
     const t = importSetup({}, undefined, { prefix: "pat_", allowedScopes: ["read"] });
     const g = await importedGrant(t);
     const apiToken = `pat_${"A".repeat(43)}`;
@@ -819,7 +819,7 @@ describe("oauth legacy access tokens", () => {
     expect(t.legacy.verifyAccessToken).toHaveBeenCalledWith("legacy-unknown");
   });
 
-  it("narrows the scopes to those the legacy token names, never wider (review a2 B r1 L3)", async () => {
+  it("narrows the scopes to those the legacy token names, never wider", async () => {
     const t = importSetup();
     const g = await importedGrant(t, { scopes: ["mcp:read", "mcp:events"] });
     const expiresAt = new Date(t.clock.now().getTime() + 1000);
@@ -973,7 +973,7 @@ describe("oauth legacy refresh tokens", () => {
     expect(await t.ik.oauth.listGrants(g.accountId)).toHaveLength(1);
   });
 
-  it("ends the grant for a token one generation below whose digest is not the previous one (review a2 B r1 N4)", async () => {
+  it("ends the grant for a token one generation below whose digest is not the previous one", async () => {
     const t = importSetup();
     const g = await importedGrant(t);
     // A legacy rotation: the grant is at generation 4 now, its previous digest the legacy token's.

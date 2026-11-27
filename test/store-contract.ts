@@ -1114,7 +1114,7 @@ export function runStoreContract(
       );
       expect(consumed.filter((c) => c !== null)).toEqual([code]);
       expect(await oauth.consumeCode(code.digest)).toBeNull();
-      // The flag round-trips both ways (review a2 r2 N-a: every case used true).
+      // The flag round-trips both ways, not only true.
       const implicit = oauthCode(client.id, accountId, { redirectUriExplicit: false });
       await oauth.insertCode(implicit);
       expect(await oauth.consumeCode(implicit.digest)).toEqual(implicit);

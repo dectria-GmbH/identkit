@@ -74,7 +74,7 @@ describe("oauth purge", () => {
   });
 
   it("keeps a client in the middle of a code exchange: the approval counts as use", async () => {
-    // Review a2 r1 L4: between consumeCode and insertGrant the client holds neither a code nor
+    // Between consumeCode and insertGrant the client holds neither a code nor
     // a grant, so a purge in that gap deleted an old unused client and the exchange failed.
     const inner = createMemoryStore();
     const innerOAuth = inner.oauth;

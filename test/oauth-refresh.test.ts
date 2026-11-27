@@ -168,7 +168,7 @@ describe("oauth refresh", () => {
     clock.advanceSeconds(30 * 86_400);
     const oauthStore = store.oauth;
     if (!oauthStore) throw new Error("no oauth store");
-    // A concurrent call ends the grant between the read and the delete (review a2 r2 N-d).
+    // A concurrent call ends the grant between the read and the delete.
     oauthStore.deleteGrant = () => Promise.resolve(null);
     expect((await client.refresh(refreshToken)).body?.["error"]).toBe("invalid_grant");
     expect(audit.ofType("oauth.token_failed").map((e) => e.reason)).toEqual(["refresh_unknown"]);

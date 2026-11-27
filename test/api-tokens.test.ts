@@ -437,7 +437,7 @@ describe("api tokens", () => {
       { ...valid, name: "zero\u200Bwidth" },
       { ...valid, name: "bom\uFEFF" },
       { ...valid, name: "lone\uD800" },
-      // Review r2 N2: names that show nothing.
+      // Names that show nothing.
       { ...valid, name: " " },
       { ...valid, name: "\u00A0" },
       { ...valid, name: "\u3164" },
@@ -914,7 +914,7 @@ describe("api tokens: one token stored twice", () => {
     const b = await t.account();
     const ambiguous = { status: "refused", reason: "ambiguous" };
 
-    // Review r2 L2: the owner revoked the legacy copy of a leaked token, the operator turned
+    // The owner revoked the legacy copy of a leaked token, the operator turned
     // legacy digests off, and the live keyed copy verified again.
     const leaked = randomShaped();
     const keyed = await t.ik.apiTokens.import({ ...importInput(t, a), token: leaked });
@@ -1061,7 +1061,7 @@ describe("api tokens: accounts.disable without a working token store", () => {
     });
     const accountId = (await t.signIn("hook@example.org")).account.id;
     const error = await rejection(t.ik.accounts.disable(accountId));
-    // Review r2 L1: the token error went up and the hook failure was dropped.
+    // The token error went up and the hook failure was dropped.
     expect(error).toBeInstanceOf(AllSessionsRevokedHookError);
     const hookError = error as AllSessionsRevokedHookError;
     expect(hookError.cause).toEqual(new Error("hook down"));
@@ -1092,9 +1092,9 @@ describe("api tokens: accounts.disable without a working token store", () => {
       if (created.status !== "created") throw new Error(created.status);
       failSink(t.audit, type);
       const error = await rejection(t.ik.accounts.disable(accountId));
-      // Review r2 L1: the token error went up and the refused event went unnoticed.
+      // The token error went up and the refused event went unnoticed.
       expect(error, type).toEqual(new Error("sink down"));
-      // Review r3 N1: identkit does not change the sink's error object.
+      // identkit does not change the sink's error object.
       expect(Object.getOwnPropertyNames(error), type).not.toContain("tokenRevocationError");
       expect(hookRuns, type).toBe(1);
       // The retry, while the store still fails, reports the token store error.
@@ -1134,7 +1134,7 @@ describe("api tokens: accounts.disable without a working token store", () => {
     if (created.status !== "created") throw new Error(created.status);
     const error = await rejection(t.ik.accounts.disable(accountId));
     expect(error).toBeInstanceOf(AllSessionsRevokedHookError);
-    // Review r3 L1: the message said "call sessions.revokeAll again", which leaves the token
+    // The message said "call sessions.revokeAll again", which leaves the token
     // live, and the token store error serialized to {}.
     const { message } = error as Error;
     expect(message).toContain("call accounts.disable again");

@@ -485,7 +485,7 @@ describe("TOTP enrolment", () => {
       } else {
         expect(reasons, label).toContain("cleanup_failed_account_disabled");
       }
-      // Review r3: the cleanup disabled the account with a bare status write, so enabling it
+      // The cleanup disabled the account with a bare status write, so enabling it
       // again in the store brought its API tokens back.
       await inner.accounts.setStatus(user.account.id, "active");
       expect(await t.ik.apiTokens.verify(apiToken.token), label).toEqual({
@@ -502,7 +502,7 @@ describe("TOTP enrolment", () => {
         label,
       ).toEqual([`${oauthClient.clientId} account_disabled`]);
       if (!tokenStoreFails) {
-        // Review a2 B r1 L4: also after a grant store error, the retry finds the tokens revoked
+        // Also after a grant store error, the retry finds the tokens revoked
         // already; their event comes from the first attempt.
         expect(
           t.audit.ofType("api_token.revoked").map((e) => `${e.tokenId} ${e.reason}`),

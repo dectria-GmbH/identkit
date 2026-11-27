@@ -147,7 +147,7 @@ describe("postgresql store without a database", () => {
       if (query.sql.includes('delete from "identkit_oauth_codes"')) return sqlError("57P01");
       return { rows: [grantRow] };
     });
-    // Review a2 r1 L5: the grant delete committed on its own, so a failed code delete lost the
+    // The grant delete committed on its own, so a failed code delete lost the
     // ended grants for good.
     await expect(oauth.deleteGrantsForAccount("a1", new Date())).rejects.toThrow("sqlstate 57P01");
     expect(steps.map((s) => (s.startsWith("delete from") ? s.split(" ")[2] : s))).toEqual([
@@ -186,7 +186,7 @@ describe("postgresql store without a database", () => {
       createdAt: at,
       expiresAt: grant.expiresAt,
     };
-    // Review a2 r2 L1: the client row was locked only by the foreign key check of the insert,
+    // The client row was locked only by the foreign key check of the insert,
     // after a replacing insert held its grant row lock, so deleteClient could deadlock with it.
     const calls = [
       (s: ReturnType<typeof scriptedStore>) =>
@@ -233,7 +233,7 @@ describe("postgresql store without a database", () => {
       windowBefore: at,
     });
     expect(result.clients).toEqual([{ id: "c1", reason: "unused" }]);
-    // Review a2 r1 L4: one DELETE with NOT EXISTS re-checks only the client row after it waited
+    // One DELETE with NOT EXISTS re-checks only the client row after it waited
     // on a grant insert's key share lock, and cascaded the grant that had just committed.
     const lock = steps.findIndex(
       (q) => q.startsWith("select") && q.includes('"identkit_oauth_clients"'),
@@ -248,7 +248,7 @@ describe("postgresql store without a database", () => {
           : q.split(" ")[0],
       );
     expect(clientSteps).toEqual(["BEGIN", "select for update", "delete", "COMMIT"]);
-    // Review a2 B r1 L5: only clients without a live grant or code, in id order, so a busy
+    // Only clients without a live grant or code, in id order, so a busy
     // client is never locked and two purges lock in the same order.
     const candidates = steps[lock] ?? "";
     expect(candidates).toMatch(/ order by "c"\."id" for update$/);

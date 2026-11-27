@@ -501,7 +501,7 @@ describe("passkey registration races", () => {
         expect(error, label).toEqual(new Error("connection reset"));
         expect(reasons, label).toContain("cleanup_failed_account_disabled");
       }
-      // Review r3: the cleanup disabled the account with a bare status write, so enabling it
+      // The cleanup disabled the account with a bare status write, so enabling it
       // again in the store brought its API tokens back.
       await inner.accounts.setStatus(accountId, "active");
       expect(await t.ik.apiTokens.verify(apiToken.token), label).toEqual({
@@ -518,7 +518,7 @@ describe("passkey registration races", () => {
         label,
       ).toEqual([`${oauthClient.clientId} account_disabled`]);
       if (!tokenStoreFails) {
-        // Review a2 B r1 L4: also after a grant store error, the retry finds the tokens revoked
+        // Also after a grant store error, the retry finds the tokens revoked
         // already; their event comes from the first attempt.
         expect(
           t.audit.ofType("api_token.revoked").map((e) => `${e.tokenId} ${e.reason}`),
@@ -986,7 +986,7 @@ describe("oauth races", () => {
     expect(audit.ofType("oauth.grant_ended").map((e) => e.reason)).toEqual(["account_disabled"]);
   });
 
-  it("a client deleted mid-exchange: no grant survives, its tokens never work (review a2 r2 N-c)", async () => {
+  it("a client deleted mid-exchange: no grant survives, its tokens never work", async () => {
     const { store, hooks } = hookedOAuthStore();
     const { ik, account, audit } = oauthSetup({ store });
     const client = await createOAuthTestClient(ik.oauth);
