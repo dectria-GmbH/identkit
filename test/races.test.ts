@@ -3,7 +3,7 @@
  * A wrapped store runs the concurrent change at the exact point where it would hurt.
  */
 import { describe, expect, it } from "vitest";
-import { createMemoryStore, hashPayload } from "../src/index.js";
+import { createMemoryStore, hashPayload, PasskeyCleanupError } from "../src/index.js";
 import type { IdentkitStore, SessionRecord } from "../src/storage/types.js";
 import { emailFirstPolicy, setup, testConfig } from "./helpers.js";
 
@@ -390,6 +390,106 @@ describe("passkey registration races", () => {
     expect((await t.ik.passkeys.finishSignIn(t.authenticator.assert(options))).status).toBe(
       "failed",
     );
+  });
+
+  it("a cleanup whose deletes and disables all fail throws PasskeyCleanupError", async () => {
+    for (const scenario of ["grant lost", "grant lost, revokeAll fails", "activate throws"]) {
+      const inner = createMemoryStore();
+      const fail = { delete: 0, setStatus: 0, revokeAll: 0 };
+      let afterActivate: (() => Promise<void>) | null = null;
+      const store: IdentkitStore = {
+        ...inner,
+        accounts: {
+          ...inner.accounts,
+          setStatus: async (...args) => {
+            if (fail.setStatus > 0) {
+              fail.setStatus -= 1;
+              throw new Error("connection reset");
+            }
+            return inner.accounts.setStatus(...args);
+          },
+        },
+        credentials: {
+          ...inner.credentials,
+          activate: async (...args) => {
+            const result = await inner.credentials.activate(...args);
+            const hook = afterActivate;
+            afterActivate = null;
+            if (hook) await hook();
+            return result;
+          },
+          delete: async (...args) => {
+            if (fail.delete > 0) {
+              fail.delete -= 1;
+              throw new Error("connection reset");
+            }
+            return inner.credentials.delete(...args);
+          },
+        },
+        sessions: {
+          ...inner.sessions,
+          revokeAllForAccount: async (...args) => {
+            if (fail.revokeAll > 0) {
+              fail.revokeAll -= 1;
+              throw new Error("store unavailable");
+            }
+            return inner.sessions.revokeAllForAccount(...args);
+          },
+        },
+      };
+      const t = setup({ store });
+      const created = await t.ik.accounts.create({ email: "staff@example.org" });
+      if (created.status !== "created") throw new Error("not created");
+      const accountId = created.account.id;
+      const { token } = await t.ik.passkeys.issueEnrollmentToken(accountId);
+      const start = await t.ik.passkeys.startRegistration({ enrollmentToken: token });
+      if (start.status !== "ok") throw new Error("denied");
+      afterActivate = async () => {
+        await t.ik.passkeys.revokeEnrollmentTokens(accountId);
+        fail.delete = 2;
+        fail.setStatus = 2;
+        fail.revokeAll = scenario === "grant lost, revokeAll fails" ? 1 : 0;
+        // A committed activation whose reply is lost.
+        if (scenario === "activate throws") throw new Error("connection lost");
+      };
+      const error: unknown = await t.ik.passkeys
+        .finishRegistration({ enrollmentToken: token }, t.authenticator.register(start.options))
+        .then(
+          () => null,
+          (e: unknown) => e,
+        );
+      const label = scenario;
+      // The store error, a failed session revocation and an activation error do not hide the
+      // surviving passkey.
+      expect(error, label).toBeInstanceOf(PasskeyCleanupError);
+      if (!(error instanceof PasskeyCleanupError)) return;
+      const [credential] = await inner.credentials.listByAccount(accountId);
+      expect(error, label).toMatchObject({
+        code: "passkey_cleanup_failed",
+        accountId,
+        credentialId: credential?.id,
+      });
+      expect((error.cause as Error).message, label).toBe("connection reset");
+      // The residual: an active passkey on an active account, and only a best-effort event.
+      expect((await t.ik.accounts.get(accountId))?.status, label).toBe("active");
+      expect(
+        t.audit.ofType("passkey.registration_failed").map((e) => e.reason),
+        label,
+      ).toContain("cleanup_failed_disable_failed");
+      expect(t.audit.ofType("account.disabled"), label).toHaveLength(0);
+      const signIn = await t.ik.passkeys.startSignIn();
+      expect(
+        (await t.ik.passkeys.finishSignIn(t.authenticator.assert(signIn.options))).status,
+        label,
+      ).toBe("signed_in");
+      // The operator step the error names removes it.
+      expect(await t.ik.passkeys.revoke(accountId, error.credentialId), label).toBe(true);
+      const again = await t.ik.passkeys.startSignIn();
+      expect(
+        (await t.ik.passkeys.finishSignIn(t.authenticator.assert(again.options))).status,
+        label,
+      ).toBe("failed");
+    }
   });
 
   it("a session revocation that fails in the cleanup is recorded", async () => {

@@ -316,6 +316,17 @@ Passkeys:
   deletes it. After the activation it checks once more; if the grant no longer holds, it deletes
   the passkey and ends every session of the account; an error on the way does the same. A crash
   in between leaves an unusable pending row.
+- If the store fails on both deletes of that passkey, identkit tries twice to disable the
+  account, ends all its sessions and throws: the passkey may still be active without a valid
+  grant. The audit event `passkey.registration_failed` says `cleanup_failed_account_disabled`
+  (with an `account.disabled` event) or, if the disable failed too,
+  `cleanup_failed_disable_failed`. In the second case the account stays active and the passkey
+  can sign in; `finishRegistration` then throws `PasskeyCleanupError`, which names the account
+  and the credential, so your code learns it also when the audit sink was down. In both cases
+  an operator first removes the passkey with `passkeys.revoke(accountId, credentialId)` (the
+  credential id is in the error, or in `passkeys.list(accountId)`) and only then enables the
+  account again in the store; identkit has no call to enable an account. Enabling it first
+  brings the passkey back into use.
 - A registration that is already running is cancelled only by revocation, not by a token
   rotation: `rotate` and step-ups keep the session, so a registration started before them
   completes. Use `sessions.revokeById` or `revokeAll` to cut off a stolen session.

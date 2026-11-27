@@ -3,6 +3,7 @@ import type { Context } from "./context.js";
 import { enrolledSecondFactors, factorChangeStepUp, hasFreshStepUp } from "./second-factor.js";
 import { isTokenShaped, randomToken } from "./crypto.js";
 import { assertMethodAllowed } from "./email-otp.js";
+import { PasskeyCleanupError } from "./errors.js";
 import type { PasskeyCore } from "./passkey-core.js";
 import { toAccountView, type AccountView } from "./accounts.js";
 import type { IssuedSession, SessionInternals, Sessions } from "./sessions.js";
@@ -59,6 +60,10 @@ export interface PasskeyInfo {
 
 export interface Passkeys {
   startRegistration(grant: RegistrationGrant): Promise<StartRegistrationResult>;
+  /**
+   * Throws `PasskeyCleanupError` if the grant was lost after the activation and the store
+   * failed to delete the new passkey and to disable the account: the passkey may still sign in.
+   */
   finishRegistration(
     grant: RegistrationGrant,
     response: RegistrationResponseJSON,
@@ -327,6 +332,8 @@ export function createPasskeys(
         store.credentials.delete(verified.credentialId, account.id, verified.publicKey);
       const disable = async () => store.accounts.setStatus(account.id, "disabled");
       const undo = async () => {
+        let failed = false;
+        let failure: unknown;
         try {
           // One retry: a passkey that survives here could sign in again later.
           await remove().catch(remove);
@@ -353,20 +360,30 @@ export function createPasskeys(
               .emit({ type: "account.disabled", accountId: account.id, reason: "passkey_cleanup" })
               .catch(() => undefined);
           }
-          throw error;
-        } finally {
-          await sessions.revokeAll(account.id).catch(async (error: unknown) => {
-            // Other sessions may survive: record it, then fail.
-            await ctx
-              .emit({
-                type: "passkey.registration_failed",
-                accountId: account.id,
-                reason: "cleanup_failed",
-              })
-              .catch(() => undefined);
-            throw error;
-          });
+          failed = true;
+          // The audit event above is best effort. If the account is still active, the caller
+          // must learn that a passkey without a grant may sign in.
+          failure = disabled
+            ? error
+            : new PasskeyCleanupError(account.id, verified.credentialId, { cause: error });
         }
+        try {
+          await sessions.revokeAll(account.id);
+        } catch (error) {
+          // Other sessions may survive: record it, then fail.
+          await ctx
+            .emit({
+              type: "passkey.registration_failed",
+              accountId: account.id,
+              reason: "cleanup_failed",
+            })
+            .catch(() => undefined);
+          if (!(failure instanceof PasskeyCleanupError)) {
+            failed = true;
+            failure = error;
+          }
+        }
+        if (failed) throw failure;
       };
       let activated = false;
       let outcome: true | RegistrationDenied;
@@ -381,8 +398,11 @@ export function createPasskeys(
           ? await grantStillHolds(grant, resolved, account.id, verified.credentialId)
           : { status: "denied", reason: "no_session" };
       } catch (error) {
-        // Keep the original error; `undo` records its own failure.
-        await undo().catch(() => undefined);
+        // Keep the original error; `undo` records its own failure. A passkey that may still
+        // be active on an active account outweighs it: that error goes up instead.
+        await undo().catch((undoError: unknown) => {
+          if (undoError instanceof PasskeyCleanupError) throw undoError;
+        });
         throw error;
       }
       if (outcome !== true) {
