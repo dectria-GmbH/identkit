@@ -93,7 +93,9 @@ export interface Passkeys {
   /**
    * Administrative removal after loss or theft. Revokes all sessions and all enrollment
    * tokens of the account, on every call: also when the passkey is already gone, so a retry
-   * after an error completes the revocation. Returns false if no passkey was removed.
+   * after an error completes the revocation. Returns false if no passkey was removed. If it
+   * throws after the token revocation, it records `enrollment.revoked` first (best effort),
+   * because a retry finds no token to revoke.
    */
   revoke(accountId: string, credentialId: string): Promise<boolean>;
   /**
@@ -556,24 +558,33 @@ export function createPasskeys(
     async revoke(accountId, credentialId) {
       // Tokens first: a registration that runs with one of them fails its check after the insert.
       const revokedTokens = await store.enrollment.revokeAllForAccount(accountId, clock.now());
-      const removed = await store.credentials.delete(credentialId, accountId);
+      const tokensEvent =
+        revokedTokens > 0
+          ? ({ type: "enrollment.revoked", accountId, reason: "passkey_revoked" } as const)
+          : null;
       const removedEvent = {
         type: "passkey.removed",
         accountId,
         credentialId,
         reason: "administrative",
       } as const;
-      // Always, also when the passkey is gone: a retry after a failed revocation must still
-      // end the sessions. Revoke before the audit events, so a failing sink skips nothing.
-      await revokeRecordingRemoval(
-        () => sessions.revokeAll(accountId),
-        removed ? removedEvent : null,
-      );
-      // The removal first: a retry finds no passkey and cannot record it any more.
-      if (removed) await ctx.emit(removedEvent);
-      if (revokedTokens > 0) {
-        await ctx.emit({ type: "enrollment.revoked", accountId, reason: "passkey_revoked" });
+      let removed: boolean;
+      try {
+        removed = await store.credentials.delete(credentialId, accountId);
+        // Always, also when the passkey is gone: a retry after a failed revocation must still
+        // end the sessions. Revoke before the audit events, so a failing sink skips nothing.
+        await revokeRecordingRemoval(
+          () => sessions.revokeAll(accountId),
+          removed ? removedEvent : null,
+        );
+        // The removal first: a retry finds no passkey and cannot record it any more.
+        if (removed) await ctx.emit(removedEvent);
+      } catch (error) {
+        // A retry finds no open token and cannot record the token revocation any more.
+        if (tokensEvent) await ctx.emit(tokensEvent).catch(() => undefined);
+        throw error;
       }
+      if (tokensEvent) await ctx.emit(tokensEvent);
       return removed;
     },
 
