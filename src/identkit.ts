@@ -15,6 +15,7 @@ import {
 import { createPasskeyCore } from "./passkey-core.js";
 import { createPasskeys, type Passkeys } from "./passkeys.js";
 import { NotConfiguredError } from "./errors.js";
+import { createOidc, unconfiguredOidc, type Oidc, type OidcOptions } from "./oidc.js";
 import type { SecretSealer } from "./sealer.js";
 import { createSessions, type AllSessionsRevokedHook, type Sessions } from "./sessions.js";
 import { createStepUp, type StepUp } from "./step-up.js";
@@ -54,6 +55,12 @@ export interface IdentkitOptions {
    * and its audit events; if it throws, the calling operation fails, and a retry calls it again.
    */
   onAllSessionsRevoked?: AllSessionsRevokedHook;
+  /**
+   * Sign-in through external OpenID Connect providers. Needs the config section `oidc`, a
+   * `sealer` and a store with `oidcLinks`; `createIdentkit` throws `NotConfiguredError` if one
+   * is missing. Without this option, every `identkit.oidc` call throws `NotConfiguredError`.
+   */
+  oidc?: OidcOptions;
 }
 
 export interface Identkit {
@@ -65,6 +72,7 @@ export interface Identkit {
   totp: Totp;
   accounts: Accounts;
   identityVerification: IdentityVerification;
+  oidc: Oidc;
 }
 
 export function createIdentkit(options: IdentkitOptions): Identkit {
@@ -126,5 +134,6 @@ export function createIdentkit(options: IdentkitOptions): Identkit {
     totp: createTotp(ctx, totpEngine, sessions, internals),
     accounts: createAccounts(ctx, (accountId) => sessions.revokeAll(accountId)),
     identityVerification: createIdentityVerification(ctx),
+    oidc: options.oidc ? createOidc(ctx, internals, sessions, options.oidc) : unconfiguredOidc(),
   };
 }

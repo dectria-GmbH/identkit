@@ -124,7 +124,7 @@ function bytesFrom(value: unknown): Uint8Array {
 }
 
 const LEVELS = ["low", "substantial", "high"] as const;
-const AUTH_METHODS = ["email_otp", "passkey", "totp"] as const;
+const AUTH_METHODS = ["email_otp", "passkey", "totp", "oidc"] as const;
 const OIDC_PROVIDERS = ["microsoft", "google", "oidc"] as const;
 const OIDC_LINK_SOURCES = ["sign_in", "import"] as const;
 const STEP_UP_METHODS = ["email_otp", "passkey", "totp"] as const;

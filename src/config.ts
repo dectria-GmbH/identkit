@@ -133,6 +133,25 @@ export const identkitConfigSchema = z
         lockout: lockoutSchema,
       })
       .strict(),
+    /**
+     * Sign-in through an external OpenID Connect provider. Optional: needed only with the
+     * `oidc` option of `createIdentkit`. Every value inside is required.
+     */
+    oidc: z
+      .object({
+        /** Lifetime of the sealed transaction between `begin` and `finish`. */
+        transactionTtlSeconds: seconds(60, 1800),
+        /** Tolerance for `exp`, `nbf` and `iat` of an ID token, for clock drift. */
+        clockSkewSeconds: seconds(0, 300),
+        /** How long fetched provider keys (JWKS) are used before they are fetched again. */
+        jwksCacheSeconds: seconds(60, DAY),
+        /** Least time between two key fetches for an unknown key id. */
+        jwksRefetchIntervalSeconds: seconds(10, 3600),
+        /** Timeout of each request to the token endpoint and the key endpoint. */
+        httpTimeoutSeconds: seconds(1, 60),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 
@@ -142,7 +161,8 @@ export function parseConfig(input: unknown): IdentkitConfig {
   return identkitConfigSchema.parse(input);
 }
 
-export type SignInMethod = "email_otp" | "passkey";
+/** `oidc`: an external OpenID Connect provider, through `identkit.oidc`. */
+export type SignInMethod = "email_otp" | "passkey" | "oidc";
 /** A method that can complete a sign-in after an e-mail code. */
 export type SecondFactorMethod = "passkey" | "totp";
 /** Every method a session can record. TOTP never starts a session on its own. */
@@ -162,7 +182,7 @@ export type ApprovalEvidenceLevel = "signature" | "code-confirmation";
 export const signInPolicySchema = z
   .object({
     /** Methods that may start a session. */
-    signInMethods: z.array(z.enum(["email_otp", "passkey"])).min(1),
+    signInMethods: z.array(z.enum(["email_otp", "passkey", "oidc"])).min(1),
     /**
      * After an e-mail code sign-in: `none` gives a full session, `if_enrolled` asks for a
      * second factor when the account has one (passkey or TOTP). A privileged account always

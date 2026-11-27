@@ -107,6 +107,30 @@ export type {
   PasskeyCreationOptions,
   PasskeyRequestOptions,
 } from "./webauthn.js";
+export type {
+  Oidc,
+  OidcOptions,
+  OidcBindRequest,
+  OidcBeginResult,
+  OidcSignInResult,
+  OidcFailure,
+  OidcRefusal,
+  OidcLinkView,
+  OidcImportInput,
+  OidcImportResult,
+} from "./oidc.js";
+export {
+  microsoftProvider,
+  googleProvider,
+  oidcProvider,
+  MICROSOFT_CONSUMER_TENANT_ID,
+  type OidcProvider,
+  type MicrosoftProviderOptions,
+  type GoogleProviderOptions,
+  type GenericOidcProviderOptions,
+} from "./oidc-providers.js";
+export { createJwksCache, type JwksCache, type OidcFetch } from "./oidc-jwks.js";
+export type { IdTokenAlgorithm } from "./oidc-jwt.js";
 export { createMemoryStore } from "./storage/memory.js";
 export { applyThrottle, lockDuration, type ThrottleState } from "./storage/throttle-logic.js";
 export type * from "./storage/types.js";

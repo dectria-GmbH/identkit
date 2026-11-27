@@ -1,6 +1,7 @@
 import { expect, it } from "vitest";
 import type { IdentkitStore } from "../src/storage/types.js";
 import { mfaPolicy, otherCode, setup, STEP, testConfig } from "./helpers.js";
+import { googleClaims, guid, msClaims, oidcSetup, TENANT } from "./oidc-helpers.js";
 
 /**
  * End-to-end flows against a database store: the services on top of the store, with parallel
@@ -125,5 +126,51 @@ export function runStoreFlows(name: string, store: () => IdentkitStore) {
     expect(await t.ik.sessions.validate(token)).not.toBeNull();
     t.clock.advanceSeconds(testConfig.sessions.idleTimeoutSeconds);
     expect(await t.ik.sessions.validate(token)).toBeNull();
+  });
+
+  it(`flows: OIDC binding, import, one link per account and concurrent first sign-ins against ${name}`, async () => {
+    const t = await oidcSetup({ store: store() });
+    const tag = guid().slice(-8);
+    const claims = msClaims(`flows-oidc-${tag}@contoso.example`);
+    const first = await t.signInWith("microsoft", claims);
+    if (first.status !== "signed_in") throw new Error(first.status);
+    expect(first.session.authMethods).toEqual(["oidc"]);
+    expect((await t.ik.sessions.validate(first.token))?.authMethods).toEqual(["oidc"]);
+    const again = await t.signInWith("microsoft", claims);
+    if (again.status !== "signed_in") throw new Error(again.status);
+    expect(again.account.id).toBe(first.account.id);
+    expect(await t.signInWith("google", googleClaims(`flows-oidc-${tag}@contoso.example`))).toEqual(
+      { status: "refused", reason: "account_has_link" },
+    );
+
+    const legacy = await t.ik.accounts.create({ email: `flows-legacy-${tag}@example.org` });
+    if (legacy.status !== "created") throw new Error("no account");
+    const objectId = guid();
+    const imports = await Promise.all(
+      [0, 1, 2].map(() =>
+        t.ik.oidc.importLink({
+          accountId: legacy.account.id,
+          provider: "microsoft",
+          tenantId: TENANT,
+          objectId,
+        }),
+      ),
+    );
+    expect(imports.filter((r) => r.status === "imported")).toHaveLength(1);
+    expect(imports.filter((r) => r.status === "already_linked")).toHaveLength(2);
+    const migrated = await t.signInWith(
+      "microsoft",
+      msClaims("anything@contoso.example", { oid: objectId, xms_edov: false }),
+    );
+    if (migrated.status !== "signed_in") throw new Error(migrated.status);
+    expect(migrated.account.id).toBe(legacy.account.id);
+
+    const raced = googleClaims(`flows-race-${tag}@example.org`);
+    const results = await Promise.all([0, 1, 2].map(() => t.signInWith("google", raced)));
+    const accounts = new Set(
+      results.map((r) => (r.status === "signed_in" ? r.account.id : r.status)),
+    );
+    expect(accounts.size).toBe(1);
+    expect(await t.ik.oidc.listLinks(String([...accounts][0]))).toHaveLength(1);
   });
 }
