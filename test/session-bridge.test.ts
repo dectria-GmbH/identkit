@@ -4,6 +4,7 @@ import {
   parseConfig,
   type AllSessionsRevokedEvent,
 } from "../src/index.js";
+import { randomToken } from "../src/crypto.js";
 import { setup, testConfig } from "./helpers.js";
 
 const TWELVE_HOURS = 43_200;
@@ -49,6 +50,40 @@ describe("session bridge", () => {
         sessions: { ...noIdleConfig.sessions, idleTimeoutSeconds: TWELVE_HOURS + 1 },
       }),
     ).toThrow(/absoluteTimeoutSeconds/);
+  });
+
+  it("rule: unknown methods fail closed - a session of a later release reads with fewer methods and no extra rights", async () => {
+    const t = setup();
+    const { account } = await t.signIn("person@example.org");
+    const token = randomToken();
+    const now = t.clock.now();
+    await t.store.sessions.insert({
+      id: "later-session",
+      accountId: account.id,
+      tokenDigest: await t.hasher.digest("session-token", token),
+      state: "complete",
+      authMethods: ["later_method" as never],
+      createdAt: now,
+      lastSeenAt: now,
+      absoluteExpiresAt: new Date(now.getTime() + 3_600_000),
+      stepUp: null,
+      revokedAt: null,
+      revokeReason: null,
+    });
+    const view = await t.ik.sessions.validate(token);
+    expect(view?.authMethods).toEqual([]);
+    // An empty method list grants nothing: a step-up is still required.
+    expect(await t.ik.sessions.requireStepUp(token)).toEqual({
+      ok: false,
+      reason: "step_up_required",
+    });
+    expect(await t.ik.sessions.requireStepUp(token, { methods: ["email_otp"] })).toEqual({
+      ok: false,
+      reason: "step_up_required",
+    });
+    const rotated = await t.ik.sessions.rotate(token);
+    expect(rotated?.session.authMethods).toEqual([]);
+    expect(rotated?.session.stepUp).toBeNull();
   });
 
   it("rule: revoke-all hook - every revokeAll reports to the hook, also from other services", async () => {

@@ -548,6 +548,25 @@ export function runStoreContract(
       expect(found?.stepUp?.method).toBe("totp");
     });
 
+    it("sessions: a method written by a later release is dropped on read, not an error", async () => {
+      const store = await factory();
+      const a = account();
+      await store.accounts.insert(a);
+      // As a later release would write it: a method this release does not know.
+      const later = session(a.id, {
+        authMethods: ["oidc", "later_method" as never],
+        stepUp: null,
+      });
+      const only = session(a.id, { authMethods: ["later_method" as never], stepUp: null });
+      await store.sessions.insert(later);
+      await store.sessions.insert(only);
+      expect((await store.sessions.findById(later.id))?.authMethods).toEqual(["oidc"]);
+      expect((await store.sessions.findByTokenDigest(later.tokenDigest))?.authMethods).toEqual([
+        "oidc",
+      ]);
+      expect((await store.sessions.findById(only.id))?.authMethods).toEqual([]);
+    });
+
     it("challenges: a pending code approval is consumed once, only for its purpose", async () => {
       const store = await factory();
       const digest = uid("chal");

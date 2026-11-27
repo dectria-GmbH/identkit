@@ -1,4 +1,5 @@
 import { addSeconds } from "../clock.js";
+import { knownAuthMethods } from "../storage/auth-methods.js";
 import { applyThrottle, type ThrottleState } from "../storage/throttle-logic.js";
 import type {
   AccountRecord,
@@ -124,7 +125,6 @@ function bytesFrom(value: unknown): Uint8Array {
 }
 
 const LEVELS = ["low", "substantial", "high"] as const;
-const AUTH_METHODS = ["email_otp", "passkey", "totp", "oidc"] as const;
 const OIDC_PROVIDERS = ["microsoft", "google", "oidc"] as const;
 const OIDC_LINK_SOURCES = ["sign_in", "import"] as const;
 const STEP_UP_METHODS = ["email_otp", "passkey", "totp"] as const;
@@ -194,7 +194,8 @@ function toSession(r: Row): SessionRecord {
     accountId: text(r["account_id"]),
     tokenDigest: text(r["token_digest"]),
     state: oneOf(r["state"], ["pending_second_factor", "complete"]),
-    authMethods: stringList(r["auth_methods"]).map((m) => oneOf(m, AUTH_METHODS)),
+    // Unknown methods, written by a later release, are dropped: fewer methods, never more rights.
+    authMethods: knownAuthMethods(stringList(r["auth_methods"])),
     createdAt: date(r["created_at"]),
     lastSeenAt: date(r["last_seen_at"]),
     absoluteExpiresAt: date(r["absolute_expires_at"]),

@@ -538,6 +538,10 @@ identkit signs people in through an external OpenID Connect provider with the au
 flow, PKCE (S256), `state` and `nonce`. It is a client only: it issues no tokens, and it keeps no
 provider tokens (no refresh token, no access token for APIs).
 
+Before you turn on the option `oidc`, deploy this release to every instance and finish any
+gradual deployment. An earlier release cannot read a session whose method is `oidc` and fails
+it; a rollback after the first OIDC sign-in fails those sessions too (see Storage).
+
 ```ts
 import { createJwksCache, googleProvider, microsoftProvider } from "identkit";
 
@@ -732,7 +736,13 @@ Migration `0003_lockout_and_enrollment_revocation.sql` adds the consecutive fail
 `identkit_enrollment_tokens`. It does not change the earlier files.
 
 Migration `0004_oidc_links.sql` (D1: `0002_oidc_links.sql`) adds the table `identkit_oidc_links`.
-It changes nothing else, so the previous release runs on the new schema.
+It changes nothing else, so the previous release runs on the new schema. It cannot read the
+session rows that an OIDC sign-in writes, though: their method `oidc` is unknown to it, and it
+fails every request of such a session. So deploy this release to every instance, and finish a
+gradual deployment, before you turn on the option `oidc`. A rollback to an earlier release after
+the first OIDC sign-in fails those sessions until they end or you revoke them. From this release
+on, every store drops a session method it does not know when it reads a session (fewer methods,
+never more rights), so a later release can add a method without this problem.
 
 A custom store needs the member `oidcLinks` (`insert(link, { exclusive })`, `findByKey`,
 `listByAccount`, `delete`) to use OIDC sign-in. It is optional in the type, so a custom store

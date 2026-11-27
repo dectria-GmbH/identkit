@@ -1,5 +1,6 @@
 import { sql, type Kysely, type Selectable } from "kysely";
 import { addSeconds } from "../clock.js";
+import { knownAuthMethods } from "../storage/auth-methods.js";
 import { applyThrottle } from "../storage/throttle-logic.js";
 import type {
   AccountRecord,
@@ -43,7 +44,6 @@ function oneOfOrNull<const T extends string>(
 }
 
 const LEVELS = ["low", "substantial", "high"] as const;
-const AUTH_METHODS = ["email_otp", "passkey", "totp", "oidc"] as const;
 const OIDC_PROVIDERS = ["microsoft", "google", "oidc"] as const;
 const OIDC_LINK_SOURCES = ["sign_in", "import"] as const;
 const STEP_UP_METHODS = ["email_otp", "passkey", "totp"] as const;
@@ -79,7 +79,8 @@ const toSession = (r: Row<"identkit_sessions">): SessionRecord => ({
   accountId: r.account_id,
   tokenDigest: r.token_digest,
   state: oneOf(r.state, ["pending_second_factor", "complete"]),
-  authMethods: r.auth_methods.map((m) => oneOf(m, AUTH_METHODS)),
+  // Unknown methods, written by a later release, are dropped: fewer methods, never more rights.
+  authMethods: knownAuthMethods(r.auth_methods),
   createdAt: r.created_at,
   lastSeenAt: r.last_seen_at,
   absoluteExpiresAt: r.absolute_expires_at,

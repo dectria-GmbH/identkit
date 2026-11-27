@@ -62,6 +62,10 @@ export interface IdentkitOptions {
    * Sign-in through external OpenID Connect providers. Needs the config section `oidc`, a
    * `sealer` and a store with `oidcLinks`; `createIdentkit` throws `NotConfiguredError` if one
    * is missing. Without this option, every `identkit.oidc` call throws `NotConfiguredError`.
+   *
+   * Deploy this release to every instance before you set it, and finish a gradual deployment
+   * first: identkit 0.1.x cannot read the sessions of an OIDC sign-in and fails them. A rollback
+   * to 0.1.x after the first OIDC sign-in fails those sessions too.
    */
   oidc?: OidcOptions;
 }

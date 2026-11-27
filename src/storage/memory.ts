@@ -1,4 +1,5 @@
 import { addSeconds } from "../clock.js";
+import { knownAuthMethods } from "./auth-methods.js";
 import { applyThrottle, type ThrottleState } from "./throttle-logic.js";
 import type {
   AccountRecord,
@@ -14,6 +15,12 @@ import type {
 } from "./types.js";
 
 const copy = <T>(value: T): T => structuredClone(value);
+
+/** As the database stores read it: methods this release does not know are dropped. */
+const readSession = (session: SessionRecord): SessionRecord => ({
+  ...copy(session),
+  authMethods: knownAuthMethods(session.authMethods),
+});
 
 const sameBytes = (a: Uint8Array, b: Uint8Array) =>
   a.byteLength === b.byteLength && a.every((byte, i) => byte === b[i]);
@@ -167,13 +174,13 @@ export function createMemoryStore(): IdentkitStore {
       },
       findByTokenDigest(digest) {
         for (const session of sessions.values()) {
-          if (session.tokenDigest === digest) return Promise.resolve(copy(session));
+          if (session.tokenDigest === digest) return Promise.resolve(readSession(session));
         }
         return Promise.resolve(null);
       },
       findById(id) {
         const found = sessions.get(id);
-        return Promise.resolve(found ? copy(found) : null);
+        return Promise.resolve(found ? readSession(found) : null);
       },
       touch(id, at) {
         const found = sessions.get(id);
