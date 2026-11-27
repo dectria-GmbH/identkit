@@ -14,7 +14,13 @@ import {
   migrateIdentkit,
   type IdentkitDatabase,
 } from "../../src/postgres/index.js";
-import type { IdentkitStore, OidcLinkRecord } from "../../src/storage/types.js";
+import type {
+  IdentkitStore,
+  OAuthAccessTokenRecord,
+  OAuthClientRecord,
+  OAuthGrantRecord,
+  OidcLinkRecord,
+} from "../../src/storage/types.js";
 import { setup } from "../helpers.js";
 import { runStoreContract } from "../store-contract.js";
 import { runStoreFlows } from "../store-flows.js";
@@ -29,6 +35,147 @@ let store: IdentkitStore | undefined;
 function requireStore(): IdentkitStore {
   if (!store) throw new Error("store not initialised");
   return store;
+}
+
+const DAY_MS = 86_400_000;
+
+function oauthStore() {
+  const oauth = requireStore().oauth;
+  if (!oauth) throw new Error("store has no oauth");
+  return oauth;
+}
+
+const tag = () => randomBytes(6).toString("hex");
+
+/** A connection outside the store's pool, with explicit BEGIN and COMMIT. */
+async function connection(): Promise<pg.Client> {
+  if (!url) throw new Error("no DATABASE_URL");
+  const client = new pg.Client({ connectionString: url, options: `-c search_path=${schema}` });
+  await client.connect();
+  return client;
+}
+
+async function backendPid(client: pg.Client): Promise<number> {
+  const { rows } = await client.query<{ pid: number }>("SELECT pg_backend_pid() AS pid");
+  const pid = rows[0]?.pid;
+  if (pid === undefined) throw new Error("no backend pid");
+  return pid;
+}
+
+/**
+ * Waits until a backend other than those in `except` waits on a lock that one of `by` holds,
+ * and returns its pid. Polls pg_blocking_pids, so the test goes on only once the other call is
+ * really blocked, not after a guessed sleep.
+ */
+async function blockedBy(probe: pg.Client, by: number[], except: number[] = []): Promise<number> {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const { rows } = await probe.query<{ pid: number }>(
+      "SELECT pid FROM pg_stat_activity WHERE pg_blocking_pids(pid) && $1::int[]",
+      [by],
+    );
+    const found = rows.map((r) => r.pid).find((pid) => !except.includes(pid) && !by.includes(pid));
+    if (found !== undefined) return found;
+    if (Date.now() > deadline) throw new Error("no call waited on the lock");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+/** Settles a promise into its value or its error, so a test can await it after other steps. */
+function settle<T>(promise: Promise<T>): Promise<{ value: T } | { error: unknown }> {
+  return promise.then(
+    (value) => ({ value }),
+    (error: unknown) => ({ error }),
+  );
+}
+
+async function lockAccount(id: string) {
+  const inserted = await requireStore().accounts.insert({
+    id,
+    email: `${id}@example.org`,
+    webauthnUserId: `wu-${id}`,
+    status: "active",
+    createdAt: new Date(),
+    personKeyDigest: null,
+    assuranceLevel: null,
+    identityVerifiedAt: null,
+  });
+  if (inserted !== "inserted") throw new Error(inserted);
+  return id;
+}
+
+function lockClient(id: string, overrides: Partial<OAuthClientRecord> = {}): OAuthClientRecord {
+  return {
+    id,
+    secretDigest: null,
+    secretDigestAlgorithm: null,
+    authMethod: "none",
+    grantTypes: ["authorization_code", "refresh_token"],
+    redirectUris: ["http://127.0.0.1/cb"],
+    name: null,
+    source: "dynamic",
+    createdAt: new Date(Date.now() - 400 * DAY_MS),
+    lastUsedAt: new Date(Date.now() - 300 * DAY_MS),
+    ...overrides,
+  };
+}
+
+function lockGrant(accountId: string, clientId: string): OAuthGrantRecord {
+  const now = Date.now();
+  return {
+    id: `grant-${tag()}`,
+    accountId,
+    clientId,
+    scopes: ["mcp:read"],
+    resource: "https://example.com/mcp",
+    createdAt: new Date(now),
+    expiresAt: new Date(now + 90 * DAY_MS),
+    generation: 1,
+    refreshRefDigest: `ref-${tag()}`,
+    refreshDigest: `refresh-${tag()}`,
+    refreshDigestAlgorithm: "hmac-sha256",
+    previousRefreshDigest: null,
+    refreshedAt: null,
+    refreshExpiresAt: new Date(now + 30 * DAY_MS),
+    codeDigest: null,
+    source: "created",
+  };
+}
+
+function lockToken(grantId: string, digest = `access-${tag()}`): OAuthAccessTokenRecord {
+  const now = Date.now();
+  return {
+    digest,
+    grantId,
+    generation: 1,
+    scopes: ["mcp:read"],
+    createdAt: new Date(now),
+    expiresAt: new Date(now + 3_600_000),
+  };
+}
+
+/** Three idle clients in id order; the first holds a live grant. Inserted in reverse. */
+async function threeIdleClients() {
+  const oauth = oauthStore();
+  const prefix = `lockorder-${tag()}`;
+  const [busy, first, second] = [0, 1, 2].map((n) => lockClient(`${prefix}-${n}`));
+  if (!busy || !first || !second) throw new Error("no clients");
+  for (const c of [second, first, busy]) await oauth.insertClient(c);
+  const accountId = await lockAccount(`acc-${tag()}`);
+  const live = lockGrant(accountId, busy.id);
+  await oauth.insertGrant(live, lockToken(live.id), { maxOtherGrants: 10, at: new Date() });
+  return { oauth, busy, first, second };
+}
+
+/** Purge bounds that make the clients of `lockClient` idle, and no client of the 2030 cases. */
+function purgeBounds() {
+  const at = new Date();
+  return {
+    at,
+    unusedBefore: new Date(at.getTime() - 30 * DAY_MS),
+    idleBefore: new Date(at.getTime() - 180 * DAY_MS),
+    windowBefore: new Date(at.getTime() - DAY_MS),
+  };
 }
 
 describe.skipIf(!url)("postgresql", () => {
@@ -87,6 +234,216 @@ describe.skipIf(!url)("postgresql", () => {
     // The client belongs to no account and stays.
     expect(result.client).not.toBeNull();
   });
+
+  // Each case waits for a real lock; the timeout leaves room for blockedBy's own deadline.
+  describe(
+    "oauth lock order with real transactions (review a2 B r1 L6)",
+    { timeout: 20_000 },
+    () => {
+      it("deleteClient against a replacing insertGrant: no deadlock, the insert fails on the client", async () => {
+        // 2462828: insertGrant locks the client before it deletes the grant it replaces. Without
+        // that, it would hold the old grant's row lock while its foreign key check waits on the
+        // client, and deleteClient would wait on the old grant: a deadlock.
+        const oauth = oauthStore();
+        const accountId = await lockAccount(`acc-${tag()}`);
+        const client = lockClient(`client-${tag()}`);
+        expect(await oauth.insertClient(client)).toBe("inserted");
+        const old = lockGrant(accountId, client.id);
+        await oauth.insertGrant(old, lockToken(old.id), { maxOtherGrants: 10, at: new Date() });
+        const holder = await connection();
+        const probe = await connection();
+        try {
+          // deleteClient's first step: the client row FOR UPDATE.
+          await holder.query("BEGIN ISOLATION LEVEL READ COMMITTED");
+          await holder.query("SELECT id FROM identkit_oauth_clients WHERE id = $1 FOR UPDATE", [
+            client.id,
+          ]);
+          const replacing = lockGrant(accountId, client.id);
+          const inserting = settle(
+            oauth.insertGrant(replacing, lockToken(replacing.id), {
+              maxOtherGrants: 10,
+              at: new Date(),
+            }),
+          );
+          await blockedBy(probe, [await backendPid(holder)]);
+          // deleteClient's next steps: the client's grants, then the client. With the fix the
+          // insert holds no grant row lock, so these do not wait.
+          await holder.query("DELETE FROM identkit_oauth_grants WHERE client_id = $1", [client.id]);
+          await holder.query("DELETE FROM identkit_oauth_clients WHERE id = $1", [client.id]);
+          await holder.query("COMMIT");
+          const result = await inserting;
+          expect(result).toMatchObject({
+            error: expect.objectContaining({
+              message: "oauth grant references a missing client",
+            }),
+          });
+          const { rows } = await probe.query(
+            "SELECT id FROM identkit_oauth_grants WHERE client_id = $1",
+            [client.id],
+          );
+          expect(rows).toEqual([]);
+        } finally {
+          await holder.query("ROLLBACK").catch(() => undefined);
+          await holder.end();
+          await probe.end();
+        }
+      });
+
+      it("purge against a grant insert that commits during the wait keeps the client and the grant", async () => {
+        // ff326f6: the candidate lock waits on the insert's key share lock on the client, and the
+        // delete is a second statement whose snapshot sees the committed grant. A single DELETE
+        // would cascade it.
+        const oauth = oauthStore();
+        const accountId = await lockAccount(`acc-${tag()}`);
+        const other = await lockAccount(`acc-${tag()}`);
+        const idle = lockClient(`client-${tag()}`);
+        const elsewhere = lockClient(`client-${tag()}`, { lastUsedAt: new Date() });
+        await oauth.insertClient(idle);
+        await oauth.insertClient(elsewhere);
+        const parked = lockGrant(other, elsewhere.id);
+        await oauth.insertGrant(parked, lockToken(parked.id), {
+          maxOtherGrants: 10,
+          at: new Date(),
+        });
+        const holder = await connection();
+        const probe = await connection();
+        try {
+          // Parks the insert below on its access token: this uncommitted row has the same digest.
+          const digest = `access-${tag()}`;
+          await holder.query("BEGIN ISOLATION LEVEL READ COMMITTED");
+          await holder.query(
+            `INSERT INTO identkit_oauth_access_tokens
+             (digest, grant_id, generation, scopes, created_at, expires_at)
+           VALUES ($1, $2, 1, '{mcp:read}', now(), now() + interval '1 hour')`,
+            [digest, parked.id],
+          );
+          const holderPid = await backendPid(holder);
+          const grant = lockGrant(accountId, idle.id);
+          const inserting = settle(
+            oauth.insertGrant(grant, lockToken(grant.id, digest), {
+              maxOtherGrants: 10,
+              at: new Date(),
+            }),
+          );
+          // The insert holds the account and client locks and waits on the token digest.
+          const insertPid = await blockedBy(probe, [holderPid]);
+          const purging = settle(oauth.purge(purgeBounds()));
+          await blockedBy(probe, [insertPid], [holderPid]);
+          await holder.query("ROLLBACK");
+          expect(await inserting).toMatchObject({ value: { status: "inserted" } });
+          const purged = await purging;
+          if (!("value" in purged)) throw purged.error;
+          expect(purged.value.clients.map((c) => c.id)).not.toContain(idle.id);
+          expect(await oauth.findClient(idle.id)).not.toBeNull();
+          expect(await oauth.findGrant(grant.id)).not.toBeNull();
+        } finally {
+          await holder.query("ROLLBACK").catch(() => undefined);
+          await holder.end();
+          await probe.end();
+        }
+      });
+
+      it("purge against an approval's last-use write keeps the client", async () => {
+        // The candidate lock waits on the row lock of the last-use write and re-checks the date
+        // rule on the new row; the delete checks it once more.
+        const oauth = oauthStore();
+        const idle = lockClient(`client-${tag()}`);
+        await oauth.insertClient(idle);
+        const holder = await connection();
+        const probe = await connection();
+        try {
+          await holder.query("BEGIN ISOLATION LEVEL READ COMMITTED");
+          await holder.query(
+            "UPDATE identkit_oauth_clients SET last_used_at = now() WHERE id = $1",
+            [idle.id],
+          );
+          const purging = settle(oauth.purge(purgeBounds()));
+          await blockedBy(probe, [await backendPid(holder)]);
+          await holder.query("COMMIT");
+          const purged = await purging;
+          if (!("value" in purged)) throw purged.error;
+          expect(purged.value.clients.map((c) => c.id)).not.toContain(idle.id);
+          expect(await oauth.findClient(idle.id)).not.toBeNull();
+        } finally {
+          await holder.query("ROLLBACK").catch(() => undefined);
+          await holder.end();
+          await probe.end();
+        }
+      });
+
+      it("purge locks only clients without a live grant or code, in id order (review a2 B r1 L5)", async () => {
+        const { oauth, busy, first, second } = await threeIdleClients();
+        const holder = await connection();
+        const probe = await connection();
+        try {
+          await holder.query("BEGIN ISOLATION LEVEL READ COMMITTED");
+          await holder.query("SELECT id FROM identkit_oauth_clients WHERE id = $1 FOR UPDATE", [
+            first.id,
+          ]);
+          const purging = settle(oauth.purge(purgeBounds()));
+          await blockedBy(probe, [await backendPid(holder)]);
+          // The purge waits at `first`. It never locked the busy client, which sorts before it,
+          // and not yet the second, which sorts after it (and lies first on disk).
+          await probe.query("BEGIN");
+          for (const c of [busy, second]) {
+            await expect(
+              probe.query("SELECT id FROM identkit_oauth_clients WHERE id = $1 FOR UPDATE NOWAIT", [
+                c.id,
+              ]),
+              c.id,
+            ).resolves.toMatchObject({ rowCount: 1 });
+          }
+          await probe.query("ROLLBACK");
+          await holder.query("COMMIT");
+          const purged = await purging;
+          if (!("value" in purged)) throw purged.error;
+          const mine = purged.value.clients
+            .map((c) => c.id)
+            .filter((id) => id.startsWith(first.id.slice(0, -2)));
+          expect(mine.toSorted()).toEqual([first.id, second.id]);
+          expect(await oauth.findClient(busy.id)).not.toBeNull();
+        } finally {
+          await probe.query("ROLLBACK").catch(() => undefined);
+          await holder.query("ROLLBACK").catch(() => undefined);
+          await holder.end();
+          await probe.end();
+        }
+      });
+
+      it("two overlapping purges do not deadlock and delete each client once", async () => {
+        const { oauth, busy, first, second } = await threeIdleClients();
+        const holder = await connection();
+        const probe = await connection();
+        try {
+          await holder.query("BEGIN ISOLATION LEVEL READ COMMITTED");
+          await holder.query("SELECT id FROM identkit_oauth_clients WHERE id = $1 FOR UPDATE", [
+            first.id,
+          ]);
+          const holderPid = await backendPid(holder);
+          const one = settle(oauth.purge(purgeBounds()));
+          const onePid = await blockedBy(probe, [holderPid]);
+          const two = settle(oauth.purge(purgeBounds()));
+          await blockedBy(probe, [holderPid, onePid], [onePid]);
+          await holder.query("COMMIT");
+          const results = [await one, await two];
+          const prefix = first.id.slice(0, -2);
+          const deleted: string[] = [];
+          for (const result of results) {
+            if (!("value" in result)) throw result.error;
+            deleted.push(
+              ...result.value.clients.map((c) => c.id).filter((id) => id.startsWith(prefix)),
+            );
+          }
+          expect(deleted.toSorted()).toEqual([first.id, second.id]);
+          expect(await oauth.findClient(busy.id)).not.toBeNull();
+        } finally {
+          await holder.query("ROLLBACK").catch(() => undefined);
+          await holder.end();
+          await probe.end();
+        }
+      });
+    },
+  );
 
   it("enrollment: revokeAllForAccount waits for the account row lock that issue takes", async () => {
     const database = db;
