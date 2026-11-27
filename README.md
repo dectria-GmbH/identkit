@@ -345,19 +345,35 @@ Sessions:
   operation's own writes and audit events (the disable, the new or removed passkey, the TOTP
   change, the removed link). If it throws, the call throws `AllSessionsRevokedHookError`, and
   everything identkit does is done: the identkit sessions stay revoked and the audit events are
-  written. Some calls cannot be repeated (a finished passkey registration or TOTP enrolment, a
-  `totp.remove` whose factor is gone), so re-run the hook with
-  `sessions.revokeAll(error.accountId, error.revokeAllOptions)`.
+  written, unless `auditError` is set (next point). Some calls cannot be repeated (a finished
+  passkey registration or TOTP enrolment, a `totp.remove` whose factor is gone), so re-run the
+  hook with `sessions.revokeAll(error.accountId, error.revokeAllOptions)`.
   `revokeAll` is idempotent and calls the hook also when no session was live. Make the hook
   idempotent too. On such a re-run `revokedSessionIds` is empty, because the sessions are already
-  revoked: do not depend on it to find the sessions to end. If an operation fails for another
-  reason and rolls back (a failed passkey registration or TOTP enrolment), the hook runs best
-  effort and the original error goes up.
-- The hook runs also when the audit sink throws on the operation's own events, so a failing
-  sink cannot leave your application's sessions live. Then the sink's error goes up after the
-  hook ran. If the hook throws as well, `AllSessionsRevokedHookError` goes up, because only the
-  hook needs a re-run, and its `auditError` holds the sink's error: that audit event may be
-  missing. Without a sink failure, `auditError` is undefined.
+  revoked: do not depend on it to find the sessions to end.
+- `AllSessionsRevokedHookError` does not mean that the operation succeeded. A TOTP enrolment or
+  a passkey registration whose grant changed before it completed rolls back: identkit removes
+  the new factor or passkey, revokes every session of the account and records the failure. If
+  the hook throws then, the error has `rolledBack: true` and `revokeAllOptions` is `{}`; without
+  the hook failure the call would have returned `denied`. For every other operation
+  `rolledBack` is false. If an operation fails for another reason and rolls back (a store error
+  during a passkey registration or TOTP enrolment), the hook runs best effort and the original
+  error goes up, never `AllSessionsRevokedHookError` and never a sink error of the rollback.
+- The hook runs also when the audit sink throws, on the `session.revoked` events or on the
+  operation's own events, so a failing sink cannot leave your application's sessions live.
+  identkit still offers every other event of the operation to the sink (a refused
+  `session.revoked` does not skip `account.disabled`, `totp.removed` or `passkey.registered`).
+  Then the first sink error goes up after the hook ran. If the hook throws as well,
+  `AllSessionsRevokedHookError` goes up, because only the hook needs a re-run, and its
+  `auditError` holds that first sink error: the refused event is missing, and later events may
+  be missing too if the sink stayed down. In `totp.confirmEnrolment`, `auditError` can also hold
+  the throttle store's error from the reset after a successful enrolment. Without such a
+  failure, `auditError` is undefined. In short: sink fails only, the sink's error goes up; hook
+  fails only, `AllSessionsRevokedHookError` without `auditError`; both fail,
+  `AllSessionsRevokedHookError` with `auditError`.
+- A sink error on the `session.revoked` events is not a failed revocation: the sessions are
+  revoked. A TOTP enrolment or a passkey registration then stands, as when the sink refuses
+  `totp.enrolled` or `passkey.registered`.
 
 Passkeys:
 
