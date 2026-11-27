@@ -394,11 +394,6 @@ const oauthAccessTokenRow = (t: OAuthAccessTokenRecord) => ({
 });
 
 /**
- * PostgreSQL store. Pass a Kysely instance with a PostgreSQL dialect; apply the migrations
- * first (`migrateIdentkit` or the files in `migrations/`). Each guarded method is one
- * conditional statement or one transaction with a row lock.
- */
-/**
  * Deletes the client with its grants and codes, and returns the grants, or null. Imported grants
  * get their tombstones. The client gets one too, unless this rolls back its import (`rollBack`):
  * then it matches only an imported client and writes no tombstone for it.
@@ -438,6 +433,11 @@ async function endClient(
     });
 }
 
+/**
+ * PostgreSQL store. Pass a Kysely instance with a PostgreSQL dialect; apply the migrations
+ * first (`migrateIdentkit` or the files in `migrations/`). Each guarded method is one
+ * conditional statement or one transaction with a row lock.
+ */
 export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore {
   return {
     accounts: {
