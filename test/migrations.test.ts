@@ -58,4 +58,27 @@ describe("migrations", () => {
     ]);
     expect(text).not.toMatch(/\b(DROP|RENAME|ALTER)\b/i);
   });
+
+  it("splits the OAuth migration into its statements, new tables only", () => {
+    const text = readFileSync(join(MIGRATIONS_DIR, "0006_oauth.sql"), "utf8");
+    const statements = splitStatements(text);
+    expect(statements.map((s) => s.split(/\s+/).slice(0, 3).join(" "))).toEqual([
+      "CREATE TABLE identkit_oauth_clients",
+      "CREATE TABLE identkit_oauth_grants",
+      "CREATE UNIQUE INDEX",
+      "CREATE INDEX identkit_oauth_grants_client_idx",
+      "CREATE TABLE identkit_oauth_access_tokens",
+      "CREATE INDEX identkit_oauth_access_tokens_grant_idx",
+      "CREATE TABLE identkit_oauth_codes",
+      "CREATE INDEX identkit_oauth_codes_account_idx",
+      "CREATE INDEX identkit_oauth_codes_client_idx",
+      "CREATE INDEX identkit_oauth_codes_expires_idx",
+      "CREATE TABLE identkit_oauth_registration_counts",
+    ]);
+    expect(text).not.toMatch(/\b(DROP|RENAME|ALTER)\b/i);
+    // Every unique index is on a table that this migration creates.
+    expect(statements.filter((s) => /UNIQUE INDEX/.test(s))).toEqual([
+      expect.stringMatching(/ON identkit_oauth_grants \(account_id, client_id\)$/),
+    ]);
+  });
 });

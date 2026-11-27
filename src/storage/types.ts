@@ -247,6 +247,153 @@ export type InsertApiTokenResult = "inserted" | "limit_reached" | "digest_taken"
 export type LinkPersonResult =
   "linked" | "already_linked" | "person_linked_elsewhere" | "account_has_other_person";
 
+/** How an OAuth client authenticates at the token and revocation endpoints (RFC 7591). */
+export type OAuthClientAuthMethod = "none" | "client_secret_basic" | "client_secret_post";
+
+/**
+ * How a stored OAuth secret digest was made. `hmac-sha256`: the keyed HMAC of the
+ * `SecretHasher`, for every secret that identkit issues. `sha256`: an unkeyed SHA-256 hex digest,
+ * only for client secrets and refresh tokens imported from an earlier system.
+ */
+export type OAuthDigestAlgorithm = "hmac-sha256" | "sha256";
+
+/** `dynamic`: by dynamic client registration (RFC 7591). `import`: by `oauth.importClient`. */
+export type OAuthClientSource = "dynamic" | "import";
+
+/** `created`: by a code exchange. `import`: by `oauth.importGrant`. */
+export type OAuthGrantSource = "created" | "import";
+
+/** A registered OAuth client. The store holds only the digest of its secret. */
+export interface OAuthClientRecord {
+  /** The public `client_id`. */
+  id: string;
+  /** Lowercase hex digest of the client secret; null for a public client. */
+  secretDigest: string | null;
+  secretDigestAlgorithm: OAuthDigestAlgorithm | null;
+  authMethod: OAuthClientAuthMethod;
+  /** As registered, for example `["authorization_code", "refresh_token"]`. */
+  grantTypes: string[];
+  /** Exact strings, as registered. */
+  redirectUris: string[];
+  /** The registered `client_name` after identkit removed unsafe characters, or null. */
+  name: string | null;
+  source: OAuthClientSource;
+  createdAt: Date;
+  /** Written at a code exchange and a refresh, at most once a day. */
+  lastUsedAt: Date | null;
+}
+
+/**
+ * The consent of one account for one client. At most one per (account, client). Ending it is a
+ * delete: its access tokens go with it, and every token of it stops at once.
+ */
+export interface OAuthGrantRecord {
+  id: string;
+  accountId: string;
+  clientId: string;
+  /** Opaque scope strings, stored as granted. */
+  scopes: string[];
+  /** The resource (RFC 8707) that every token of the grant is for. */
+  resource: string;
+  createdAt: Date;
+  /** Absolute end of the grant. */
+  expiresAt: Date;
+  /** Counts the refresh rotations; the first tokens have generation 1. */
+  generation: number;
+  /** Digest of the fixed part of the refresh token. Unique; null until the grant has one. */
+  refreshRefDigest: string | null;
+  /** Digest of the current refresh token; null if the client gets none. */
+  refreshDigest: string | null;
+  refreshDigestAlgorithm: OAuthDigestAlgorithm | null;
+  /** Digest of the refresh token before the current one, for the race grace. */
+  previousRefreshDigest: string | null;
+  /** Time of the last rotation, or null. */
+  refreshedAt: Date | null;
+  refreshExpiresAt: Date | null;
+  /** Digest of the authorization code that created the grant. Unique. */
+  codeDigest: string | null;
+  source: OAuthGrantSource;
+}
+
+/** One issued access token. The store holds only its digest. */
+export interface OAuthAccessTokenRecord {
+  /** Lowercase hex digest of the whole token. Unique. */
+  digest: string;
+  grantId: string;
+  /** The grant generation that issued it. */
+  generation: number;
+  /** The token's own scopes: the grant's, or fewer. */
+  scopes: string[];
+  createdAt: Date;
+  expiresAt: Date;
+}
+
+/** An authorization code in flight. Single use; the store holds only its digest. */
+export interface OAuthCodeRecord {
+  digest: string;
+  clientId: string;
+  accountId: string;
+  /** The redirect URI of the authorization request, exactly. */
+  redirectUri: string;
+  /** The S256 code challenge (RFC 7636). */
+  codeChallenge: string;
+  resource: string;
+  scopes: string[];
+  createdAt: Date;
+  expiresAt: Date;
+}
+
+/** A grant with the status of its account, read in one query. */
+export interface OAuthGrantLookup {
+  grant: OAuthGrantRecord;
+  accountStatus: AccountStatus;
+}
+
+/** An access token with its grant and the status of the grant's account, read in one query. */
+export interface OAuthAccessTokenLookup {
+  token: OAuthAccessTokenRecord;
+  grant: OAuthGrantRecord;
+  accountStatus: AccountStatus;
+}
+
+/** The fields that a refresh rotation writes. */
+export interface OAuthGrantRotation {
+  /** The new generation: the expected one plus one. */
+  generation: number;
+  refreshRefDigest: string;
+  refreshDigest: string;
+  refreshDigestAlgorithm: OAuthDigestAlgorithm;
+  previousRefreshDigest: string | null;
+  refreshedAt: Date;
+  refreshExpiresAt: Date;
+}
+
+/**
+ * `limit_reached`: the account holds `maxOtherGrants` or more live grants of other clients.
+ * `account_inactive`: the account is missing or not active.
+ */
+export type InsertOAuthGrantResult =
+  | { status: "inserted"; replaced: OAuthGrantRecord | null }
+  | { status: "limit_reached" }
+  | { status: "account_inactive" };
+
+/**
+ * `id_taken`: a grant with this id exists. `account_client_taken`: the account holds a grant of
+ * this client. Others as for `InsertOAuthGrantResult`.
+ */
+export type ImportOAuthGrantStoreResult =
+  "inserted" | "id_taken" | "account_client_taken" | "limit_reached" | "account_inactive";
+
+/** What `oauth.purge` removed in the store. */
+export interface OAuthPurgeStoreResult {
+  clients: { id: string; reason: "unused" | "idle" }[];
+  /** Grants past their `expiresAt`. */
+  grants: OAuthGrantRecord[];
+  codes: number;
+  accessTokens: number;
+  registrationWindows: number;
+}
+
 /**
  * Storage port. Every method that guards a security rule is atomic on its own, so two
  * concurrent calls cannot both pass a single-use or limit check.
@@ -474,5 +621,101 @@ export interface IdentkitStore {
     revokeAllForAccount(accountId: string, at: Date, reason: string): Promise<string[]>;
     /** Deletes the token of the account, for a rollback. Returns false if it is gone. */
     delete(id: string, accountId: string): Promise<boolean>;
+  };
+  /**
+   * The OAuth authorization server. Optional, so a store written for an earlier release still
+   * fits the type; `createIdentkit` throws `NotConfiguredError` if the `oauth` option is set and
+   * the store has no `oauth`. The built-in stores implement it. A grant delete removes its
+   * access tokens; a client delete removes its grants and codes; an account delete removes its
+   * grants and codes.
+   */
+  oauth?: {
+    /** Inserts the client unless a client with its id exists. */
+    insertClient(client: OAuthClientRecord): Promise<"inserted" | "id_taken">;
+    findClient(id: string): Promise<OAuthClientRecord | null>;
+    /**
+     * Atomically sets `lastUsedAt` to `at` if it is null or at most `notAfter`. Returns false
+     * otherwise, so of concurrent calls one writes.
+     */
+    markClientUsed(id: string, at: Date, notAfter: Date): Promise<boolean>;
+    /**
+     * Compare-and-set of the client secret digest: replaces `oldDigest` with the keyed
+     * `newDigest` (algorithm `hmac-sha256`). Returns false if the stored digest is not `oldDigest`.
+     */
+    upgradeClientSecret(id: string, oldDigest: string, newDigest: string): Promise<boolean>;
+    /** Deletes the client, its grants and its codes. Returns true if this call deleted it. */
+    deleteClient(id: string): Promise<boolean>;
+    /**
+     * Counts one registration for each key in order, in the window that starts at
+     * `windowStart`. Stops at the first key whose count is at `max` already and returns it;
+     * the keys before it keep their count. No key ever exceeds its `max`, also under
+     * concurrent calls.
+     */
+    reserveRegistration(input: {
+      keys: readonly { key: string; max: number }[];
+      windowStart: Date;
+    }): Promise<"reserved" | { limitReached: string }>;
+    insertCode(code: OAuthCodeRecord): Promise<void>;
+    /** Atomically removes and returns the code. Of concurrent calls exactly one gets it. */
+    consumeCode(digest: string): Promise<OAuthCodeRecord | null>;
+    /** Atomically deletes and returns the grant that the code created, or null. */
+    endGrantByCode(codeDigest: string): Promise<OAuthGrantRecord | null>;
+    /**
+     * Atomically: if the account is active and holds fewer than `limit.maxOtherGrants` live
+     * grants (`expiresAt` after `limit.at`) of other clients, deletes the account's grant of
+     * this client (returned as `replaced`), inserts the grant and its first access token.
+     * Concurrent inserts for one account never exceed the limit.
+     */
+    insertGrant(
+      grant: OAuthGrantRecord,
+      firstAccessToken: OAuthAccessTokenRecord,
+      limit: { maxOtherGrants: number; at: Date },
+    ): Promise<InsertOAuthGrantResult>;
+    /** As `insertGrant`, without an access token, and it never replaces a grant. */
+    importGrant(
+      grant: OAuthGrantRecord,
+      limit: { maxOtherGrants: number; at: Date },
+    ): Promise<ImportOAuthGrantStoreResult>;
+    findGrantByRefreshRef(refDigest: string): Promise<OAuthGrantLookup | null>;
+    findGrant(id: string): Promise<OAuthGrantLookup | null>;
+    /**
+     * Compare-and-set on the generation: if the grant still has `expectedGeneration`, writes
+     * `update`, inserts `accessToken` and deletes the grant's access tokens that expire at or
+     * before `pruneBefore`. Of concurrent rotations with one expected generation exactly one
+     * returns true, and only its access token exists. `update.refreshDigest` is new for each
+     * call (a fresh random token); the D1 store uses it to tell which rotation won.
+     */
+    rotateGrant(
+      id: string,
+      expectedGeneration: number,
+      update: OAuthGrantRotation,
+      accessToken: OAuthAccessTokenRecord,
+      pruneBefore: Date,
+    ): Promise<boolean>;
+    findAccessToken(digest: string): Promise<OAuthAccessTokenLookup | null>;
+    /**
+     * Atomically deletes the grant if it belongs to the client or the account, and returns it.
+     * A client can end only its own grants, an account only its own.
+     */
+    deleteGrant(
+      id: string,
+      match: { clientId: string } | { accountId: string },
+    ): Promise<OAuthGrantRecord | null>;
+    /** Deletes every grant and code of the account and returns the grants. Idempotent. */
+    deleteGrantsForAccount(accountId: string): Promise<OAuthGrantRecord[]>;
+    /** The grants of the account with `expiresAt` after `at`, oldest first. */
+    listGrants(accountId: string, at: Date): Promise<OAuthGrantRecord[]>;
+    /**
+     * Deletes grants, codes and access tokens that expire at or before `at`; clients that never
+     * got a grant and were created before `unusedBefore`; clients last used before
+     * `idleBefore`; and registration windows that start before `windowBefore`. Never deletes a
+     * client that holds a live grant or a live code.
+     */
+    purge(input: {
+      at: Date;
+      unusedBefore: Date;
+      idleBefore: Date;
+      windowBefore: Date;
+    }): Promise<OAuthPurgeStoreResult>;
   };
 }

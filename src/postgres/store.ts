@@ -9,6 +9,10 @@ import type {
   CredentialRecord,
   EnrollmentTokenRecord,
   IdentkitStore,
+  OAuthAccessTokenRecord,
+  OAuthClientRecord,
+  OAuthCodeRecord,
+  OAuthGrantRecord,
   OidcLinkRecord,
   OtpFlowRecord,
   SessionRecord,
@@ -58,6 +62,11 @@ const OIDC_LINK_SOURCES = ["sign_in", "import"] as const;
 const STEP_UP_METHODS = ["email_otp", "passkey", "totp"] as const;
 const API_TOKEN_ALGORITHMS = ["hmac-sha256", "sha256"] as const;
 const API_TOKEN_SOURCES = ["created", "import"] as const;
+const OAUTH_ALGORITHMS = ["hmac-sha256", "sha256"] as const;
+const OAUTH_AUTH_METHODS = ["none", "client_secret_basic", "client_secret_post"] as const;
+const OAUTH_CLIENT_SOURCES = ["dynamic", "import"] as const;
+const OAUTH_GRANT_SOURCES = ["created", "import"] as const;
+const ACCOUNT_STATUSES = ["active", "disabled"] as const;
 
 const toAccount = (r: Row<"identkit_accounts">): AccountRecord => ({
   id: r.id,
@@ -201,6 +210,78 @@ const toApiToken = (r: Row<"identkit_api_tokens">): ApiTokenRecord => ({
   lastUsedAt: r.last_used_at,
   revokedAt: r.revoked_at,
   revokeReason: r.revoke_reason,
+});
+
+const toOAuthClient = (r: Row<"identkit_oauth_clients">): OAuthClientRecord => ({
+  id: r.id,
+  secretDigest: r.secret_digest,
+  secretDigestAlgorithm: oneOfOrNull(r.secret_digest_algorithm, OAUTH_ALGORITHMS),
+  authMethod: oneOf(r.auth_method, OAUTH_AUTH_METHODS),
+  grantTypes: [...r.grant_types],
+  redirectUris: [...r.redirect_uris],
+  name: r.name,
+  source: oneOf(r.source, OAUTH_CLIENT_SOURCES),
+  createdAt: r.created_at,
+  lastUsedAt: r.last_used_at,
+});
+
+const toOAuthGrant = (r: Row<"identkit_oauth_grants">): OAuthGrantRecord => ({
+  id: r.id,
+  accountId: r.account_id,
+  clientId: r.client_id,
+  scopes: [...r.scopes],
+  resource: r.resource,
+  createdAt: r.created_at,
+  expiresAt: r.expires_at,
+  generation: r.generation,
+  refreshRefDigest: r.refresh_ref_digest,
+  refreshDigest: r.refresh_digest,
+  refreshDigestAlgorithm: oneOfOrNull(r.refresh_digest_algorithm, OAUTH_ALGORITHMS),
+  previousRefreshDigest: r.previous_refresh_digest,
+  refreshedAt: r.refreshed_at,
+  refreshExpiresAt: r.refresh_expires_at,
+  codeDigest: r.code_digest,
+  source: oneOf(r.source, OAUTH_GRANT_SOURCES),
+});
+
+const toOAuthCode = (r: Row<"identkit_oauth_codes">): OAuthCodeRecord => ({
+  digest: r.digest,
+  clientId: r.client_id,
+  accountId: r.account_id,
+  redirectUri: r.redirect_uri,
+  codeChallenge: r.code_challenge,
+  resource: r.resource,
+  scopes: [...r.scopes],
+  createdAt: r.created_at,
+  expiresAt: r.expires_at,
+});
+
+const oauthGrantRow = (g: OAuthGrantRecord) => ({
+  id: g.id,
+  account_id: g.accountId,
+  client_id: g.clientId,
+  scopes: g.scopes,
+  resource: g.resource,
+  created_at: g.createdAt,
+  expires_at: g.expiresAt,
+  generation: g.generation,
+  refresh_ref_digest: g.refreshRefDigest,
+  refresh_digest: g.refreshDigest,
+  refresh_digest_algorithm: g.refreshDigestAlgorithm,
+  previous_refresh_digest: g.previousRefreshDigest,
+  refreshed_at: g.refreshedAt,
+  refresh_expires_at: g.refreshExpiresAt,
+  code_digest: g.codeDigest,
+  source: g.source,
+});
+
+const oauthAccessTokenRow = (t: OAuthAccessTokenRecord) => ({
+  digest: t.digest,
+  grant_id: t.grantId,
+  generation: t.generation,
+  scopes: t.scopes,
+  created_at: t.createdAt,
+  expires_at: t.expiresAt,
 });
 
 /**
@@ -1077,6 +1158,406 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           .returning("id")
           .executeTakeFirst();
         return row !== undefined;
+      },
+    },
+    oauth: {
+      async insertClient(c) {
+        // Atomic: one INSERT; the primary key makes a second insert of an id a no-op.
+        const row = await db
+          .insertInto("identkit_oauth_clients")
+          .values({
+            id: c.id,
+            secret_digest: c.secretDigest,
+            secret_digest_algorithm: c.secretDigestAlgorithm,
+            auth_method: c.authMethod,
+            grant_types: c.grantTypes,
+            redirect_uris: c.redirectUris,
+            name: c.name,
+            source: c.source,
+            created_at: c.createdAt,
+            last_used_at: c.lastUsedAt,
+          })
+          .onConflict((oc) => oc.column("id").doNothing())
+          .returning("id")
+          .executeTakeFirst();
+        return row ? "inserted" : "id_taken";
+      },
+      async findClient(id) {
+        const r = await db
+          .selectFrom("identkit_oauth_clients")
+          .selectAll()
+          .where("id", "=", id)
+          .executeTakeFirst();
+        return r ? toOAuthClient(r) : null;
+      },
+      async markClientUsed(id, at, notAfter) {
+        try {
+          // Atomic: one UPDATE that matches only while the last use is old enough.
+          const row = await db
+            .updateTable("identkit_oauth_clients")
+            .set({ last_used_at: at })
+            .where("id", "=", id)
+            .where((eb) =>
+              eb.or([eb("last_used_at", "is", null), eb("last_used_at", "<=", notAfter)]),
+            )
+            .returning("id")
+            .executeTakeFirst();
+          return row !== undefined;
+        } catch (error) {
+          // A concurrent write under REPEATABLE READ: that call wrote, so this one need not.
+          if (isLostRace(error)) return false;
+          throw error;
+        }
+      },
+      async upgradeClientSecret(id, oldDigest, newDigest) {
+        // Atomic: compare-and-set in one UPDATE on the expected digest.
+        const row = await db
+          .updateTable("identkit_oauth_clients")
+          .set({ secret_digest: newDigest, secret_digest_algorithm: "hmac-sha256" })
+          .where("id", "=", id)
+          .where("secret_digest", "=", oldDigest)
+          .returning("id")
+          .executeTakeFirst();
+        return row !== undefined;
+      },
+      async deleteClient(id) {
+        // The foreign keys remove the client's grants, their access tokens and its codes.
+        const row = await db
+          .deleteFrom("identkit_oauth_clients")
+          .where("id", "=", id)
+          .returning("id")
+          .executeTakeFirst();
+        return row !== undefined;
+      },
+      async reserveRegistration({ keys, windowStart }) {
+        // One upsert per key, in order. Each is atomic: the row lock of ON CONFLICT DO UPDATE
+        // makes the WHERE see the count of the call before, so the count never passes max.
+        for (const { key, max } of keys) {
+          const { rows } = await sql<{ count: number }>`
+            INSERT INTO identkit_oauth_registration_counts AS c (key, window_start, count)
+            VALUES (${key}, ${windowStart}, 1)
+            ON CONFLICT (key, window_start)
+            DO UPDATE SET count = c.count + 1 WHERE c.count < ${max}
+            RETURNING c.count`.execute(db);
+          if (rows.length === 0) return { limitReached: key };
+        }
+        return "reserved";
+      },
+      async insertCode(code) {
+        await db
+          .insertInto("identkit_oauth_codes")
+          .values({
+            digest: code.digest,
+            client_id: code.clientId,
+            account_id: code.accountId,
+            redirect_uri: code.redirectUri,
+            code_challenge: code.codeChallenge,
+            resource: code.resource,
+            scopes: code.scopes,
+            created_at: code.createdAt,
+            expires_at: code.expiresAt,
+          })
+          .execute();
+      },
+      async consumeCode(digest) {
+        // Atomic: one DELETE ... RETURNING. Only the call that deletes the row gets it.
+        const r = await db
+          .deleteFrom("identkit_oauth_codes")
+          .where("digest", "=", digest)
+          .returningAll()
+          .executeTakeFirst();
+        return r ? toOAuthCode(r) : null;
+      },
+      async endGrantByCode(codeDigest) {
+        // Atomic: one DELETE ... RETURNING.
+        const r = await db
+          .deleteFrom("identkit_oauth_grants")
+          .where("code_digest", "=", codeDigest)
+          .returningAll()
+          .executeTakeFirst();
+        return r ? toOAuthGrant(r) : null;
+      },
+      async insertGrant(grant, firstAccessToken, limit) {
+        // READ COMMITTED whatever the database default, for the reason given at `oidcLinks`.
+        return db
+          .transaction()
+          .setIsolationLevel("read committed")
+          .execute(async (trx) => {
+            // The account row lock serializes grant inserts and imports for one account, so
+            // the count and the insert cannot interleave with another one's. FOR NO KEY UPDATE,
+            // as at `apiTokens.insert`, so foreign key checks of other rows do not wait.
+            const account = await trx
+              .selectFrom("identkit_accounts")
+              .select("status")
+              .where("id", "=", grant.accountId)
+              .forNoKeyUpdate()
+              .executeTakeFirst();
+            if (!account || account.status !== "active") {
+              return { status: "account_inactive" } as const;
+            }
+            const { live } = await trx
+              .selectFrom("identkit_oauth_grants")
+              .select((eb) => eb.fn.countAll<string>().as("live"))
+              .where("account_id", "=", grant.accountId)
+              .where("client_id", "<>", grant.clientId)
+              .where("expires_at", ">", limit.at)
+              .executeTakeFirstOrThrow();
+            if (Number(live) >= limit.maxOtherGrants) return { status: "limit_reached" } as const;
+            const replaced = await trx
+              .deleteFrom("identkit_oauth_grants")
+              .where("account_id", "=", grant.accountId)
+              .where("client_id", "=", grant.clientId)
+              .returningAll()
+              .executeTakeFirst();
+            await trx.insertInto("identkit_oauth_grants").values(oauthGrantRow(grant)).execute();
+            await trx
+              .insertInto("identkit_oauth_access_tokens")
+              .values(oauthAccessTokenRow(firstAccessToken))
+              .execute();
+            return {
+              status: "inserted",
+              replaced: replaced ? toOAuthGrant(replaced) : null,
+            } as const;
+          });
+      },
+      async importGrant(grant, limit) {
+        return db
+          .transaction()
+          .setIsolationLevel("read committed")
+          .execute(async (trx) => {
+            // The same account row lock as `insertGrant`.
+            const account = await trx
+              .selectFrom("identkit_accounts")
+              .select("status")
+              .where("id", "=", grant.accountId)
+              .forNoKeyUpdate()
+              .executeTakeFirst();
+            const sameId = await trx
+              .selectFrom("identkit_oauth_grants")
+              .select("id")
+              .where("id", "=", grant.id)
+              .executeTakeFirst();
+            if (sameId) return "id_taken";
+            if (!account || account.status !== "active") return "account_inactive";
+            const taken = await trx
+              .selectFrom("identkit_oauth_grants")
+              .select("id")
+              .where("account_id", "=", grant.accountId)
+              .where("client_id", "=", grant.clientId)
+              .executeTakeFirst();
+            if (taken) return "account_client_taken";
+            const { live } = await trx
+              .selectFrom("identkit_oauth_grants")
+              .select((eb) => eb.fn.countAll<string>().as("live"))
+              .where("account_id", "=", grant.accountId)
+              .where("client_id", "<>", grant.clientId)
+              .where("expires_at", ">", limit.at)
+              .executeTakeFirstOrThrow();
+            if (Number(live) >= limit.maxOtherGrants) return "limit_reached";
+            const row = await trx
+              .insertInto("identkit_oauth_grants")
+              .values(oauthGrantRow(grant))
+              .onConflict((oc) => oc.column("id").doNothing())
+              .returning("id")
+              .executeTakeFirst();
+            return row ? "inserted" : "id_taken";
+          });
+      },
+      async findGrantByRefreshRef(refDigest) {
+        // One query: the grant and the status of its account.
+        const r = await db
+          .selectFrom("identkit_oauth_grants as g")
+          .innerJoin("identkit_accounts as a", "a.id", "g.account_id")
+          .selectAll("g")
+          .select("a.status as account_status")
+          .where("g.refresh_ref_digest", "=", refDigest)
+          .executeTakeFirst();
+        return r
+          ? { grant: toOAuthGrant(r), accountStatus: oneOf(r.account_status, ACCOUNT_STATUSES) }
+          : null;
+      },
+      async findGrant(id) {
+        const r = await db
+          .selectFrom("identkit_oauth_grants as g")
+          .innerJoin("identkit_accounts as a", "a.id", "g.account_id")
+          .selectAll("g")
+          .select("a.status as account_status")
+          .where("g.id", "=", id)
+          .executeTakeFirst();
+        return r
+          ? { grant: toOAuthGrant(r), accountStatus: oneOf(r.account_status, ACCOUNT_STATUSES) }
+          : null;
+      },
+      async rotateGrant(id, expectedGeneration, u, accessToken, pruneBefore) {
+        try {
+          return await db
+            .transaction()
+            .setIsolationLevel("read committed")
+            .execute(async (trx) => {
+              // Compare-and-set on the generation. Under READ COMMITTED a concurrent rotation
+              // that committed first makes this UPDATE match no row after its wait.
+              const row = await trx
+                .updateTable("identkit_oauth_grants")
+                .set({
+                  generation: u.generation,
+                  refresh_ref_digest: u.refreshRefDigest,
+                  refresh_digest: u.refreshDigest,
+                  refresh_digest_algorithm: u.refreshDigestAlgorithm,
+                  previous_refresh_digest: u.previousRefreshDigest,
+                  refreshed_at: u.refreshedAt,
+                  refresh_expires_at: u.refreshExpiresAt,
+                })
+                .where("id", "=", id)
+                .where("generation", "=", expectedGeneration)
+                .returning("id")
+                .executeTakeFirst();
+              if (!row) return false;
+              await trx
+                .insertInto("identkit_oauth_access_tokens")
+                .values(oauthAccessTokenRow(accessToken))
+                .execute();
+              await trx
+                .deleteFrom("identkit_oauth_access_tokens")
+                .where("grant_id", "=", id)
+                .where("expires_at", "<=", pruneBefore)
+                .execute();
+              return true;
+            });
+        } catch (error) {
+          // A serialization failure means a concurrent rotation won.
+          if (isLostRace(error)) return false;
+          throw error;
+        }
+      },
+      async findAccessToken(digest) {
+        // One query: the token, its grant and the status of the grant's account.
+        const r = await db
+          .selectFrom("identkit_oauth_access_tokens as t")
+          .innerJoin("identkit_oauth_grants as g", "g.id", "t.grant_id")
+          .innerJoin("identkit_accounts as a", "a.id", "g.account_id")
+          .selectAll("g")
+          .select([
+            "t.digest as token_digest",
+            "t.generation as token_generation",
+            "t.scopes as token_scopes",
+            "t.created_at as token_created_at",
+            "t.expires_at as token_expires_at",
+            "a.status as account_status",
+          ])
+          .where("t.digest", "=", digest)
+          .executeTakeFirst();
+        if (!r) return null;
+        return {
+          token: {
+            digest: r.token_digest,
+            grantId: r.id,
+            generation: r.token_generation,
+            scopes: [...r.token_scopes],
+            createdAt: r.token_created_at,
+            expiresAt: r.token_expires_at,
+          },
+          grant: toOAuthGrant(r),
+          accountStatus: oneOf(r.account_status, ACCOUNT_STATUSES),
+        };
+      },
+      async deleteGrant(id, match) {
+        // Atomic: one DELETE ... RETURNING, scoped to the client or the account.
+        let query = db.deleteFrom("identkit_oauth_grants").where("id", "=", id);
+        query =
+          "clientId" in match
+            ? query.where("client_id", "=", match.clientId)
+            : query.where("account_id", "=", match.accountId);
+        const r = await query.returningAll().executeTakeFirst();
+        return r ? toOAuthGrant(r) : null;
+      },
+      async deleteGrantsForAccount(accountId) {
+        // Two statements, each idempotent; they share no invariant.
+        const rows = await db
+          .deleteFrom("identkit_oauth_grants")
+          .where("account_id", "=", accountId)
+          .returningAll()
+          .execute();
+        await db.deleteFrom("identkit_oauth_codes").where("account_id", "=", accountId).execute();
+        return rows.map(toOAuthGrant);
+      },
+      async listGrants(accountId, at) {
+        const rows = await db
+          .selectFrom("identkit_oauth_grants")
+          .selectAll()
+          .where("account_id", "=", accountId)
+          .where("expires_at", ">", at)
+          .orderBy("created_at")
+          .orderBy("id")
+          .execute();
+        return rows.map(toOAuthGrant);
+      },
+      async purge({ at, unusedBefore, idleBefore, windowBefore }) {
+        // Each statement is idempotent. A client delete re-checks in its own WHERE that the
+        // client holds no live grant and no live code, so a grant created meanwhile keeps it.
+        const grants = await db
+          .deleteFrom("identkit_oauth_grants")
+          .where("expires_at", "<=", at)
+          .returningAll()
+          .execute();
+        const codes = await db
+          .deleteFrom("identkit_oauth_codes")
+          .where("expires_at", "<=", at)
+          .executeTakeFirst();
+        const tokens = await db
+          .deleteFrom("identkit_oauth_access_tokens")
+          .where("expires_at", "<=", at)
+          .executeTakeFirst();
+        const deleteClients = (rule: "unused" | "idle") =>
+          db
+            .deleteFrom("identkit_oauth_clients as c")
+            .where((eb) =>
+              rule === "unused"
+                ? eb.and([eb("c.last_used_at", "is", null), eb("c.created_at", "<", unusedBefore)])
+                : eb.and([
+                    eb("c.last_used_at", "is not", null),
+                    eb("c.last_used_at", "<", idleBefore),
+                  ]),
+            )
+            .where((eb) =>
+              eb.not(
+                eb.exists(
+                  eb
+                    .selectFrom("identkit_oauth_grants as g")
+                    .select("g.id")
+                    .whereRef("g.client_id", "=", "c.id")
+                    .where("g.expires_at", ">", at),
+                ),
+              ),
+            )
+            .where((eb) =>
+              eb.not(
+                eb.exists(
+                  eb
+                    .selectFrom("identkit_oauth_codes as o")
+                    .select("o.digest")
+                    .whereRef("o.client_id", "=", "c.id")
+                    .where("o.expires_at", ">", at),
+                ),
+              ),
+            )
+            .returning("c.id")
+            .execute();
+        const unused = await deleteClients("unused");
+        const stale = await deleteClients("idle");
+        const windows = await db
+          .deleteFrom("identkit_oauth_registration_counts")
+          .where("window_start", "<", windowBefore)
+          .executeTakeFirst();
+        return {
+          clients: [
+            ...unused.map((r) => ({ id: r.id, reason: "unused" as const })),
+            ...stale.map((r) => ({ id: r.id, reason: "idle" as const })),
+          ],
+          grants: grants.map(toOAuthGrant),
+          codes: Number(codes.numDeletedRows),
+          accessTokens: Number(tokens.numDeletedRows),
+          registrationWindows: Number(windows.numDeletedRows),
+        };
       },
     },
   };
