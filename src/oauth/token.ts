@@ -487,6 +487,8 @@ export function createTokenEndpoint(internals: OAuthInternals) {
     ) {
       const ended = await store.deleteGrant(grant.id, { clientId: client.id });
       if (ended) await grantEnded(ended, "expired");
+      // A concurrent call ended it first; record the attempt all the same.
+      else await failed(client, "refresh_unknown");
       return invalidGrant("The refresh token has expired.");
     }
     if (lookup.accountStatus !== "active") {

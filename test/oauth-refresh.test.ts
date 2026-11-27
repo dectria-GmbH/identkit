@@ -163,6 +163,18 @@ describe("oauth refresh", () => {
     expect(audit.ofType("oauth.grant_ended")).toEqual([]);
   });
 
+  it("records refresh_unknown when an expired token's grant was already ended", async () => {
+    const { client, refreshToken, audit, store, clock } = await connected();
+    clock.advanceSeconds(30 * 86_400);
+    const oauthStore = store.oauth;
+    if (!oauthStore) throw new Error("no oauth store");
+    // A concurrent call ends the grant between the read and the delete (review a2 r2 N-d).
+    oauthStore.deleteGrant = () => Promise.resolve(null);
+    expect((await client.refresh(refreshToken)).body?.["error"]).toBe("invalid_grant");
+    expect(audit.ofType("oauth.token_failed").map((e) => e.reason)).toEqual(["refresh_unknown"]);
+    expect(audit.ofType("oauth.grant_ended")).toEqual([]);
+  });
+
   it("refuses a malformed or unknown refresh token without ending anything", async () => {
     const { ik, client, accountId, audit } = await connected();
     for (const token of ["garbage", `ikrt_${"a".repeat(22)}.${"b".repeat(43)}`]) {
