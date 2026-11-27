@@ -131,19 +131,45 @@ export type HashName = "SHA-1" | "SHA-256" | "SHA-512";
 /** A Web Crypto key, named without the DOM library or `node:crypto` types. */
 export type WebCryptoKey = Awaited<ReturnType<typeof crypto.subtle.importKey>>;
 
-/** Imports raw bytes as a non-extractable HMAC signing key. The bytes are copied. */
+/**
+ * Imports raw bytes as a non-extractable HMAC signing key. Web Crypto copies the bytes, so
+ * this makes no copy of its own; the caller wipes `key` when it no longer needs it.
+ */
 export function importHmacKey(key: Uint8Array, hash: HashName): Promise<WebCryptoKey> {
-  return crypto.subtle.importKey("raw", new Uint8Array(key), { name: "HMAC", hash }, false, [
-    "sign",
-  ]);
+  return crypto.subtle.importKey("raw", key, { name: "HMAC", hash }, false, ["sign"]);
+}
+
+/**
+ * Returns a function that imports `bytes` as a key on its first call and returns that key
+ * after. When the import succeeds, `bytes` is wiped, so the raw key does not stay in memory
+ * next to the key object. When it fails, the next call tries again.
+ */
+export function lazyKey(
+  bytes: Uint8Array,
+  importKey: (bytes: Uint8Array) => Promise<WebCryptoKey>,
+): () => Promise<WebCryptoKey> {
+  let pending: Promise<WebCryptoKey> | undefined;
+  return () => {
+    pending ??= importKey(bytes).then(
+      (key) => {
+        bytes.fill(0);
+        return key;
+      },
+      (error: unknown) => {
+        pending = undefined;
+        throw error;
+      },
+    );
+    return pending;
+  };
 }
 
 /** HMAC of `data` with an imported key. */
 export async function hmac(key: WebCryptoKey, data: Uint8Array): Promise<Uint8Array<ArrayBuffer>> {
-  return new Uint8Array(await crypto.subtle.sign("HMAC", key, new Uint8Array(data)));
+  return new Uint8Array(await crypto.subtle.sign("HMAC", key, data));
 }
 
 /** SHA-256 of `data`. */
 export async function sha256(data: Uint8Array): Promise<Uint8Array<ArrayBuffer>> {
-  return new Uint8Array(await crypto.subtle.digest("SHA-256", new Uint8Array(data)));
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", data));
 }

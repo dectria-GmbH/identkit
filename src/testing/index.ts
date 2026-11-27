@@ -10,6 +10,7 @@ import {
 } from "../bytes.js";
 import { addSeconds, type Clock } from "../clock.js";
 import type { MailSender } from "../context.js";
+import { InvalidArgumentError } from "../errors.js";
 import type { IdentityVerificationAdapter, VendorResult } from "../identity-verification.js";
 import { nodeCrypto } from "../node-crypto.js";
 import { createAesGcmSealer, SealedSecretError, type SecretSealer } from "../sealer.js";
@@ -62,8 +63,15 @@ export function createTestSealer(): TestSealer {
   };
 }
 
+/** Decodes the base32 secret. An empty secret is refused: Web Crypto takes no empty key. */
+function totpSecret(input: TotpCodeInput): Uint8Array {
+  const secret = base32Decode(input.secret);
+  if (secret.byteLength === 0) throw new InvalidArgumentError("TOTP secret must not be empty");
+  return secret;
+}
+
 export interface TotpCodeInput {
-  /** The secret, base32, as the enrolment returns it. */
+  /** The secret, base32, as the enrolment returns it. An empty secret is refused. */
   secret: string;
   at: Date;
   algorithm?: TotpAlgorithm;
@@ -74,8 +82,8 @@ export interface TotpCodeInput {
  * Computes the TOTP code an authenticator app would show for a base32 secret at `at`, for
  * tests and demos.
  */
-export function generateTotpCodeAsync(input: TotpCodeInput): Promise<string> {
-  return totpAt(base32Decode(input.secret), input.at, input.algorithm ?? "SHA1", input.digits ?? 6);
+export async function generateTotpCodeAsync(input: TotpCodeInput): Promise<string> {
+  return totpAt(totpSecret(input), input.at, input.algorithm ?? "SHA1", input.digits ?? 6);
 }
 
 /**
@@ -89,10 +97,7 @@ export function generateTotpCode(input: TotpCodeInput): string {
   const algorithm = input.algorithm ?? "SHA1";
   const message = new Uint8Array(8);
   new DataView(message.buffer).setBigUint64(0, BigInt(timeStepAt(input.at)));
-  const mac = node
-    .createHmac(algorithm.toLowerCase(), base32Decode(input.secret))
-    .update(message)
-    .digest();
+  const mac = node.createHmac(algorithm.toLowerCase(), totpSecret(input)).update(message).digest();
   return truncateHotp(mac, input.digits ?? 6);
 }
 
@@ -165,7 +170,8 @@ export interface FakeIdentityVerificationOptions {
   personKey?: string | ((verificationId: string) => string);
   /**
    * Secret for the fake callback signature. Default: 32 random bytes per adapter, so no
-   * known value can sign a callback. `callbackFor` signs with the secret in use.
+   * known value can sign a callback. `callbackFor` signs with the secret in use. An empty
+   * secret throws `InvalidArgumentError`.
    */
   callbackSecret?: string;
 }
@@ -196,6 +202,9 @@ export interface FakeIdentityVerificationAdapter extends IdentityVerificationAda
 export function createFakeIdentityVerificationAdapter(
   options: FakeIdentityVerificationOptions,
 ): FakeIdentityVerificationAdapter {
+  if (options.callbackSecret === "") {
+    throw new InvalidArgumentError("callbackSecret must not be empty");
+  }
   const secret = options.callbackSecret ?? toBase64Url(randomBytes(32));
   const state = new Map<string, { outcome: FakeOutcome; personKey: string }>();
   let counter = 0;

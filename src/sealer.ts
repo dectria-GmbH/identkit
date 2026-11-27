@@ -1,6 +1,7 @@
 import {
   concatBytes,
   fromBase64Url,
+  lazyKey,
   randomBytes,
   toBase64Url,
   utf8,
@@ -85,18 +86,17 @@ export function createAesGcmSealer(options: AesGcmSealerOptions): SecretSealer {
   const activeKeyId = options.activeKeyId;
 
   // Keys are imported on first use, not here: some runtimes allow no crypto work while a
-  // module is loading. Imported keys are not extractable.
-  const imported = new Map<string, Promise<WebCryptoKey>>();
-  const cryptoKey = (id: string): Promise<WebCryptoKey> | undefined => {
-    let key = imported.get(id);
-    if (!key) {
-      const bytes = keyBytes.get(id);
-      if (!bytes) return undefined;
-      key = crypto.subtle.importKey("raw", bytes, "AES-GCM", false, ["encrypt", "decrypt"]);
-      imported.set(id, key);
-    }
-    return key;
-  };
+  // module is loading. Imported keys are not extractable; the raw copies are wiped after import.
+  const cryptoKeys = new Map<string, () => Promise<WebCryptoKey>>();
+  for (const [id, bytes] of keyBytes) {
+    cryptoKeys.set(
+      id,
+      lazyKey(bytes, (raw) =>
+        crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]),
+      ),
+    );
+  }
+  const cryptoKey = (id: string) => cryptoKeys.get(id)?.();
 
   return {
     async seal(plaintext, context) {

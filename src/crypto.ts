@@ -2,12 +2,12 @@ import {
   bytesEqual,
   hmac,
   importHmacKey,
+  lazyKey,
   randomBytes,
   randomInt,
   toBase64Url,
   toHex,
   utf8,
-  type WebCryptoKey,
 } from "./bytes.js";
 
 /**
@@ -42,14 +42,12 @@ export function createHmacHasher(key: Uint8Array): SecretHasher {
     throw new RangeError(`hash key must have at least ${MIN_HASH_KEY_BYTES} bytes`);
   }
   // Copy now, so a later change to `key` has no effect. The key is imported on the first
-  // digest, not here: some runtimes allow no crypto work while a module is loading.
-  const keyCopy = new Uint8Array(key);
-  let imported: Promise<WebCryptoKey> | undefined;
+  // digest, not here: some runtimes allow no crypto work while a module is loading. The copy
+  // is wiped once the import succeeds.
+  const hmacKey = lazyKey(new Uint8Array(key), (bytes) => importHmacKey(bytes, "SHA-256"));
   return {
-    digest: async (purpose, value) => {
-      imported ??= importHmacKey(keyCopy, "SHA-256");
-      return toHex(await hmac(await imported, utf8(`${purpose}\u0000${value}`)));
-    },
+    digest: async (purpose, value) =>
+      toHex(await hmac(await hmacKey(), utf8(`${purpose}\u0000${value}`))),
   };
 }
 
