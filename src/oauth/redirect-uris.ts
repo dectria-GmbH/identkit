@@ -2,7 +2,7 @@
  * Rules for redirect URIs: what a registration may name, and which requested URI matches a
  * registered one. The registered string must equal its normalized form, so a URI that two
  * parsers could read differently (case, encoding, dot segments, default ports, Unicode hosts)
- * never gets in.
+ * never gets in. Punycode hosts (a label that starts with `xn--`) are refused too.
  */
 
 /** Visible ASCII only: no white space, no control characters, no Unicode. */
@@ -52,8 +52,14 @@ export function parseRedirectUri(raw: unknown, rules: RedirectUriRules): URL | n
     if (url.hostname === "") return null;
     const ipv6 = rules.allowIpv6Loopback && url.hostname === "[::1]";
     if (!ipv6 && !HOST.test(url.hostname)) return null;
-    // A host of dots only, or with an empty label, is no host.
-    if (!ipv6 && url.hostname.split(".").some((label) => label === "")) return null;
+    // A host of dots only, or with an empty label, is no host. A punycode label (`xn--`) can
+    // spell a host that looks like another one (homograph), so it is refused.
+    if (
+      !ipv6 &&
+      url.hostname.split(".").some((label) => label === "" || label.startsWith("xn--"))
+    ) {
+      return null;
+    }
     if (url.protocol === "http:" && !isLoopbackHost(url.hostname, rules)) return null;
     return url;
   }

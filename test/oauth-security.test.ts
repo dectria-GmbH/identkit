@@ -225,6 +225,10 @@ describe("oauth security review list", () => {
       "https://exa_mple.com/cb",
       "https://exämple.com/cb",
       "https://[2001:db8::1]/cb",
+      // Punycode labels: a homograph can hide behind the ASCII form.
+      "https://xn--e1afmkfd.xn--p1ai/cb",
+      "https://app.xn--exmple-cua.com/cb",
+      "https://example.xn--p1ai/cb",
     ];
     for (const uri of refused) {
       const result = await registerWith(ik, [uri]);
@@ -242,6 +246,8 @@ describe("oauth security review list", () => {
       "http://127.0.0.1/cb",
       "http://127.0.0.1:33418/callback",
       "http://localhost:5000/cb",
+      "https://xn.example.com/cb",
+      "https://a-xn--b.example.com/cb",
     ];
     for (const uri of accepted) {
       expect({ uri, status: (await registerWith(ik, [uri])).httpStatus }).toEqual({
