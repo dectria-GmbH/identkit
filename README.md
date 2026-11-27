@@ -354,7 +354,9 @@ Sessions:
   identkit sessions stay revoked and the audit events are written, unless `auditError` is set
   (see below). Some calls cannot be repeated (a finished
   passkey registration or TOTP enrolment, a `totp.remove` whose factor is gone), so re-run the
-  hook with `sessions.revokeAll(error.accountId, error.revokeAllOptions)`.
+  hook with `sessions.revokeAll(error.accountId, error.revokeAllOptions)`. One exception: if
+  the error's `tokenRevocationError` is set (only `accounts.disable` sets it), call
+  `accounts.disable` again instead; it also runs the hook again (see "Personal API tokens").
   `revokeAll` is idempotent and calls the hook also when no session was live. Make the hook
   idempotent too. On such a re-run `revokedSessionIds` is empty, because the sessions are already
   revoked: do not depend on it to find the sessions to end.
@@ -426,15 +428,19 @@ Passkeys:
   `OperationRolledBackError`). A crash in between leaves an unusable pending row.
 - If the store fails on both deletes of that passkey, identkit tries twice to disable the
   account, ends all its sessions and throws: the passkey may still be active without a valid
-  grant. The audit event `passkey.registration_failed` says `cleanup_failed_account_disabled`
-  (with an `account.disabled` event) or, if the disable failed too,
-  `cleanup_failed_disable_failed`. In the second case the account stays active and the passkey
-  can sign in; `finishRegistration` then throws `PasskeyCleanupError`, which names the account
-  and the credential, so your code learns it also when the audit sink was down. In both cases
-  an operator first removes the passkey with `passkeys.revoke(accountId, credentialId)` (the
+  grant. The disable, as `accounts.disable`, also revokes the account's API tokens. The audit
+  event `passkey.registration_failed` says `cleanup_failed_account_disabled` (with an
+  `account.disabled` event and an `api_token.revoked` event per token) or, if the disable
+  failed too, `cleanup_failed_disable_failed`. In the second case the account may still be
+  active, so the passkey can sign in, or its API tokens may not be revoked;
+  `finishRegistration` then throws `PasskeyCleanupError`, which names the account and the
+  credential, so your code learns it also when the audit sink was down. In both cases an
+  operator first removes the passkey with `passkeys.revoke(accountId, credentialId)` (the
   credential id is in the error, or in `passkeys.list(accountId)`) and only then enables the
   account again in the store; identkit has no call to enable an account. Enabling it first
-  brings the passkey back into use.
+  brings the passkey back into use. After `cleanup_failed_disable_failed`, the operator also
+  calls `accounts.disable(accountId)` until it succeeds before the account is enabled again;
+  otherwise its API tokens can come back into use.
 - A registration that is already running is cancelled only by revocation, not by a token
   rotation: `rotate` and step-ups keep the session, so a registration started before them
   completes. Use `sessions.revokeById` or `revokeAll` to cut off a stolen session.
@@ -464,11 +470,15 @@ TOTP:
   and then lost its reply. If the store fails on every delete (two tries, then a delete of all
   the account's factors), identkit tries twice to disable the account, ends all its sessions
   and throws: the factor may still be active, and someone without the grant may know its
-  secret. The audit event `totp.enrolment_failed` says `cleanup_failed_account_disabled`
-  (with an `account.disabled` event) or, if the disable failed too,
-  `cleanup_failed_disable_failed`. On the error paths no grant may have been lost; the account
-  is disabled all the same. An operator removes the factor with `totp.revoke(accountId)` and
-  enables the account again in the store; identkit has no call to enable an account.
+  secret. The disable, as `accounts.disable`, also revokes the account's API tokens. The audit
+  event `totp.enrolment_failed` says `cleanup_failed_account_disabled` (with an
+  `account.disabled` event and an `api_token.revoked` event per token) or, if the disable failed
+  too, `cleanup_failed_disable_failed`: the account may still be active, or its API tokens may
+  not be revoked. On the error paths no grant may have been lost; the account is disabled all
+  the same. An operator removes the factor with `totp.revoke(accountId)` and enables the account
+  again in the store; identkit has no call to enable an account. After
+  `cleanup_failed_disable_failed`, the operator first calls `accounts.disable(accountId)` until
+  it succeeds; otherwise the account's API tokens can come back into use.
 - A code is accepted within `driftSteps` time steps on either side of the current one. All
   candidates are computed and compared in constant time.
 - Replay: the store keeps the latest accepted time step per factor and accepts a step only if
@@ -877,17 +887,29 @@ Accounts and sessions:
   whose account is not active, also one that a parallel `create` stored after the revocation.
   If the token revocation throws (for example on a schema without the token table),
   `accounts.disable` still revokes the sessions, offers its events to the sink and runs
-  `onAllSessionsRevoked`. Then it throws the store's error, unless the hook or the sink failed
-  too: the hook's `AllSessionsRevokedHookError` wins, then the sink's error, because a failed
-  hook leaves your application's sessions live and a refused event is lost, while the tokens
-  stay unusable. The thrown error then carries the store's error as `tokenRevocationError` (a
-  field of `AllSessionsRevokedHookError`; on a sink error, a property identkit sets if the error
-  is an object). The writes stand; call `accounts.disable` again once the store works. That call
-  revokes the remaining tokens, records their `api_token.revoked` events and runs the hook again.
-  It does not record `account.disabled` or `session.revoked` again, also not when the sink
-  refused them the first time.
+  `onAllSessionsRevoked`. The error that goes up, in this order:
+  - If the session revocation throws, its error goes up. The hook has not run, and the token
+    store's error is dropped.
+  - Else, if the hook throws, its `AllSessionsRevokedHookError` goes up. If the token
+    revocation failed too, the error carries the store's error as `tokenRevocationError`, and
+    its message says to call `accounts.disable` again and includes the store error's message.
+    An `Error` in that field serializes to `{}` in JSON, so log the message.
+  - Else, if the sink refused an event, the sink's error goes up unchanged, and the token
+    store's error is dropped.
+  - Else the token store's error goes up.
+
+  A failed hook leaves your application's sessions live, and a refused event is lost for good.
+  The tokens stay unusable while the account is disabled, but they are not revoked. So after
+  any error from `accounts.disable`, call it again until it succeeds. Until then the account's
+  API tokens may not be revoked, and enabling the account again directly in the store brings
+  them back. The retry repeats every step: it reports a token store error that persists,
+  revokes the remaining tokens, records their `api_token.revoked` events and runs the hook
+  again. It does not record `account.disabled` or `session.revoked` again, also not when the
+  sink refused them the first time.
+
 - Tokens are separate from sessions. `sessions.revokeAll`, a passkey or TOTP change and
-  `oidc.removeLink` do not revoke tokens, and `onAllSessionsRevoked` is not called for tokens.
+  `oidc.removeLink` do not revoke tokens (except a passkey or TOTP cleanup that disables the
+  account, see "Passkeys" and "TOTP"), and `onAllSessionsRevoked` is not called for tokens.
   Call `apiTokens.revokeAll(accountId)` where a sign-out everywhere must also end tokens, for
   example after an account takeover.
 - Every call except `verify` takes a bare account id and trusts its caller. Check the person
@@ -936,6 +958,9 @@ Import:
   `limit_reached`, `no_account` or `account_disabled`. Imports count against
   `maxActiveTokensPerAccount`; raise it for the migration if accounts hold more tokens.
 - Imported tokens must have the configured format, or they never verify.
+- `name` follows the rules of `create`. A source token whose name is blank after the check for
+  blank characters (for example only spaces or Hangul fillers) fails to import with
+  `InvalidArgumentError`; give it a name first.
 - A legacy digest is weaker than the HMAC: whoever can read the table can test guesses offline
   without a key. With 256-bit random tokens that is no practical attack, but a token from an
   earlier system may have less entropy than its format suggests. Rotate legacy tokens out:
