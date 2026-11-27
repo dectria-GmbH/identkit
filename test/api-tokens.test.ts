@@ -1073,26 +1073,85 @@ describe("api tokens: accounts.disable without a working token store", () => {
     expect(t.audit.ofType("session.revoked")).toHaveLength(1);
   });
 
-  it("rule: a refused audit event wins over the token store error, which it carries", async () => {
+  it("rule: a refused audit event wins over the token store error; the retry shows and fixes it", async () => {
     for (const type of ["account.disabled", "session.revoked"] as const) {
       const { store, broken } = brokenTokenStore();
       let hookRuns = 0;
-      const t = setup({ store, onAllSessionsRevoked: () => void (hookRuns += 1) });
+      const t = setup({
+        store,
+        apiTokens: baseOptions,
+        onAllSessionsRevoked: () => void (hookRuns += 1),
+      });
       const accountId = (await t.signIn(`sink-${type}@example.org`)).account.id;
+      const created = await t.ik.apiTokens.create({
+        accountId,
+        name: "ci",
+        scopes: ["read:items"],
+        expiresInDays: 30,
+      });
+      if (created.status !== "created") throw new Error(created.status);
       failSink(t.audit, type);
       const error = await rejection(t.ik.accounts.disable(accountId));
       // Review r2 L1: the token error went up and the refused event went unnoticed.
       expect(error, type).toEqual(new Error("sink down"));
-      expect((error as { tokenRevocationError?: unknown }).tokenRevocationError, type).toEqual(
-        new Error("no such table: identkit_api_tokens"),
-      );
+      // Review r3 N1: identkit does not change the sink's error object.
+      expect(Object.getOwnPropertyNames(error), type).not.toContain("tokenRevocationError");
       expect(hookRuns, type).toBe(1);
-      // A retry once the store works runs the hook again, but cannot record the lost event.
+      // The retry, while the store still fails, reports the token store error.
+      await expect(t.ik.accounts.disable(accountId), type).rejects.toThrow(
+        "no such table: identkit_api_tokens",
+      );
+      // Once the store works, the retry revokes the token and runs the hook again, but cannot
+      // record the lost event.
       broken.on = false;
       await t.ik.accounts.disable(accountId);
-      expect(hookRuns, type).toBe(2);
+      expect(hookRuns, type).toBe(3);
       expect(t.audit.ofType(type), type).toHaveLength(0);
+      await store.accounts.setStatus(accountId, "active");
+      expect(await t.ik.apiTokens.verify(created.token), type).toEqual({
+        status: "refused",
+        reason: "revoked",
+      });
     }
+  });
+
+  it("rule: a hook error with a token store error names accounts.disable as the retry", async () => {
+    const { store, broken } = brokenTokenStore();
+    const t = setup({
+      store,
+      apiTokens: baseOptions,
+      onAllSessionsRevoked: () => {
+        throw new Error("hook down");
+      },
+    });
+    const accountId = (await t.signIn("retry@example.org")).account.id;
+    const created = await t.ik.apiTokens.create({
+      accountId,
+      name: "ci",
+      scopes: ["read:items"],
+      expiresInDays: 30,
+    });
+    if (created.status !== "created") throw new Error(created.status);
+    const error = await rejection(t.ik.accounts.disable(accountId));
+    expect(error).toBeInstanceOf(AllSessionsRevokedHookError);
+    // Review r3 L1: the message said "call sessions.revokeAll again", which leaves the token
+    // live, and the token store error serialized to {}.
+    const { message } = error as Error;
+    expect(message).toContain("call accounts.disable again");
+    expect(message).toContain("no such table: identkit_api_tokens");
+    expect(message).not.toContain("sessions.revokeAll");
+    expect(message).not.toContain(created.token);
+    // Without a token store error the message stays as it was.
+    broken.on = false;
+    const plain = await rejection(t.ik.accounts.disable(accountId));
+    expect((plain as Error).message).toBe(
+      "onAllSessionsRevoked failed after the revocation; call sessions.revokeAll again",
+    );
+    await store.accounts.setStatus(accountId, "active");
+    expect(await t.ik.apiTokens.verify(created.token)).toEqual({
+      status: "refused",
+      reason: "revoked",
+    });
   });
 
   it("rule: hook, sink and token store all fail: the hook error carries both others", async () => {

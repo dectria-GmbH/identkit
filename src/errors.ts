@@ -10,6 +10,15 @@ export class IdentkitError extends Error {
   }
 }
 
+/** The message of an error for another error's message; never throws. */
+function messageOf(error: unknown): string {
+  try {
+    return error instanceof Error ? error.message : String(error);
+  } catch {
+    return "unknown error";
+  }
+}
+
 /**
  * The operator policy does not allow this method for this call. The decision depends only
  * on the policy, never on the account or the address.
@@ -81,8 +90,11 @@ export class AllSessionsRevokedHookError extends IdentkitError {
   /**
    * Set only by `accounts.disable`: the store's error on the revocation of the account's API
    * tokens, else undefined. The hook error wins over it, because only the hook leaves something
-   * live (`verify` refuses tokens of a disabled account). Call `accounts.disable` again to
-   * revoke the tokens.
+   * live now (`verify` refuses tokens of a disabled account). But the tokens are not revoked:
+   * call `accounts.disable` again, which also re-runs the hook. Until that call succeeds,
+   * enabling the account again in the store brings the tokens back. The message then names
+   * this call and includes the store error's message, because an `Error` in this field
+   * serializes to `{}` in JSON.
    */
   readonly tokenRevocationError: unknown;
 
@@ -94,7 +106,10 @@ export class AllSessionsRevokedHookError extends IdentkitError {
   ) {
     super(
       "all_sessions_revoked_hook_failed",
-      "onAllSessionsRevoked failed after the revocation; call sessions.revokeAll again",
+      options?.tokenRevocationError === undefined
+        ? "onAllSessionsRevoked failed after the revocation; call sessions.revokeAll again"
+        : "onAllSessionsRevoked failed after the revocation, and the revocation of the API " +
+            `tokens failed (${messageOf(options.tokenRevocationError)}); call accounts.disable again`,
       options,
     );
     this.revokeAllOptions = exceptSessionId === null ? {} : { exceptSessionId };

@@ -174,9 +174,10 @@ export function createAccounts(
       // hook leaves something live, and a refused event is lost for good: a retry of `disable`
       // repeats the token revocation, its `api_token.revoked` events and the hook, but records
       // neither `account.disabled` (the account is disabled already) nor `session.revoked` (the
-      // sessions are revoked already). A failed token revocation is safe, because `verify`
-      // refuses tokens of a disabled account; the thrown error carries it as
-      // `tokenRevocationError`.
+      // sessions are revoked already). The tokens stay unusable while the account is disabled,
+      // but a retry is the only call that revokes them. The hook's error carries the token
+      // store's error as `tokenRevocationError`; the sink's error is not changed, so after it
+      // the token store's error shows only on the retry.
       const finished = finishThenRunHook(revoked, async () => {
         let failure: { error: unknown } | null = null;
         try {
@@ -195,32 +196,14 @@ export function createAccounts(
       try {
         await finished;
       } catch (error) {
-        throw withTokenRevocationError(error, tokenFailure.error);
+        if (!(error instanceof AllSessionsRevokedHookError)) throw error;
+        throw new AllSessionsRevokedHookError(error.accountId, error.exceptSessionId, {
+          cause: error.cause,
+          auditError: error.auditError,
+          tokenRevocationError: tokenFailure.error,
+        });
       }
       throw tokenFailure.error;
     },
   };
-}
-
-/**
- * Attaches the token store's error to the error that `disable` throws instead of it: the hook's
- * `AllSessionsRevokedHookError` (as a field), or the audit sink's error (as a property set on
- * the error object, if it is an object that takes one).
- */
-function withTokenRevocationError(error: unknown, tokenRevocationError: unknown): unknown {
-  if (error instanceof AllSessionsRevokedHookError) {
-    return new AllSessionsRevokedHookError(error.accountId, error.exceptSessionId, {
-      cause: error.cause,
-      auditError: error.auditError,
-      tokenRevocationError,
-    });
-  }
-  if (typeof error === "object" && error !== null && Object.isExtensible(error)) {
-    Object.defineProperty(error, "tokenRevocationError", {
-      value: tokenRevocationError,
-      configurable: true,
-      writable: true,
-    });
-  }
-  return error;
 }

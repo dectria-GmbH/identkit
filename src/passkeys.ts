@@ -6,6 +6,7 @@ import { assertMethodAllowed } from "./email-otp.js";
 import { PasskeyCleanupError } from "./errors.js";
 import type { PasskeyCore } from "./passkey-core.js";
 import { toAccountView, type AccountView } from "./accounts.js";
+import { emitApiTokensRevoked, revokeAllApiTokens } from "./api-tokens.js";
 import {
   finishRollback,
   finishThenRunHook,
@@ -349,12 +350,18 @@ export function createPasskeys(
       // Async, so a store that throws synchronously still gets the retry below.
       const remove = async () =>
         store.credentials.delete(verified.credentialId, account.id, verified.publicKey);
-      const disable = async () => store.accounts.setStatus(account.id, "disabled");
+      // As `accounts.disable`: the status, then the account's API tokens, whose ids it returns.
+      // A token store error counts as a failed disable: an operator who enables the account
+      // again must know that its tokens may still be live.
+      const disable = async () => {
+        await store.accounts.setStatus(account.id, "disabled");
+        return revokeAllApiTokens(ctx, account.id, "account_disabled");
+      };
       // Removes the passkey and revokes every session of the account. Returns the revocation, or
       // null and the store's error if the revocation failed, for `finishRollback`. If the passkey
       // cannot be removed, the rollback is incomplete: `undo` disables the account, runs the hook
-      // best effort and throws the delete's error, or `PasskeyCleanupError` if the account is
-      // still active.
+      // best effort and throws the delete's error, or `PasskeyCleanupError` if the disable
+      // failed.
       const undo = async () => {
         let cleanupFailure: { error: unknown } | null = null;
         try {
@@ -363,12 +370,10 @@ export function createPasskeys(
         } catch (error) {
           // The passkey may still be active without a valid grant: fail closed and disable the
           // account until an operator looks at it, as the TOTP enrolment does.
-          const disabled = await disable()
+          const tokenIds = await disable()
             .catch(disable)
-            .then(
-              () => true,
-              () => false,
-            );
+            .catch(() => null);
+          const disabled = tokenIds !== null;
           await ctx
             .emit({
               type: "passkey.registration_failed",
@@ -382,6 +387,9 @@ export function createPasskeys(
             await ctx
               .emit({ type: "account.disabled", accountId: account.id, reason: "passkey_cleanup" })
               .catch(() => undefined);
+            await emitApiTokensRevoked(ctx, account.id, tokenIds, "account_disabled").catch(
+              () => undefined,
+            );
           }
           // The audit event above is best effort. If the account is still active, the caller
           // must learn that a passkey without a grant may sign in.
