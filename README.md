@@ -1305,9 +1305,11 @@ refreshedAt?, refreshExpiresAt, refreshSha256 })` keeps the grant id, because th
   transaction as the delete. A later import of that id answers `revoked`, so an ended grant
   never comes back with the earlier system's refresh token, which a thief may hold. A delete of
   rows directly in the database writes no tombstone. A rolled-back import (a refused audit event)
-  writes none either, so the retry imports. A grant that a concurrent call imported for a client
-  whose own import then rolls back did happen: it ends with the client, keeps its tombstone and
-  gets `oauth.grant_ended` (reason `client_deleted`). Import the clients first, then the grants,
+  writes none either, so the retry imports. A grant on a client whose own import rolls back ends
+  with the client. This holds for an imported grant and for one created in the meantime. It gets
+  `oauth.grant_ended` (reason `client_deleted`, best effort). An imported grant also keeps its
+  tombstone. If its own import rolls back at the same time (for example the audit sink refuses
+  its event), the retry of the grant import answers `revoked`. Import the clients first, then the grants,
   one call at a time. identkit never deletes tombstones in this release; the rows are small.
 - Run the import before the switch. A re-run is safe: it answers `already_imported` for what
   stands, `revoked` for what ended since, and imports only what is new.
