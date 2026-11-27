@@ -22,6 +22,7 @@ import {
   createFakeClock,
   createFakeIdentityVerificationAdapter,
   createFakeOidcProvider,
+  createOAuthTestClient,
   createRecordingAuditSink,
   createRecordingMailSender,
   createTestSealer,
@@ -31,6 +32,7 @@ import {
   APPROVAL_CHALLENGES,
   DIGESTS,
   HASH_KEY_HEX,
+  LATER_DIGESTS,
   PAYLOAD_HASHES,
   SEAL_KEY_K1_HEX,
   SEAL_KEY_OLD_HEX,
@@ -38,6 +40,7 @@ import {
 } from "../compat-vectors.ts";
 import {
   API_TOKENS,
+  OAUTH,
   basePolicy,
   config,
   OIDC_CLIENT,
@@ -73,6 +76,7 @@ function setup(store = createMemoryStore()) {
     clock,
     policy: () => policy.current,
     apiTokens: API_TOKENS,
+    oauth: OAUTH,
   });
   async function signIn(email) {
     const requested = await ik.emailSignIn.requestCode({ email });
@@ -123,7 +127,7 @@ const checks = {
 
   async hasherDigests() {
     const hasher = createHmacHasher(hex(HASH_KEY_HEX));
-    for (const [purpose, value, digest] of DIGESTS) {
+    for (const [purpose, value, digest] of [...DIGESTS, ...LATER_DIGESTS]) {
       check((await hasher.digest(purpose, value)) === digest, `digest ${purpose} ${value}`);
     }
   },
@@ -322,6 +326,40 @@ const checks = {
       );
       const refused = await t.ik.apiTokens.verify(created.token);
       check(refused.reason === "revoked", `after revoke: ${refused.status}`);
+    }
+  },
+
+  async oauthFlow(env) {
+    await migrateIdentkitD1(env.DB);
+    for (const store of [createMemoryStore(), createD1Store(env.DB)]) {
+      const t = setup(store);
+      const account = await t.ik.accounts.create({
+        email: `oauth-${crypto.randomUUID()}@example.org`,
+      });
+      check(account.status === "created", `account: ${account.status}`);
+      const accountId = account.account.id;
+      const metadata = t.ik.oauth.metadata.authorizationServer();
+      check(metadata.issuer === ORIGIN, "metadata issuer");
+      const client = await createOAuthTestClient(t.ik.oauth, { authMethod: "client_secret_basic" });
+      const connected = await client.connect(accountId, { optInScopes: ["mcp:events"] });
+      check(/^ikat_[A-Za-z0-9_-]{43}$/.test(connected.accessToken), "access token format");
+      const token = parseBearerToken(`Bearer ${connected.accessToken}`);
+      const valid = await t.ik.oauth.validateAccessToken(token, { resource: `${ORIGIN}/mcp` });
+      check(valid.status === "valid", `validate: ${valid.status} ${valid.reason}`);
+      check(valid.scopes.join(" ") === "mcp:read mcp:events", `scopes: ${valid.scopes}`);
+      const refreshed = await client.refresh(connected.refreshToken ?? "");
+      check(refreshed.httpStatus === 200, `refresh: ${JSON.stringify(refreshed.body)}`);
+      const reused = await client.refresh(connected.refreshToken ?? "");
+      check(reused.body?.error === "invalid_grant", "previous refresh token refused");
+      const revoked = await client.revoke(String(refreshed.body?.refresh_token));
+      check(revoked.httpStatus === 200, "revoke");
+      const after = await t.ik.oauth.validateAccessToken(String(refreshed.body?.access_token));
+      check(after.reason === "unknown", `after revoke: ${after.status}`);
+      await client.connect(accountId);
+      await t.ik.accounts.disable(accountId);
+      check((await t.ik.oauth.listGrants(accountId)).length === 0, "disable ends grants");
+      const purged = await t.ik.oauth.purge();
+      check(typeof purged.accessTokens === "number", "purge");
     }
   },
 

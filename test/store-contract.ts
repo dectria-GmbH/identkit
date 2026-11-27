@@ -1114,6 +1114,10 @@ export function runStoreContract(
       );
       expect(consumed.filter((c) => c !== null)).toEqual([code]);
       expect(await oauth.consumeCode(code.digest)).toBeNull();
+      // The flag round-trips both ways (review a2 r2 N-a: every case used true).
+      const implicit = oauthCode(client.id, accountId, { redirectUriExplicit: false });
+      await oauth.insertCode(implicit);
+      expect(await oauth.consumeCode(implicit.digest)).toEqual(implicit);
 
       const grant = oauthGrant(accountId, client.id, { codeDigest: code.digest });
       const token = oauthAccessToken(grant.id);

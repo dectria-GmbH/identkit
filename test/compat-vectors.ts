@@ -158,6 +158,158 @@ export const DIGESTS: [string, string, string][] = [
   ],
 ];
 
+/**
+ * [purpose, value, digest] for createHmacHasher(HASH_KEY), for the purposes added after 0.1.1:
+ * personal API tokens and the OAuth server. Computed with node:crypto HMAC-SHA-256 over
+ * `${purpose}\u0000${value}` (the 0.1.1 rule, checked against DIGESTS above), not with identkit.
+ * Fixed from the release that adds them on; do not regenerate.
+ */
+export const LATER_DIGESTS: [string, string, string][] = [
+  ["api-token", "", "9c333fd3988877ce77c45a6850ef719c05b7825fe3cc542a10d0b3e79d7bab79"],
+  ["api-token", "123456", "81a4c3e5b31b683759b566175719e9c41911c155d63ff9fe509e099dd0b18855"],
+  [
+    "api-token",
+    "person@example.org",
+    "c6441c02622933982fa7c622f45bf3321eadaed9603dfdb8a6e1058ca99537e0",
+  ],
+  [
+    "api-token",
+    "Grüße 🔑 \u0000 end",
+    "a9d2469edd308ed349604a15e2bb3ad32de18f8ec6952c0e1e03a3ebfa7f2716",
+  ],
+  [
+    "api-token",
+    "lone \ud800 surrogate",
+    "58354516a4ef856a60f51a05282be451b89d0bd55f4cfc0228828def390935ca",
+  ],
+  ["oauth-client-secret", "", "368f1e46bf8c8bcb9f3f832cbea9e113403ac8d14bf29cf0507ec75eb7be6546"],
+  [
+    "oauth-client-secret",
+    "123456",
+    "eadb691c50631a2c1b051ec567a81075e0078239622f15c73e2630c1778ae59d",
+  ],
+  [
+    "oauth-client-secret",
+    "person@example.org",
+    "b41d62829952251d3b9bfd7eb9c4aa0a38203c207e62a2d5205e2f632353b63c",
+  ],
+  [
+    "oauth-client-secret",
+    "Grüße 🔑 \u0000 end",
+    "321330d403144cc84c5c47cd1c3af7faa597738278eb7397b57b4d40d703ff55",
+  ],
+  [
+    "oauth-client-secret",
+    "lone \ud800 surrogate",
+    "6b95ceac0ee0e0c7b6d15bad5d560d1e3e648e0cf27e2373d487fda49f3a0acf",
+  ],
+  ["oauth-code", "", "04f753cabbe492097e106c0e5bbc0a0019090d9333218344f0a5df9576c44a18"],
+  ["oauth-code", "123456", "ea9d80a40db0269dd91e5c3c6f97a68e35db2b2e66153dd4446b937c4bf96e60"],
+  [
+    "oauth-code",
+    "person@example.org",
+    "7788c4e9c80f92e11c7a4ff4229a87c7882730898473f75585eb4dad6251a66b",
+  ],
+  [
+    "oauth-code",
+    "Grüße 🔑 \u0000 end",
+    "1771775c1e613c69c72daa1b25adaf530d8cbe87308f0dd90f7efb0f7b1a89ef",
+  ],
+  [
+    "oauth-code",
+    "lone \ud800 surrogate",
+    "138e04fd71e24ef84f1bb0dcb6314b278ac01f355ed80e8a87f5a45e5bef3a81",
+  ],
+  ["oauth-access-token", "", "a52a465edf1796d32a079ebcf2000b3f556b416dca1e6821cd595fdc43e255c6"],
+  [
+    "oauth-access-token",
+    "123456",
+    "6f7b52a4b906d38ca4a5842ee17c79139b278eb7decca7f54ee18d00c627125d",
+  ],
+  [
+    "oauth-access-token",
+    "person@example.org",
+    "7d7d01ebbf3a091bc644d9295c8a2091a7f581e90c3cb2ad6799e03af0b7805b",
+  ],
+  [
+    "oauth-access-token",
+    "Grüße 🔑 \u0000 end",
+    "5b8477b6d0bfcbc51cf47cfd1c23ae2edeb6c1bd3f59f442f4465a34df298730",
+  ],
+  [
+    "oauth-access-token",
+    "lone \ud800 surrogate",
+    "26b891cfa2e57ff980ddbcbb499784c9f2f2fd3baad131adbf709fcd77175a47",
+  ],
+  ["oauth-refresh-ref", "", "00a04021ade002a13b9be29d144ce4cc2ec8edaa96cb93ea65f58a171eadb016"],
+  [
+    "oauth-refresh-ref",
+    "123456",
+    "b4b39229249f8e0a1471c9bc8cc68076e3d9c4947e9c046ca96b96dabca57573",
+  ],
+  [
+    "oauth-refresh-ref",
+    "person@example.org",
+    "40edc9e546dd4b8a835a34cb8ed17758ff7b0469791c05fa633b3673df7ce763",
+  ],
+  [
+    "oauth-refresh-ref",
+    "Grüße 🔑 \u0000 end",
+    "c5151d7f12a2d7ee708db880d94750adb0609fee50e44379e22e1fa1e84c402f",
+  ],
+  [
+    "oauth-refresh-ref",
+    "lone \ud800 surrogate",
+    "b51e93cf3311458f2354f02a278ffbbc13e5b84639282de9d3a6b6fc899821e9",
+  ],
+  ["oauth-refresh-token", "", "cea36010e9c7864bdd242fcc17ac56b1f16b67c55ccab3df365f09ad89262559"],
+  [
+    "oauth-refresh-token",
+    "123456",
+    "c75bb121e3f36e5268d863415f5098c20c425009acaaaa31fce92d1a3254a552",
+  ],
+  [
+    "oauth-refresh-token",
+    "person@example.org",
+    "1aa078d7d459daeae07953d909a2c4d609c7584a7114e5a82f2a3b7ce9260aa8",
+  ],
+  [
+    "oauth-refresh-token",
+    "Grüße 🔑 \u0000 end",
+    "ae3056799475181f7ceba556dcba270aecab6f1bc7954cbbb7e272e86f9cdcec",
+  ],
+  [
+    "oauth-refresh-token",
+    "lone \ud800 surrogate",
+    "82d73a69456822321f753d90e3cabf2c9e13f26e5e6e030e28578dc4539fddce",
+  ],
+  [
+    "oauth-registration-address",
+    "",
+    "5b0a1937c5a2da6ac7215277230428ad557135808b91d96a3aae898ce05a7403",
+  ],
+  [
+    "oauth-registration-address",
+    "123456",
+    "9c7901955f29a06b4b8a03a7b32ad43eee50180b3d2fabeab6014a9bb46103f5",
+  ],
+  [
+    "oauth-registration-address",
+    "person@example.org",
+    "996351e1a249c384850ca51df17cc035138ba62e74d2fc583879fabd3d8bf30f",
+  ],
+  [
+    "oauth-registration-address",
+    "Grüße 🔑 \u0000 end",
+    "36a18618a185874ac9b94eafce6405db1e47199ece14cb5c1c3446b5f706f245",
+  ],
+  [
+    "oauth-registration-address",
+    "lone \ud800 surrogate",
+    "055cdab2c8dbccab4b08f2566dfc3836c661c937c33a3a19d06f6d0200f35fa9",
+  ],
+];
+
 /** [plaintext hex, context, sealed] for createAesGcmSealer({ k1, old }). */
 export const SEALED: [string, string, string][] = [
   ["01", "ctx", "v1.k1.ORP7OaQPlp8L8gQ3.TA.9Ljx4_ecpg0gW_ZWPl_mWA"],

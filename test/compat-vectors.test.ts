@@ -17,6 +17,7 @@ import {
   SEAL_KEY_K1_HEX,
   SEAL_KEY_OLD_HEX,
   SEALED,
+  LATER_DIGESTS,
 } from "./compat-vectors.js";
 
 const hex = (text: string) => new Uint8Array(Buffer.from(text, "hex"));
@@ -35,6 +36,35 @@ describe("compatibility with values stored by identkit 0.1.1", () => {
         digest,
       );
     }
+  });
+
+  it("rule: digests of the purposes added later stay fixed, and every purpose has vectors", async () => {
+    const hasher = createHmacHasher(hex(HASH_KEY_HEX));
+    for (const [purpose, value, digest] of LATER_DIGESTS) {
+      expect(await hasher.digest(purpose as HashPurpose, value), `${purpose} ${value}`).toBe(
+        digest,
+      );
+    }
+    // Compile-time complete: a new HashPurpose fails here until it has vectors.
+    const purposes: Record<HashPurpose, true> = {
+      "otp-code": true,
+      address: true,
+      "session-token": true,
+      "webauthn-challenge": true,
+      "enrollment-token": true,
+      "person-key": true,
+      "approval-id": true,
+      "approval-evidence": true,
+      "api-token": true,
+      "oauth-client-secret": true,
+      "oauth-code": true,
+      "oauth-access-token": true,
+      "oauth-refresh-ref": true,
+      "oauth-refresh-token": true,
+      "oauth-registration-address": true,
+    };
+    const covered = new Set([...DIGESTS, ...LATER_DIGESTS].map(([purpose]) => purpose));
+    expect([...covered].toSorted()).toEqual(Object.keys(purposes).toSorted());
   });
 
   it("rule: values sealed by 0.1.1 still open, also with a rotated-out key", async () => {

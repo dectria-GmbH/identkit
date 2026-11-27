@@ -2,6 +2,7 @@
  * Races between a ceremony and a concurrent change (revocation, registration, store error).
  * A wrapped store runs the concurrent change at the exact point where it would hurt.
  */
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   createMemoryStore,
@@ -814,7 +815,19 @@ function hookedOAuthStore() {
     beforeConsume: (() => Promise<void>) | null;
     beforeRotate: (() => Promise<void>) | null;
     beforeInsertGrant: (() => Promise<void>) | null;
-  } = { beforeConsume: null, beforeRotate: null, beforeInsertGrant: null };
+    afterInsertGrant: (() => Promise<void>) | null;
+    beforeUpgradeSecret: (() => Promise<void>) | null;
+    beforeImportGrant: (() => Promise<void>) | null;
+    beforeInsertClient: (() => Promise<void>) | null;
+  } = {
+    beforeConsume: null,
+    beforeRotate: null,
+    beforeInsertGrant: null,
+    afterInsertGrant: null,
+    beforeUpgradeSecret: null,
+    beforeImportGrant: null,
+    beforeInsertClient: null,
+  };
   const once = async (name: keyof typeof hooks) => {
     const hook = hooks[name];
     hooks[name] = null;
@@ -834,7 +847,21 @@ function hookedOAuthStore() {
       },
       insertGrant: async (...args) => {
         await once("beforeInsertGrant");
-        return oauth.insertGrant(...args);
+        const result = await oauth.insertGrant(...args);
+        await once("afterInsertGrant");
+        return result;
+      },
+      upgradeClientSecret: async (...args) => {
+        await once("beforeUpgradeSecret");
+        return oauth.upgradeClientSecret(...args);
+      },
+      importGrant: async (...args) => {
+        await once("beforeImportGrant");
+        return oauth.importGrant(...args);
+      },
+      insertClient: async (...args) => {
+        await once("beforeInsertClient");
+        return oauth.insertClient(...args);
       },
     },
   };
@@ -915,5 +942,147 @@ describe("oauth races", () => {
       ),
     );
     expect(spread.filter((r) => r.httpStatus === 201)).toHaveLength(3);
+  });
+
+  it("a disable between the code and the grant insert leaves no grant", async () => {
+    const { store, hooks } = hookedOAuthStore();
+    const { ik, account } = oauthSetup({ store });
+    const client = await createOAuthTestClient(ik.oauth);
+    const accountId = await account();
+    const { code, verifier } = await client.authorize(accountId);
+    hooks.beforeInsertGrant = () => ik.accounts.disable(accountId);
+    expect((await client.exchange(code, verifier)).body?.["error"]).toBe("invalid_grant");
+    expect(await store.oauth?.listGrants(accountId, new Date(0))).toEqual([]);
+  });
+
+  it("a disable right after the grant insert ends the new grant; its tokens never work", async () => {
+    const { store, hooks } = hookedOAuthStore();
+    const { ik, account, audit } = oauthSetup({ store });
+    const client = await createOAuthTestClient(ik.oauth);
+    const accountId = await account();
+    const { code, verifier } = await client.authorize(accountId);
+    hooks.afterInsertGrant = () => ik.accounts.disable(accountId);
+    const result = await client.exchange(code, verifier);
+    // The exchange had won already, so it answers with tokens; the disable ended their grant.
+    expect(result.httpStatus).toBe(200);
+    const accessToken = String(result.body?.["access_token"]);
+    await store.accounts.setStatus(accountId, "active");
+    expect(await ik.oauth.validateAccessToken(accessToken)).toMatchObject({ reason: "unknown" });
+    expect(await ik.oauth.listGrants(accountId)).toEqual([]);
+    expect(audit.ofType("oauth.grant_ended").map((e) => e.reason)).toEqual(["account_disabled"]);
+  });
+
+  it("a client deleted mid-exchange: no grant survives, its tokens never work (review a2 r2 N-c)", async () => {
+    const { store, hooks } = hookedOAuthStore();
+    const { ik, account, audit } = oauthSetup({ store });
+    const client = await createOAuthTestClient(ik.oauth);
+    const accountId = await account();
+    const { code, verifier } = await client.authorize(accountId);
+    hooks.afterInsertGrant = async () => {
+      await ik.oauth.deleteClient(client.clientId);
+    };
+    const result = await client.exchange(code, verifier);
+    expect(result.httpStatus).toBe(200);
+    expect(await ik.oauth.validateAccessToken(String(result.body?.["access_token"]))).toMatchObject(
+      { reason: "unknown" },
+    );
+    expect(await ik.oauth.listGrants(accountId)).toEqual([]);
+    // The audit order is inverted: the end of the grant is recorded before its creation. Both
+    // records exist; the README names this order.
+    expect(
+      audit.events
+        .filter((e) => e.type === "oauth.grant_ended" || e.type === "oauth.grant_created")
+        .map((e) => e.type),
+    ).toEqual(["oauth.grant_ended", "oauth.grant_created"]);
+  });
+
+  it("a legacy secret upgrade that loses to a concurrent one still authenticates", async () => {
+    const { store, hooks } = hookedOAuthStore();
+    const { ik } = oauthSetup({ store, oauth: { acceptLegacyClientSecrets: true } });
+    const secretSha256 = createHash("sha256").update("old secret").digest("hex");
+    await ik.oauth.importClient({
+      id: "legacy-client",
+      redirectUris: ["http://127.0.0.1/callback"],
+      grantTypes: ["authorization_code"],
+      authMethod: "client_secret_post",
+      secretSha256,
+    });
+    const call = () =>
+      ik.oauth.token({
+        form: new URLSearchParams({
+          grant_type: "refresh_token",
+          refresh_token: "x",
+          client_id: "legacy-client",
+          client_secret: "old secret",
+        }),
+        authorization: null,
+      });
+    let concurrent: Awaited<ReturnType<typeof call>> | null = null;
+    hooks.beforeUpgradeSecret = async () => {
+      concurrent = await call();
+    };
+    const late = await call();
+    // Both authenticated (an unauthenticated call would answer 401, not invalid_grant).
+    expect(concurrent).toMatchObject({ httpStatus: 400 });
+    expect(late).toMatchObject({ httpStatus: 400 });
+    const stored = await store.oauth?.findClient("legacy-client");
+    expect(stored?.secretDigestAlgorithm).toBe("hmac-sha256");
+  });
+
+  it("a grant import that loses to a concurrent import of the same grant answers already_imported", async () => {
+    const { store, hooks } = hookedOAuthStore();
+    const { ik, account, clock, audit } = oauthSetup({ store });
+    const accountId = await account();
+    await ik.oauth.importClient({
+      id: "legacy-client",
+      redirectUris: ["http://127.0.0.1/callback"],
+      grantTypes: ["authorization_code", "refresh_token"],
+      authMethod: "none",
+    });
+    const now = clock.now().getTime();
+    const input = {
+      id: "legacy-grant",
+      accountId,
+      clientId: "legacy-client",
+      scopes: ["mcp:read"],
+      resource: "https://example.com/mcp",
+      createdAt: new Date(now - 1000),
+      expiresAt: new Date(now + 86_400_000),
+      generation: 1,
+      refreshExpiresAt: new Date(now + 86_400_000),
+      refreshSha256: "a".repeat(64),
+    };
+    let concurrent: Awaited<ReturnType<typeof ik.oauth.importGrant>> | null = null;
+    hooks.beforeImportGrant = async () => {
+      concurrent = await ik.oauth.importGrant(input);
+    };
+    const late = await ik.oauth.importGrant(input);
+    expect(concurrent).toEqual({ status: "imported" });
+    expect(late).toEqual({ status: "already_imported" });
+    expect(audit.ofType("oauth.grant_imported")).toHaveLength(1);
+  });
+
+  it("a client import that loses to a concurrent import of the same client answers already_imported", async () => {
+    const { store, hooks } = hookedOAuthStore();
+    const { ik, audit } = oauthSetup({ store });
+    const input = {
+      id: "legacy-client",
+      redirectUris: ["http://127.0.0.1/callback"],
+      grantTypes: ["authorization_code"],
+      authMethod: "none" as const,
+    };
+    let concurrent: Awaited<ReturnType<typeof ik.oauth.importClient>> | null = null;
+    hooks.beforeInsertClient = async () => {
+      concurrent = await ik.oauth.importClient(input);
+    };
+    const late = await ik.oauth.importClient(input);
+    expect(concurrent).toMatchObject({ status: "imported" });
+    expect(late).toMatchObject({ status: "already_imported" });
+    const other = await ik.oauth.importClient({
+      ...input,
+      grantTypes: ["authorization_code", "refresh_token"],
+    });
+    expect(other).toEqual({ status: "id_taken" });
+    expect(audit.ofType("oauth.client_imported")).toHaveLength(1);
   });
 });

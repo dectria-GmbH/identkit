@@ -3,6 +3,10 @@ import { expect, it } from "vitest";
 import type { IdentkitStore } from "../src/storage/types.js";
 import { mfaPolicy, otherCode, setup, STEP, testConfig } from "./helpers.js";
 import { googleClaims, guid, msClaims, oidcSetup, TENANT } from "./oidc-helpers.js";
+import { oauthSetup, RESOURCE } from "./oauth-helpers.js";
+import { createOAuthTestClient } from "../src/testing/index.js";
+
+const sha = (value: string) => createHash("sha256").update(value).digest("hex");
 
 /**
  * End-to-end flows against a database store: the services on top of the store, with parallel
@@ -315,5 +319,139 @@ export function runStoreFlows(name: string, store: () => IdentkitStore) {
     for (const result of results) {
       expect(result).toEqual({ status: "refused", reason: "ambiguous" });
     }
+  });
+
+  it(`flows: oauth exchange, single-use code, rotation, cap, revoke and disable against ${name}`, async () => {
+    const t = oauthSetup({ store: store(), oauth: { maxGrantsPerAccount: 3 } });
+    const client = await createOAuthTestClient(t.ik.oauth, { authMethod: "client_secret_basic" });
+    const accountId = await t.account();
+
+    // One code, ten parallel exchanges: exactly one wins.
+    const { code, verifier } = await client.authorize(accountId);
+    const exchanges = await Promise.all(
+      Array.from({ length: 10 }, () => client.exchange(code, verifier)),
+    );
+    const won = exchanges.filter((r) => r.httpStatus === 200);
+    expect(won).toHaveLength(1);
+    // A loser that came after the winner's grant ends it as a code replay; then none stands.
+    const grants = await t.ik.oauth.listGrants(accountId);
+    expect(grants.length).toBeLessThanOrEqual(1);
+
+    // A fresh connection: validate, rotate, ten parallel refreshes with one token.
+    const connected = await client.connect(accountId);
+    expect(await t.ik.oauth.validateAccessToken(connected.accessToken)).toMatchObject({
+      status: "valid",
+      accountId,
+      clientId: client.clientId,
+    });
+    const rotated = await client.refresh(connected.refreshToken ?? "");
+    expect(rotated.httpStatus).toBe(200);
+    const refreshToken = String(rotated.body?.["refresh_token"]);
+    const parallel = await Promise.all(
+      Array.from({ length: 10 }, () => client.refresh(refreshToken)),
+    );
+    expect(parallel.filter((r) => r.httpStatus === 200)).toHaveLength(1);
+    expect(await t.ik.oauth.listGrants(accountId)).toHaveLength(1);
+
+    // Cap: eight more clients exchange in parallel; with the one above, three grants at most.
+    const others = await Promise.all(
+      Array.from({ length: 8 }, () => createOAuthTestClient(t.ik.oauth)),
+    );
+    const codes = await Promise.all(others.map((c) => c.authorize(accountId)));
+    const capped = await Promise.all(
+      others.map((c, i) => c.exchange(codes[i]?.code ?? "", codes[i]?.verifier ?? "")),
+    );
+    expect(capped.filter((r) => r.httpStatus === 200)).toHaveLength(2);
+    expect(await t.ik.oauth.listGrants(accountId)).toHaveLength(3);
+
+    // Revocation by the client ends its grant; disable ends the rest.
+    const [winner] = parallel.filter((r) => r.httpStatus === 200);
+    expect((await client.revoke(String(winner?.body?.["refresh_token"]))).httpStatus).toBe(200);
+    expect(await t.ik.oauth.listGrants(accountId)).toHaveLength(2);
+    await t.ik.accounts.disable(accountId);
+    expect(await t.ik.oauth.listGrants(accountId)).toEqual([]);
+    expect(
+      t.audit.ofType("oauth.grant_ended").filter((e) => e.reason === "account_disabled"),
+    ).toHaveLength(2);
+  });
+
+  it(`flows: oauth import, legacy tokens, secret upgrade and purge against ${name}`, async () => {
+    const tag = randomBytes(6).toString("hex");
+    const legacyRefresh = `legacy-refresh-${tag}`;
+    const legacyAccess = `legacy-access-${tag}`;
+    const grantId = `legacy-grant-${tag}`;
+    const t = oauthSetup({
+      store: store(),
+      oauth: {
+        acceptLegacyClientSecrets: true,
+        clientRetention: { unusedDays: 1, idleDays: 1 },
+        legacy: {
+          verifyAccessToken: async (token) =>
+            token === legacyAccess
+              ? { grantId, audience: RESOURCE, expiresAt: new Date(Date.UTC(2100, 0)) }
+              : null,
+          verifyRefreshToken: async (token) =>
+            token === legacyRefresh
+              ? { grantId, generation: 2, expiresAt: new Date(Date.UTC(2100, 0)) }
+              : null,
+        },
+      },
+    });
+    const clientId = `legacy-client-${tag}`;
+    expect(
+      (
+        await t.ik.oauth.importClient({
+          id: clientId,
+          redirectUris: ["http://127.0.0.1/callback"],
+          grantTypes: ["authorization_code", "refresh_token"],
+          authMethod: "client_secret_post",
+          secretSha256: sha("old secret"),
+        })
+      ).status,
+    ).toBe("imported");
+    const accountId = await t.account();
+    const now = t.clock.now().getTime();
+    expect(
+      await t.ik.oauth.importGrant({
+        id: grantId,
+        accountId,
+        clientId,
+        scopes: ["mcp:read"],
+        resource: RESOURCE,
+        createdAt: new Date(now - 1000),
+        expiresAt: new Date(now + 10 * 86_400_000),
+        generation: 2,
+        refreshExpiresAt: new Date(now + 5 * 86_400_000),
+        refreshSha256: sha(legacyRefresh),
+      }),
+    ).toEqual({ status: "imported" });
+    expect((await t.ik.oauth.validateAccessToken(legacyAccess)).status).toBe("valid");
+
+    const form = (refreshToken: string) =>
+      new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+        client_id: clientId,
+        client_secret: "old secret",
+      });
+    // Two parallel refreshes with the legacy token: one rotates, the other is in the grace.
+    const results = await Promise.all(
+      [1, 2].map(() => t.ik.oauth.token({ form: form(legacyRefresh), authorization: null })),
+    );
+    expect(results.map((r) => r.httpStatus).toSorted((a, b) => a - b)).toEqual([200, 400]);
+    expect((await store().oauth?.findClient(clientId))?.secretDigestAlgorithm).toBe("hmac-sha256");
+    const fresh = results.find((r) => r.httpStatus === 200);
+    const next = await t.ik.oauth.token({
+      form: form(String(fresh?.body?.["refresh_token"])),
+      authorization: null,
+    });
+    expect(next.httpStatus).toBe(200);
+    expect(await t.ik.oauth.listGrants(accountId)).toHaveLength(1);
+
+    // Purge: the grant ends after its end, then its idle client goes.
+    t.clock.advanceSeconds(12 * 86_400);
+    await t.ik.oauth.purge();
+    expect(await t.ik.oauth.listGrants(accountId)).toEqual([]);
+    expect(await t.ik.oauth.getClient(clientId)).toBeNull();
   });
 }
