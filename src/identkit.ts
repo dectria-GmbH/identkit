@@ -1,4 +1,10 @@
 import { createAccounts, type Accounts, type AccountView } from "./accounts.js";
+import {
+  createApiTokens,
+  unconfiguredApiTokens,
+  type ApiTokenOptions,
+  type ApiTokens,
+} from "./api-tokens.js";
 import { createApprovals, type Approvals } from "./approvals.js";
 import type { AuditSink } from "./audit.js";
 import { systemClock, type Clock } from "./clock.js";
@@ -72,6 +78,12 @@ export interface IdentkitOptions {
    * first OIDC sign-in fails those sessions too.
    */
   oidc?: OidcOptions;
+  /**
+   * Personal API tokens. Needs a store with `apiTokens`; `createIdentkit` throws
+   * `NotConfiguredError` if it is missing, and `InvalidArgumentError` for invalid options.
+   * Without this option, every `identkit.apiTokens` call throws `NotConfiguredError`.
+   */
+  apiTokens?: ApiTokenOptions;
 }
 
 export interface Identkit {
@@ -84,6 +96,7 @@ export interface Identkit {
   accounts: Accounts;
   identityVerification: IdentityVerification;
   oidc: Oidc;
+  apiTokens: ApiTokens;
 }
 
 export function createIdentkit(options: IdentkitOptions): Identkit {
@@ -135,6 +148,8 @@ export function createIdentkit(options: IdentkitOptions): Identkit {
   const { sessions, internals } = createSessions(ctx, onAllSessionsRevoked);
   const core = createPasskeyCore(ctx);
   const totpEngine = createTotpEngine(ctx);
+  // Checked here, so invalid options fail at `createIdentkit`, not at the first call.
+  const apiTokens = options.apiTokens ? createApiTokens(ctx, options.apiTokens) : null;
 
   return {
     emailSignIn: createEmailSignIn(ctx, otp, internals),
@@ -146,5 +161,6 @@ export function createIdentkit(options: IdentkitOptions): Identkit {
     accounts: createAccounts(ctx, (accountId) => internals.revokeAllDeferringHook(accountId)),
     identityVerification: createIdentityVerification(ctx),
     oidc: options.oidc ? createOidc(ctx, internals, options.oidc) : unconfiguredOidc(),
+    apiTokens: apiTokens ?? unconfiguredApiTokens(),
   };
 }

@@ -22,7 +22,8 @@ export type HashPurpose =
   | "enrollment-token"
   | "person-key"
   | "approval-id"
-  | "approval-evidence";
+  | "approval-evidence"
+  | "api-token";
 
 /**
  * Computes keyed one-way hashes of secrets and identifiers. identkit stores only these

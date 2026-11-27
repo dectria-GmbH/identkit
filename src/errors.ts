@@ -104,6 +104,11 @@ export class AllSessionsRevokedHookError extends IdentkitError {
  * of the account. If it cannot remove them, it disables the account and throws the store's
  * error or `PasskeyCleanupError` instead: the factor or passkey may then still be active.
  *
+ * `apiTokens.create` and `apiTokens.import` throw it when the audit sink refused the event of the
+ * new token: identkit deleted the token again, and `cause` holds the sink's error. They revoke
+ * no session, so `hookFailed` is false. If the delete fails, the store's error goes up instead
+ * and the token stands (a created token is unusable then: its plaintext was never returned).
+ *
  * If you catch this error, the operation did not take effect. Any other error means that
  * identkit did not roll back: what it wrote before the error stands. After any other error from
  * `totp.confirmEnrolment` or `passkeys.finishRegistration`, check `totp.get` or `passkeys.list`.

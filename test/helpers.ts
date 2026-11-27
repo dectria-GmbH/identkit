@@ -4,6 +4,7 @@ import {
   createIdentkit,
   createMemoryStore,
   type AllSessionsRevokedHook,
+  type ApiTokenOptions,
   type OidcOptions,
   type SignInPolicy,
 } from "../src/index.js";
@@ -88,6 +89,7 @@ export interface SetupOptions {
   sealer?: SecretSealer;
   onAllSessionsRevoked?: AllSessionsRevokedHook;
   oidc?: OidcOptions;
+  apiTokens?: ApiTokenOptions;
 }
 
 export function setup(options: SetupOptions = {}) {
@@ -114,6 +116,7 @@ export function setup(options: SetupOptions = {}) {
     identityVerification: idv,
     ...(options.onAllSessionsRevoked ? { onAllSessionsRevoked: options.onAllSessionsRevoked } : {}),
     ...(options.oidc ? { oidc: options.oidc } : {}),
+    ...(options.apiTokens ? { apiTokens: options.apiTokens } : {}),
   });
   const authenticator = createSoftwareAuthenticator({
     origin: ORIGIN,

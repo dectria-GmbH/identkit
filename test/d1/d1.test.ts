@@ -490,4 +490,30 @@ describe("d1", { timeout: 30_000 }, () => {
       FREE_QUERIES_PER_INVOCATION,
     );
   });
+
+  it("api tokens: verify is one query, plus one conditional write at most once per interval", async () => {
+    const recorded = recordingD1(requireDb());
+    const t = setup({
+      store: createD1Store(recorded.db),
+      apiTokens: { prefix: "pat_", allowedScopes: ["read"] },
+    });
+    const created = await t.ik.accounts.create({ email: "d1-token-budget@example.org" });
+    if (created.status !== "created") throw new Error(created.status);
+    const token = await t.ik.apiTokens.create({
+      accountId: created.account.id,
+      name: "ci",
+      scopes: ["read"],
+      expiresInDays: 7,
+    });
+    if (token.status !== "created") throw new Error(token.status);
+    const verifyQueries = async () => {
+      recorded.calls.length = 0;
+      expect((await t.ik.apiTokens.verify(token.token)).status).toBe("valid");
+      return recorded.calls.map((c) => c.queries.join("; ").split(" ").slice(0, 2).join(" "));
+    };
+    expect(await verifyQueries()).toEqual(["SELECT t.id,", "UPDATE identkit_api_tokens"]);
+    expect(await verifyQueries()).toEqual(["SELECT t.id,"]);
+    t.clock.advanceSeconds(3600);
+    expect(await verifyQueries()).toEqual(["SELECT t.id,", "UPDATE identkit_api_tokens"]);
+  });
 });

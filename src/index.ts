@@ -98,6 +98,18 @@ export {
   type VerifyApprovalResult,
 } from "./approvals.js";
 export type { Accounts, AccountView, CreateAccountResult } from "./accounts.js";
+export {
+  apiTokenOptionsSchema,
+  parseBearerToken,
+  type ApiTokens,
+  type ApiTokenOptions,
+  type ApiTokenView,
+  type ApiTokenRefusal,
+  type CreateApiTokenResult,
+  type VerifyApiTokenResult,
+  type ImportApiTokenInput,
+  type ImportApiTokenResult,
+} from "./api-tokens.js";
 export type {
   IdentityVerification,
   IdentityVerificationAdapter,

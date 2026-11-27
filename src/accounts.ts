@@ -1,3 +1,4 @@
+import { emitApiTokensRevoked, revokeAllApiTokens } from "./api-tokens.js";
 import type { Context } from "./context.js";
 import { randomBytes, toBase64Url } from "./bytes.js";
 import { randomId } from "./crypto.js";
@@ -33,8 +34,9 @@ export interface Accounts {
   get(accountId: string): Promise<AccountView | null>;
   findByEmail(email: string): Promise<AccountView | null>;
   /**
-   * Disables the account and revokes all its sessions. Records `account.disabled` only if the
-   * account was not disabled yet, so a retry after an error does not record it twice.
+   * Disables the account and revokes all its sessions and personal API tokens. Records
+   * `account.disabled` only if the account was not disabled yet, so a retry after an error does
+   * not record it twice.
    */
   disable(accountId: string): Promise<void>;
   /**
@@ -144,18 +146,37 @@ export function createAccounts(
       const changed = record.status !== "disabled";
       const event = { type: "account.disabled", accountId } as const;
       await store.accounts.setStatus(accountId, "disabled");
+      // API tokens first: their revocation has no hook, so an error there leaves no revocation
+      // whose hook would need to run. `verify` refuses tokens of a disabled account anyway.
+      let tokenIds: string[] = [];
       let revoked: Revocation;
       try {
+        tokenIds = await revokeAllApiTokens(ctx, accountId, "account_disabled");
         revoked = await revokeAll(accountId);
       } catch (error) {
-        // A retry finds the account disabled and does not record it: record it now.
+        // A retry finds the account disabled and these tokens revoked, and records neither:
+        // record them now.
         if (changed) await ctx.emit(event).catch(() => undefined);
+        await emitApiTokensRevoked(ctx, accountId, tokenIds, "account_disabled").catch(
+          () => undefined,
+        );
         throw error;
       }
-      // Hook last: a throwing hook must not skip the audit event, nor a throwing sink the hook.
+      // Hook last: a throwing hook must not skip the audit events, nor a throwing sink the hook.
       // A retry revokes and runs the hook again.
       await finishThenRunHook(revoked, async () => {
-        if (changed) await ctx.emit(event);
+        let failure: { error: unknown } | null = null;
+        try {
+          if (changed) await ctx.emit(event);
+        } catch (error) {
+          failure = { error };
+        }
+        try {
+          await emitApiTokensRevoked(ctx, accountId, tokenIds, "account_disabled");
+        } catch (error) {
+          failure ??= { error };
+        }
+        if (failure) throw failure.error;
       });
     },
   };
