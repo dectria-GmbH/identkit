@@ -6,7 +6,7 @@
 -- in to at most one account.
 
 CREATE TABLE identkit_oidc_links (
-  id TEXT PRIMARY KEY,
+  id TEXT NOT NULL PRIMARY KEY,
   account_id TEXT NOT NULL REFERENCES identkit_accounts (id) ON DELETE CASCADE,
   link_key TEXT NOT NULL UNIQUE,
   provider TEXT NOT NULL,

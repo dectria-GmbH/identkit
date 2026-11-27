@@ -1,7 +1,15 @@
 import type { AuthMethod } from "../config.js";
 
-/** The session methods this release knows. */
-export const AUTH_METHODS = ["email_otp", "passkey", "totp", "oidc"] as const;
+/**
+ * The session methods this release knows. `satisfies` fails to compile on a value that is not an
+ * `AuthMethod`.
+ */
+export const AUTH_METHODS = [
+  "email_otp",
+  "passkey",
+  "totp",
+  "oidc",
+] as const satisfies readonly AuthMethod[];
 
 // Fails to compile if `AuthMethod` gains a member that the list above lacks.
 const complete: [Exclude<AuthMethod, (typeof AUTH_METHODS)[number]>] extends [never]

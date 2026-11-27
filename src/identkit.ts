@@ -64,8 +64,9 @@ export interface IdentkitOptions {
    * is missing. Without this option, every `identkit.oidc` call throws `NotConfiguredError`.
    *
    * Deploy this release to every instance before you set it, and finish a gradual deployment
-   * first: identkit 0.1.x cannot read the sessions of an OIDC sign-in and fails them. A rollback
-   * to 0.1.x after the first OIDC sign-in fails those sessions too.
+   * first: an identkit release without OIDC sign-in (any release before this one) cannot read
+   * the sessions of an OIDC sign-in and fails them. A rollback to such a release after the
+   * first OIDC sign-in fails those sessions too.
    */
   oidc?: OidcOptions;
 }
