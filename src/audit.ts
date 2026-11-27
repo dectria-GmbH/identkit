@@ -2,6 +2,11 @@
  * Security-relevant events. Events never carry a code, token, token digest, challenge, key, TOTP
  * secret, sealed secret, provisioning URI, e-mail address, ID token or provider subject. `addressDigest` is a keyed hash of the normalized address, so a consumer can
  * correlate events for one address without identkit writing the address itself.
+ *
+ * OAuth events never carry a client secret, authorization code, access or refresh token, the
+ * digest of one of them, a client name (attacker-chosen text), a redirect URI, a `state`, a code
+ * challenge or a raw address key. For `oauth.registration_refused`, `addressDigest` is a keyed
+ * hash of the `addressKey` passed to `oauth.register`.
  */
 export type AuditEventType =
   | "otp.sent"
@@ -55,7 +60,18 @@ export type AuditEventType =
   | "api_token.created"
   | "api_token.imported"
   | "api_token.revoked"
-  | "api_token.used";
+  | "api_token.used"
+  | "oauth.client_registered"
+  | "oauth.client_imported"
+  | "oauth.client_deleted"
+  | "oauth.registration_refused"
+  | "oauth.consent_approved"
+  | "oauth.consent_denied"
+  | "oauth.grant_created"
+  | "oauth.grant_imported"
+  | "oauth.grant_ended"
+  | "oauth.token_failed"
+  | "oauth.token_refreshed";
 
 export interface AuditEvent {
   type: AuditEventType;
@@ -82,15 +98,23 @@ export interface AuditEvent {
   linkId?: string;
   /** API token events: the token's id, never the token or its digest. */
   tokenId?: string;
-  /** `api_token.created` and `api_token.imported`: the scopes the token was given. */
+  /**
+   * `api_token.created` and `api_token.imported`: the scopes the token was given. OAuth consent
+   * and grant events: the scopes of the consent or grant.
+   */
   scopes?: string[];
+  /** OAuth events: the public `client_id`. */
+  clientId?: string;
+  /** OAuth events: the id of the grant, never a token. */
+  grantId?: string;
 }
 
 /**
  * Receives audit events. identkit awaits `emit`; if it throws, the calling operation
- * fails, so an operation never succeeds without its audit record. One exception:
+ * fails, so an operation never succeeds without its audit record. Two exceptions:
  * `api_token.used` is best effort, and `apiTokens.verify` still succeeds (see the option
- * `apiTokens.onAuditError`).
+ * `apiTokens.onAuditError`); `oauth.token_refreshed` is best effort, and the refresh still
+ * succeeds (see the option `oauth.onAuditError`).
  */
 export interface AuditSink {
   emit(event: AuditEvent): void | Promise<void>;

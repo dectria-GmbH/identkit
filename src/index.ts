@@ -111,6 +111,19 @@ export {
   type ImportApiTokenInput,
   type ImportApiTokenResult,
 } from "./api-tokens.js";
+export {
+  oauthOptionsSchema,
+  type OAuth,
+  type OAuthAdmitHook,
+  type OAuthAdmitRequest,
+  type OAuthAuditErrorHandler,
+  type OAuthClientView,
+  type OAuthEndpointResult,
+  type OAuthMetadata,
+  type OAuthOptions,
+  type OAuthParams,
+  type WwwAuthenticateInput,
+} from "./oauth/index.js";
 export type {
   IdentityVerification,
   IdentityVerificationAdapter,
