@@ -47,6 +47,11 @@ const MAX_LOGIN_HINT_LENGTH = 256;
 /** Provider error codes are ASCII words (RFC 6749 section 4.1.2.1); anything else is dropped. */
 const PROVIDER_ERROR = /^[a-z0-9_.-]{1,64}$/i;
 
+/** Lowercases A-Z only. */
+function asciiLowerCase(value: string): string {
+  return value.replace(/[A-Z]/g, (c) => c.toLowerCase());
+}
+
 /** What `mayBind` receives before identkit binds a subject to an account by its address. */
 export interface OidcBindRequest {
   /** The configured provider id. */
@@ -113,6 +118,7 @@ export type OidcFailure =
 export type OidcRefusal =
   | "organization_not_allowed"
   | "consumer_tenant"
+  | "guest_account"
   | "unverified_address"
   | "no_account"
   | "account_disabled"
@@ -542,6 +548,12 @@ export function createOidc(ctx: Context, internals: SessionInternals, options: O
     try {
       email = normalizeEmail(identity.address.email);
     } catch {
+      return refused(provider.id, "unverified_address", { binding: true });
+    }
+    // The provider verified exactly its own string. identkit's normalization also folds
+    // non-ASCII characters (NFC, Unicode lowercase: the Kelvin sign becomes "k"), which could
+    // turn a verified address into another account's address. Only ASCII case may differ.
+    if (email !== asciiLowerCase(identity.address.email)) {
       return refused(provider.id, "unverified_address", { binding: true });
     }
     const addressDigest = await hasher.digest("address", email);

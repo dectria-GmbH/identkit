@@ -588,12 +588,13 @@ if (result.status === "signed_in") setSessionCookie(result.token);
 
 Providers:
 
-- `microsoftProvider({ clientId, clientSecret, redirectUri, tenant?, allowedTenants?, upnAsAddress?, prompt? })`:
+- `microsoftProvider({ clientId, clientSecret, redirectUri, tenant?, allowedTenants?, upnAsAddress?, allowGuests?, prompt? })`:
   Microsoft identity platform v2.0. `tenant` is `common` (default), `organizations`,
   `consumers` or a tenant id. Scopes `openid email profile`, `prompt=select_account` by default.
   The multi-tenant endpoints sign tokens for every tenant, so identkit checks that `iss` is
   `https://login.microsoftonline.com/{tid}/v2.0` for the token's own `tid`. `allowedTenants`
-  limits sign-in to those tenant ids.
+  limits sign-in to those tenant ids. `allowGuests` (default false) lets a guest bind by address;
+  see the binding rules.
 - `googleProvider({ clientId, clientSecret, redirectUri, hostedDomains?, prompt? })`: issuer
   `https://accounts.google.com` (also accepted without `https://`, as Google documents).
   `hostedDomains` limits sign-in to those Workspace domains (`hd` claim).
@@ -624,7 +625,7 @@ The flow:
   which on Workers means one per request.
 - Results: `signed_in` (with `accountCreated` and `linkCreated`), `second_factor_required`,
   `second_factor_unavailable`, `refused` with a reason (`organization_not_allowed`,
-  `consumer_tenant`, `unverified_address`, `no_account`, `account_disabled`, `account_has_link`,
+  `consumer_tenant`, `guest_account`, `unverified_address`, `no_account`, `account_disabled`, `account_has_link`,
   `refused_by_hook`) or `failed` with a reason (`invalid_transaction`, `transaction_expired`,
   `state_mismatch`, `provider_error` with the provider's `error` code if it is a plain word,
   `missing_code`, `token_request_failed`, `keys_unavailable`, `invalid_id_token`). Only the
@@ -646,20 +647,33 @@ First binding (no link for the subject yet), in this order:
 1. `allowedTenants`, a tenant authority, or `hostedDomains` refuse other organizations
    (`organization_not_allowed`), for every sign-in, linked or not.
 2. Microsoft personal accounts (tenant `9188040d-6c67-4c5b-b112-36a304b66dad`) never bind
-   (`consumer_tenant`): Microsoft does not verify their address. A link you import for one still
-   signs in.
-3. The address must be verified by the provider (`unverified_address` otherwise): Google and
+   (`consumer_tenant`). This is identkit's requirement, not a claim that Microsoft leaves their
+   address unchecked: a personal account belongs to no organization's tenant, so no tenant
+   administrator has verified the domain of its address, which is what `xms_edov` reports for a
+   work account. A link you import for one still signs in.
+3. Microsoft guests never bind by default (`guest_account`): a user who is homed in another
+   tenant or at another identity provider and signs in to your authority tenant (relevant with a
+   tenant id as `tenant`). identkit counts a token as a guest's if the optional claim `acct` is 1,
+   or if `idp` is present and is neither `iss` nor a Microsoft STS URI of the token's own tenant
+   (Microsoft documents `idp` as equal to the issuer except for users from another tenant, and as
+   `live.com` or the consumer tenant for an invited personal account). An unknown `idp` form
+   counts as a guest, so it fails closed. With `allowGuests: true` a guest binds by `email` with
+   `xms_edov` true, never by `preferred_username`. A link you import for a guest still signs in.
+4. The address must be verified by the provider (`unverified_address` otherwise): Google and
    other providers by `email_verified` true. Microsoft by `email` with the optional claim
    `xms_edov` true (add the optional claims `email` and `xms_edov` to the app registration). With
-   `upnAsAddress: true`, Microsoft also binds by `preferred_username` when `xms_edov` is missing.
-   Entra accepts as a user principal name suffix only a domain verified in the tenant, but
-   Microsoft documents `preferred_username` as mutable and not meant for authorization, so this
-   is your decision; it stays off by default.
-4. The account of that address. If there is none, identkit creates one if the policy's
+   `upnAsAddress: true`, Microsoft also binds a member (not a guest) by `preferred_username` when
+   `xms_edov` is missing. Entra accepts as a user principal name suffix only a domain verified in
+   the tenant, but Microsoft documents `preferred_username` as mutable and not meant for
+   authorization, so this is your decision; it stays off by default. The address must also stay
+   the same under identkit's normalization except for ASCII case: an address that NFC or Unicode
+   lowercase would change (for example the Kelvin sign, which lowercases to `k`) does not bind,
+   because it could turn into another account's address.
+5. The account of that address. If there is none, identkit creates one if the policy's
    `createAccountOnFirstSignIn` is true, as for e-mail codes, else `no_account`. A disabled
    account is refused. With `linksPerAccount: "one"`, an account that has a link is refused
    (`account_has_link`).
-5. `mayBind(request)` (option): your own rule, for example refused subjects or a rebind window
+6. `mayBind(request)` (option): your own rule, for example refused subjects or a rebind window
    after an administrative reset. It gets the provider, kind, issuer, subject, tenant id, the
    address and the account (or null). It runs last and can only refuse (`refused_by_hook`). It
    must return a boolean; anything else fails the sign-in. It is not called for a subject that has

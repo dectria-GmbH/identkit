@@ -4,7 +4,8 @@ import type { OidcProviderKind } from "./storage/types.js";
 
 /**
  * Tenant id of Microsoft personal accounts (outlook.com, hotmail.com and others). Such an
- * account never binds by e-mail address: Microsoft does not verify the address for it.
+ * account never binds by e-mail address: it belongs to no organization's tenant, so no tenant
+ * administrator vouches for the domain of its address.
  */
 export const MICROSOFT_CONSUMER_TENANT_ID = "9188040d-6c67-4c5b-b112-36a304b66dad";
 
@@ -40,7 +41,8 @@ export interface ProviderIdentity {
   tenantId: string | null;
   /** The provider-verified address, or why the subject cannot bind by address. */
   address:
-    { ok: true; email: string } | { ok: false; reason: "unverified_address" | "consumer_tenant" };
+    | { ok: true; email: string }
+    | { ok: false; reason: "unverified_address" | "consumer_tenant" | "guest_account" };
 }
 
 export type IdentifyResult =
@@ -200,9 +202,16 @@ export interface MicrosoftProviderOptions extends CommonOptions {
   allowedTenants?: string[];
   /**
    * Treat `preferred_username` as a verified address when the token does not mark `email` as
-   * domain-verified (`xms_edov`). Default false. See the README for when this is sound.
+   * domain-verified (`xms_edov`). Default false. See the README for when this is sound. Never
+   * applies to a guest account.
    */
   upnAsAddress?: boolean;
+  /**
+   * Let a guest account (a user homed in another tenant or at another identity provider, signed
+   * in to the authority tenant) bind by its `email` with `xms_edov` true. Default false: a guest
+   * never binds by address. A guest with a link (for example an imported one) signs in either way.
+   */
+  allowGuests?: boolean;
   /** Default `select_account`; null sends no prompt. */
   prompt?: string | null;
 }
@@ -228,6 +237,10 @@ export function microsoftProvider(options: MicrosoftProviderOptions): OidcProvid
   const upnAsAddress = options.upnAsAddress ?? false;
   if (typeof upnAsAddress !== "boolean") {
     throw new InvalidArgumentError("upnAsAddress must be a boolean");
+  }
+  const allowGuests = options.allowGuests ?? false;
+  if (typeof allowGuests !== "boolean") {
+    throw new InvalidArgumentError("allowGuests must be a boolean");
   }
   const base = `${MICROSOFT_HOST}/${authority}`;
   return register(
@@ -263,11 +276,14 @@ export function microsoftProvider(options: MicrosoftProviderOptions): OidcProvid
         let address: ProviderIdentity["address"];
         const email = emailClaim(claims);
         const upn = claims["preferred_username"];
+        const guest = isMicrosoftGuest(claims, tenantId);
         if (consumer) {
           address = { ok: false, reason: "consumer_tenant" };
+        } else if (guest && !allowGuests) {
+          address = { ok: false, reason: "guest_account" };
         } else if (email !== null && claimTrue(claims["xms_edov"])) {
           address = { ok: true, email };
-        } else if (upnAsAddress && typeof upn === "string" && upn.includes("@")) {
+        } else if (!guest && upnAsAddress && typeof upn === "string" && upn.includes("@")) {
           address = { ok: true, email: upn };
         } else {
           address = { ok: false, reason: "unverified_address" };
@@ -287,6 +303,32 @@ export function microsoftProvider(options: MicrosoftProviderOptions): OidcProvid
       },
     },
   );
+}
+
+/**
+ * True if the token is of a guest: a user who is not homed in the token's tenant. Microsoft's ID
+ * token reference: `idp` "is identical to the value of the issuer claim unless the user account
+ * isn't in the same tenant as the issuer - guests, for instance"; a missing `idp` means `iss`.
+ * For an invited personal account it may be `live.com`. The optional claim `acct` is 1 for a
+ * guest. An `idp` that is not a Microsoft STS URI of the token's own tenant counts as a guest,
+ * so an unknown form fails closed.
+ */
+function isMicrosoftGuest(claims: Record<string, unknown>, tenantId: string): boolean {
+  const acct = claims["acct"];
+  if (acct === 1 || acct === "1") return true;
+  const idp = claims["idp"];
+  if (idp === undefined || idp === claims["iss"]) return false;
+  if (typeof idp !== "string") return true;
+  let url: URL;
+  try {
+    url = new URL(idp);
+  } catch {
+    return true;
+  }
+  const stsHost =
+    url.hostname === "sts.windows.net" || url.hostname === "login.microsoftonline.com";
+  const firstSegment = url.pathname.split("/")[1]?.toLowerCase();
+  return !(url.protocol === "https:" && stsHost && firstSegment === tenantId);
 }
 
 export interface GoogleProviderOptions extends CommonOptions {

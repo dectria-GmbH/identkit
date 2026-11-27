@@ -209,6 +209,78 @@ describe("oidc sign-in", () => {
     expect(result.account.email).toBe("upn.person@contoso.example");
   });
 
+  it("rule: a Microsoft guest never binds by default; allowGuests binds it by xms_edov only", async () => {
+    const t = await oidcSetup({ microsoftTenant: TENANT, microsoft: { upnAsAddress: true } });
+    const refusedAsGuest = { status: "refused", reason: "guest_account" };
+    // An invited personal account: Microsoft marks its address verified, idp is live.com.
+    const personalGuest = msClaims("victim@mail.example", { idp: "live.com" });
+    expect(await t.signInWith("microsoft", personalGuest)).toEqual(refusedAsGuest);
+    // A guest homed in another tenant: idp is that tenant's STS.
+    const tenantGuest = msClaims("g@fabrikam.example", {
+      idp: `https://sts.windows.net/${OTHER_TENANT}/`,
+    });
+    expect(await t.signInWith("microsoft", tenantGuest)).toEqual(refusedAsGuest);
+    // The optional claim acct is 1 for a guest.
+    expect(await t.signInWith("microsoft", msClaims("a@fabrikam.example", { acct: 1 }))).toEqual(
+      refusedAsGuest,
+    );
+    // A SAML-federated guest has no xms_edov; its preferred_username is not a tenant UPN.
+    const federatedGuest = msClaims("unused@fabrikam.example", {
+      xms_edov: false,
+      idp: "https://adfs.fabrikam.example/adfs/services/trust",
+      preferred_username: "boss@contoso.example",
+    });
+    expect(await t.signInWith("microsoft", federatedGuest)).toEqual(refusedAsGuest);
+    expect(t.audit.ofType("oidc.binding_refused").map((e) => e.reason)).toEqual([
+      "guest_account",
+      "guest_account",
+      "guest_account",
+      "guest_account",
+    ]);
+    // A member: idp absent, equal to iss, or the STS URI of its own tenant.
+    for (const idp of [undefined, `https://login.microsoftonline.com/${TENANT}/v2.0`]) {
+      const member = await t.signInWith(
+        "microsoft",
+        msClaims(`m${guid()}@contoso.example`, { idp }),
+      );
+      expect(member.status).toBe("signed_in");
+    }
+    const stsMember = msClaims("sts.member@contoso.example", {
+      idp: `https://sts.windows.net/${TENANT.toUpperCase()}/`,
+      acct: 0,
+    });
+    expect((await t.signInWith("microsoft", stsMember)).status).toBe("signed_in");
+
+    const open = await oidcSetup({
+      microsoftTenant: TENANT,
+      microsoft: { upnAsAddress: true, allowGuests: true },
+    });
+    const bound = await open.signInWith("microsoft", personalGuest);
+    if (bound.status !== "signed_in") throw new Error(bound.status);
+    expect(bound.account.email).toBe("victim@mail.example");
+    // Never by preferred_username for a guest, even with upnAsAddress.
+    expect(await open.signInWith("microsoft", federatedGuest)).toEqual({
+      status: "refused",
+      reason: "unverified_address",
+    });
+  });
+
+  it("rule: an address that normalization changes beyond ASCII case does not bind", async () => {
+    const t = await oidcSetup();
+    const kate = await t.ik.accounts.create({ email: "kate@example.org" });
+    if (kate.status !== "created") throw new Error(kate.status);
+    // U+212A KELVIN SIGN lowercases to an ASCII "k".
+    expect(await t.signInWith("google", googleClaims("\u212Aate@example.org"))).toEqual({
+      status: "refused",
+      reason: "unverified_address",
+    });
+    expect(await t.ik.oidc.listLinks(kate.account.id)).toEqual([]);
+    // ASCII case alone may differ.
+    const ascii = await t.signInWith("google", googleClaims("KATE@Example.org"));
+    if (ascii.status !== "signed_in") throw new Error(ascii.status);
+    expect(ascii.account.id).toBe(kate.account.id);
+  });
+
   it("rule: allowedTenants and a tenant authority restrict who signs in at all", async () => {
     const t = await oidcSetup({ microsoft: { allowedTenants: [TENANT.toUpperCase()] } });
     expect((await t.signInWith("microsoft", msClaims("a@contoso.example"))).status).toBe(
