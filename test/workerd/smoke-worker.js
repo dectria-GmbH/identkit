@@ -15,6 +15,7 @@ import {
   microsoftProvider,
   hashPayloadAsync,
   NodeCryptoUnavailableError,
+  parseBearerToken,
 } from "../../dist/index.js";
 import { createD1Store, D1_MIGRATIONS, migrateIdentkitD1 } from "../../dist/d1/index.js";
 import {
@@ -36,6 +37,7 @@ import {
   SEALED,
 } from "../compat-vectors.ts";
 import {
+  API_TOKENS,
   basePolicy,
   config,
   OIDC_CLIENT,
@@ -70,6 +72,7 @@ function setup(store = createMemoryStore()) {
     audit: createRecordingAuditSink(),
     clock,
     policy: () => policy.current,
+    apiTokens: API_TOKENS,
   });
   async function signIn(email) {
     const requested = await ik.emailSignIn.requestCode({ email });
@@ -293,6 +296,35 @@ const checks = {
     check(after.jwks - before.jwks === 1, "one key request");
   },
 
+  async apiTokensCreateAndVerify(env) {
+    await migrateIdentkitD1(env.DB);
+    for (const store of [createMemoryStore(), createD1Store(env.DB)]) {
+      const t = setup(store);
+      const account = await t.ik.accounts.create({
+        email: `tokens-${crypto.randomUUID()}@example.org`,
+      });
+      check(account.status === "created", `account: ${account.status}`);
+      const created = await t.ik.apiTokens.create({
+        accountId: account.account.id,
+        name: "smoke",
+        scopes: ["read"],
+        expiresInDays: 7,
+      });
+      check(created.status === "created", `create: ${created.status}`);
+      check(/^pat_[A-Za-z0-9_-]{43}$/.test(created.token), "token format");
+      const token = parseBearerToken(`Bearer ${created.token}`);
+      const verified = await t.ik.apiTokens.verify(token);
+      check(verified.status === "valid", `verify: ${verified.status} ${verified.reason}`);
+      check(verified.tokenId === created.apiToken.id, "token id");
+      check(
+        await t.ik.apiTokens.revoke({ accountId: account.account.id, tokenId: verified.tokenId }),
+        "revoke",
+      );
+      const refused = await t.ik.apiTokens.verify(created.token);
+      check(refused.reason === "revoked", `after revoke: ${refused.status}`);
+    }
+  },
+
   async fakeIdentityCallback() {
     const adapter = createFakeIdentityVerificationAdapter({ outcome: "succeed" });
     const { vendorReference } = await adapter.start({ verificationId: "v1" });
@@ -325,11 +357,31 @@ async function bench(n) {
   return { n, valid };
 }
 
+/** Runs `n` API token verifications, so the caller can time them. */
+async function benchTokens(n) {
+  const t = setup();
+  const account = await t.ik.accounts.create({ email: "bench@example.org" });
+  const created = await t.ik.apiTokens.create({
+    accountId: account.account.id,
+    name: "bench",
+    scopes: ["read"],
+    expiresInDays: 7,
+  });
+  let valid = 0;
+  for (let i = 0; i < n; i += 1) {
+    if ((await t.ik.apiTokens.verify(created.token)).status === "valid") valid += 1;
+  }
+  return { n, valid };
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === "/bench") {
       return Response.json(await bench(Number(url.searchParams.get("n") ?? "0")));
+    }
+    if (url.pathname === "/bench-tokens") {
+      return Response.json(await benchTokens(Number(url.searchParams.get("n") ?? "0")));
     }
     return Response.json(await smoke(env));
   },

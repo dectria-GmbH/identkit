@@ -4,8 +4,8 @@ Identity toolkit for TypeScript: accounts, e-mail codes, passkeys, TOTP, session
 
 Status: early development, release 0.1.1. It covers sign-in by e-mail code, passkeys, TOTP
 (authenticator apps), sign-in through an external OpenID Connect provider (Microsoft, Google or
-any other), sessions, step-up, approval evidence at two levels, an identity verification port and
-storage. See "Not built" for what comes later.
+any other), sessions, personal API tokens, step-up, approval evidence at two levels, an identity
+verification port and storage. See "Not built" for what comes later.
 
 identkit is a library, not a server. The core has no HTTP framework dependency: you call it from
 your own routes and set cookies yourself.
@@ -110,13 +110,16 @@ const session = await identkit.sessions.validate(tokenFromCookie);
 - `approvals`: `start({ sessionToken, payloadHash, levels? })`,
   `verify({ sessionToken, payloadHash, levels?, response })` or
   `verify({ sessionToken, payloadHash, levels?, approvalId, code })`.
-- `accounts`: `create({ email })`, `get(id)`, `findByEmail(email)`, `disable(id)`, `unlock(id)`,
-  `unlockAddress(email)`.
+- `accounts`: `create({ email })`, `get(id)`, `findByEmail(email)`, `disable(id)` (also revokes
+  the account's sessions and API tokens), `unlock(id)`, `unlockAddress(email)`.
 - `identityVerification`: `start({ accountId, returnUrl })`, `handleCallback(payload)`,
   `refresh(verificationId)`, `get(verificationId)`.
 - `oidc`: `begin({ provider, loginHint? })`, `finish({ transaction, params })`,
   `importLink(input)`, `listLinks(accountId)`, `removeLink(accountId, linkId)`. See "External
   sign-in (OpenID Connect)".
+- `apiTokens`: `create({ accountId, name, scopes, expiresInDays })`, `verify(token)`,
+  `list(accountId)`, `revoke({ accountId, tokenId })`, `revokeAll(accountId)`, `import(input)`.
+  See "Personal API tokens".
 
 Administrative calls take bare ids and trust their caller. Expose them only to privileged code,
 or check ownership yourself before you pass client input: all of `accounts`,
@@ -124,14 +127,16 @@ or check ownership yourself before you pass client input: all of `accounts`,
 `passkeys.revokeEnrollmentTokens`, `totp.get`, `totp.revoke`,
 `totp.reseal`, `sessions.revokeById`,
 `sessions.revokeAll`, `identityVerification.start`, `identityVerification.refresh`,
-`identityVerification.get`, `oidc.importLink`, `oidc.listLinks` and `oidc.removeLink`.
+`identityVerification.get`, `oidc.importLink`, `oidc.listLinks`, `oidc.removeLink`, and every
+`apiTokens` call except `verify`.
 
 Standalone functions: `checkApprovalEvidence({ evidence, verifier | hasher })`, `hashPayload(payload)`,
 `hashPayloadAsync(payload)`, `approvalChallenge(nonce, payloadHash, accountId)`,
 `approvalChallengeAsync(nonce, payloadHash, accountId)`, `normalizeEmail(input)`, `parseConfig(input)`,
 `createAesGcmSealer({ keys, activeKeyId })`, `applyThrottle(state, at, rule)`, `lockDuration(rule, lockCount)` and the type `ThrottleState` (for custom stores),
 `microsoftProvider(options)`, `googleProvider(options)`, `oidcProvider(options)`,
-`createJwksCache()` and the constant `MICROSOFT_CONSUMER_TENANT_ID`. Constant `TOTP_INTEROPERABLE_PARAMETERS`
+`createJwksCache()`, `parseBearerToken(header)`, `apiTokenOptionsSchema` and the constant
+`MICROSOFT_CONSUMER_TENANT_ID`. Constant `TOTP_INTEROPERABLE_PARAMETERS`
 (`{ algorithm: "SHA1", digits: 6 }`).
 
 `checkApprovalEvidence` returns an object with a `status`. Switch on the exact status and
@@ -339,7 +344,8 @@ Sessions:
   time, used or not. A test checks this with 43200 seconds.
 - The option `onAllSessionsRevoked(event)` is called after every `sessions.revokeAll`, also when
   `accounts.disable`, a passkey change, a TOTP change or `oidc.removeLink` calls it, and also
-  when no session was live. `event` holds `accountId`, `exceptSessionId` (the session that stayed,
+  when no session was live. It does not cover personal API tokens: `sessions.revokeAll` leaves
+  them live (see "Personal API tokens"). `event` holds `accountId`, `exceptSessionId` (the session that stayed,
   or null) and `revokedSessionIds`. Use it to end sessions your application keeps itself, for
   example with a per-account version. It runs last: after the revocation and after the calling
   operation's own writes and audit events (the disable, the new or removed passkey, the TOTP
@@ -348,7 +354,9 @@ Sessions:
   identkit sessions stay revoked and the audit events are written, unless `auditError` is set
   (see below). Some calls cannot be repeated (a finished
   passkey registration or TOTP enrolment, a `totp.remove` whose factor is gone), so re-run the
-  hook with `sessions.revokeAll(error.accountId, error.revokeAllOptions)`.
+  hook with `sessions.revokeAll(error.accountId, error.revokeAllOptions)`. One exception: if
+  the error's `tokenRevocationError` is set (only `accounts.disable` sets it), call
+  `accounts.disable` again instead; it also runs the hook again (see "Personal API tokens").
   `revokeAll` is idempotent and calls the hook also when no session was live. Make the hook
   idempotent too. On such a re-run `revokedSessionIds` is empty, because the sessions are already
   revoked: do not depend on it to find the sessions to end.
@@ -420,15 +428,19 @@ Passkeys:
   `OperationRolledBackError`). A crash in between leaves an unusable pending row.
 - If the store fails on both deletes of that passkey, identkit tries twice to disable the
   account, ends all its sessions and throws: the passkey may still be active without a valid
-  grant. The audit event `passkey.registration_failed` says `cleanup_failed_account_disabled`
-  (with an `account.disabled` event) or, if the disable failed too,
-  `cleanup_failed_disable_failed`. In the second case the account stays active and the passkey
-  can sign in; `finishRegistration` then throws `PasskeyCleanupError`, which names the account
-  and the credential, so your code learns it also when the audit sink was down. In both cases
-  an operator first removes the passkey with `passkeys.revoke(accountId, credentialId)` (the
+  grant. The disable, as `accounts.disable`, also revokes the account's API tokens. The audit
+  event `passkey.registration_failed` says `cleanup_failed_account_disabled` (with an
+  `account.disabled` event and an `api_token.revoked` event per token) or, if the disable
+  failed too, `cleanup_failed_disable_failed`. In the second case the account may still be
+  active, so the passkey can sign in, or its API tokens may not be revoked;
+  `finishRegistration` then throws `PasskeyCleanupError`, which names the account and the
+  credential, so your code learns it also when the audit sink was down. In both cases an
+  operator first removes the passkey with `passkeys.revoke(accountId, credentialId)` (the
   credential id is in the error, or in `passkeys.list(accountId)`) and only then enables the
   account again in the store; identkit has no call to enable an account. Enabling it first
-  brings the passkey back into use.
+  brings the passkey back into use. After `cleanup_failed_disable_failed`, the operator also
+  calls `accounts.disable(accountId)` until it succeeds before the account is enabled again;
+  otherwise its API tokens can come back into use.
 - A registration that is already running is cancelled only by revocation, not by a token
   rotation: `rotate` and step-ups keep the session, so a registration started before them
   completes. Use `sessions.revokeById` or `revokeAll` to cut off a stolen session.
@@ -458,11 +470,15 @@ TOTP:
   and then lost its reply. If the store fails on every delete (two tries, then a delete of all
   the account's factors), identkit tries twice to disable the account, ends all its sessions
   and throws: the factor may still be active, and someone without the grant may know its
-  secret. The audit event `totp.enrolment_failed` says `cleanup_failed_account_disabled`
-  (with an `account.disabled` event) or, if the disable failed too,
-  `cleanup_failed_disable_failed`. On the error paths no grant may have been lost; the account
-  is disabled all the same. An operator removes the factor with `totp.revoke(accountId)` and
-  enables the account again in the store; identkit has no call to enable an account.
+  secret. The disable, as `accounts.disable`, also revokes the account's API tokens. The audit
+  event `totp.enrolment_failed` says `cleanup_failed_account_disabled` (with an
+  `account.disabled` event and an `api_token.revoked` event per token) or, if the disable failed
+  too, `cleanup_failed_disable_failed`: the account may still be active, or its API tokens may
+  not be revoked. On the error paths no grant may have been lost; the account is disabled all
+  the same. An operator removes the factor with `totp.revoke(accountId)` and enables the account
+  again in the store; identkit has no call to enable an account. After
+  `cleanup_failed_disable_failed`, the operator first calls `accounts.disable(accountId)` until
+  it succeeds; otherwise the account's API tokens can come back into use.
 - A code is accepted within `driftSteps` time steps on either side of the current one. All
   candidates are computed and compared in constant time.
 - Replay: the store keeps the latest accepted time step per factor and accepts a step only if
@@ -769,6 +785,202 @@ Migration from your own provider sign-in:
   The subject can then bind again by its address, so use `mayBind` if a reset must not allow
   that at once.
 
+## Personal API tokens
+
+A personal API token lets a script or another service act for an account without a session. The
+owner creates it, sees it once, and sends it as a bearer token. identkit checks it; your code
+decides what its scopes allow.
+
+```ts
+const identkit = createIdentkit({
+  ...options, // a store with apiTokens: the memory, PostgreSQL and D1 stores have it
+  apiTokens: { prefix: "pat_", allowedScopes: ["items:read", "items:write"] },
+});
+
+// Route "create token": the person is signed in, with a fresh step-up.
+const created = await identkit.apiTokens.create({
+  accountId: session.accountId,
+  name: "deploy script",
+  scopes: ["items:read"],
+  expiresInDays: 30,
+});
+if (created.status === "created") showOnce(created.token);
+
+// Every API request
+const result = await identkit.apiTokens.verify(
+  parseBearerToken(request.headers.get("authorization")) ?? "",
+);
+if (result.status !== "valid") return new Response(null, { status: 401 });
+// result.accountId, result.tokenId, result.scopes
+```
+
+Without the option `apiTokens`, every `identkit.apiTokens` call throws `NotConfiguredError`.
+`createIdentkit` throws `NotConfiguredError` if the store has no `apiTokens`, and
+`InvalidArgumentError` for an invalid option.
+
+Options (configurable; the defaults are design choices, not values from a standard):
+
+| Option                      | Default       | Bounds                                                       |
+| --------------------------- | ------------- | ------------------------------------------------------------ |
+| `prefix`                    | required      | a letter, then letters, digits or `_`; at most 32 characters |
+| `allowedScopes`             | required      | 1 or more, no repeats; each 1 to 128 visible ASCII, no space |
+| `allowedExpiryDays`         | `[7, 30, 90]` | 1 or more, no repeats; each 1 to 3650                        |
+| `maxActiveTokensPerAccount` | 5             | 1 to 1000                                                    |
+| `lastUsedIntervalSeconds`   | 3600          | 0 to 86400                                                   |
+| `acceptLegacyDigests`       | `false`       | see "Import"                                                 |
+| `onAuditError`              | none          | a function; see "Audit and errors"                           |
+
+The token:
+
+- A token is the prefix and 43 base64url characters from 32 random bytes (256 bits). The whole
+  token matches `^<prefix>[A-Za-z0-9_-]{43}$`. Choose a distinct prefix, so that secret scanners
+  can find a leaked token.
+- `create` returns the token once. The store keeps only its HMAC (the `SecretHasher`, purpose
+  `api-token`), never the token. No result, error or audit event after `create` holds the token
+  or its digest.
+- `parseBearerToken(header)` returns the token of an `Authorization: Bearer <token>` header, or
+  null. It does not check the format; `verify` does.
+
+Rules:
+
+- `create` takes a name (1 to 64 characters; no control characters, no format characters such as
+  bidi controls and zero-width characters, no lone surrogates and no line or paragraph
+  separators, so a list shows the name as it reads; and not blank: at least one character other
+  than white space, U+00A0 and the invisible fillers U+034F, U+115F, U+1160, U+2800, U+3164 and
+  U+FFA0), scopes (a non-empty set from
+  `allowedScopes`, stored in the given order) and `expiresInDays` (one of `allowedExpiryDays`).
+  Invalid input throws `InvalidArgumentError`. It returns `limit_reached` if the account has
+  `maxActiveTokensPerAccount` active tokens (not revoked and not expired). Every store enforces
+  the limit atomically: parallel creates never leave more active tokens.
+- `verify` refuses a value that is not a string of the configured format (`malformed`) before
+  any digest or read. Then it makes one indexed read by digest, which also returns the status
+  of the account, and compares the stored digest again in constant time. It refuses `unknown`,
+  `revoked`, `expired` (at `expiresAt` and after) and `account_disabled`. If more than one stored
+  token matches (one token imported twice, see "Import"), it refuses `ambiguous`, whatever the
+  state, account or scopes of the copies: it never picks one. It looks for the legacy digest of
+  the token also when `acceptLegacyDigests` is off, so a second copy refuses the token in either
+  setting; a legacy copy alone verifies only while the option is on.
+- `verify` returns the account id, the token id, `expiresAt` and the stored scopes that
+  `allowedScopes` still lists, in stored order. If you remove a scope from `allowedScopes`,
+  tokens lose it at once (fewer rights, never more). A token with no listed scope left is
+  refused (`no_allowed_scope`). `list` shows the scopes as stored.
+- Scopes are opaque strings: identkit gives them no meaning. Check them in your code on every
+  request. If an agent acts for a person with narrower rights, intersect the token's scopes with
+  that grant before you act.
+- `verify` writes `lastUsedAt` at most once per `lastUsedIntervalSeconds`, with a conditional
+  write, and records `api_token.used` only then. So a verify is one read and at most one write.
+  Of concurrent verifies, one writes.
+- A revocation takes effect for every verify that starts after it. identkit does not delete rows:
+  `list` shows tokens that are not revoked, expired ones included.
+- Measured with `pnpm check:workerd` on 2026-11-27 (memory store, so without database time):
+  `apiTokens.verify` takes 0.0102 ms wall time per call in workerd and 0.0335 ms CPU time per call
+  on Node; `sessions.validate` took 0.0105 ms and 0.0291 ms in the same run. Every verify computes
+  the keyed HMAC and the unkeyed SHA-256 of the token (to find a legacy copy, see "Import"); the
+  figures include both. Workers Free allows 10 ms
+  CPU time per HTTP request (Cloudflare,
+  [Workers limits](https://developers.cloudflare.com/workers/platform/limits/), read 2026-11-27).
+
+Accounts and sessions:
+
+- `accounts.disable` revokes every token of the account (reason `account_disabled`), also when
+  the option `apiTokens` is not set, if the store has `apiTokens`. And `verify` refuses a token
+  whose account is not active, also one that a parallel `create` stored after the revocation.
+  If the token revocation throws (for example on a schema without the token table),
+  `accounts.disable` still revokes the sessions, offers its events to the sink and runs
+  `onAllSessionsRevoked`. The error that goes up, in this order:
+  - If the session revocation throws, its error goes up. The hook has not run, and the token
+    store's error is dropped.
+  - Else, if the hook throws, its `AllSessionsRevokedHookError` goes up. If the token
+    revocation failed too, the error carries the store's error as `tokenRevocationError`, and
+    its message says to call `accounts.disable` again and includes the store error's message.
+    An `Error` in that field serializes to `{}` in JSON, so log the message.
+  - Else, if the sink refused an event, the sink's error goes up unchanged, and the token
+    store's error is dropped.
+  - Else the token store's error goes up.
+
+  A failed hook leaves your application's sessions live, and a refused event is lost for good.
+  The tokens stay unusable while the account is disabled, but they are not revoked. So after
+  any error from `accounts.disable`, call it again until it succeeds. Until then the account's
+  API tokens may not be revoked, and enabling the account again directly in the store brings
+  them back. The retry repeats every step: it reports a token store error that persists,
+  revokes the remaining tokens, records their `api_token.revoked` events and runs the hook
+  again. It does not record `account.disabled` or `session.revoked` again, also not when the
+  sink refused them the first time.
+
+- Tokens are separate from sessions. `sessions.revokeAll`, a passkey or TOTP change and
+  `oidc.removeLink` do not revoke tokens (except a passkey or TOTP cleanup that disables the
+  account, see "Passkeys" and "TOTP"), and `onAllSessionsRevoked` is not called for tokens.
+  Call `apiTokens.revokeAll(accountId)` where a sign-out everywhere must also end tokens, for
+  example after an account takeover.
+- Every call except `verify` takes a bare account id and trusts its caller. Check the person
+  first: a session, and a fresh step-up for `create`.
+
+Audit and errors:
+
+- `api_token.created` and `api_token.imported` (with `tokenId` and `scopes`; the import also with
+  `method`, the digest algorithm), `api_token.revoked` (with `reason`: `revoked`, `revoked_all`
+  or `account_disabled`) and `api_token.used`.
+- If the sink refuses the event of `create` or `import`, identkit deletes the new token and throws
+  `OperationRolledBackError` (`hookFailed` false): nothing took effect. If that delete fails, the
+  store's error goes up and the token stands; a created token is then unusable, because its
+  plaintext was never returned, and it counts against the limit until you revoke it. An imported
+  token is different: its holder already has the plaintext, so the token verifies at once, and
+  no `api_token.imported` record exists. A retry of the import returns `already_imported` and
+  records nothing. So after such an error, either revoke the token (`list` shows it with
+  `source: "import"`; its owner then needs a new one), or keep it and record the import in your
+  own log.
+- If the sink refuses `api_token.revoked`, the revocation stands and the sink's error goes up.
+  `revokeAll` and `accounts.disable` offer every event to the sink before the first error goes
+  up.
+- `api_token.used` is the one exception to the sink contract (see "Audit events"): it is best
+  effort. If the sink refuses it, `verify` still returns `valid`, and identkit passes the error and
+  the event to the option `onAuditError(error, event)`; without the option the error is dropped.
+  `verify` awaits `onAuditError` and drops what it throws. The reason: the event is recorded on
+  the path of every API request, and a sink outage must not fail every request that a token
+  authenticates. The authentication decision does not depend on the event, and `lastUsedAt` is
+  written before it, so the next verify in the interval records nothing; the refused event is
+  lost. Report it from `onAuditError` if you need it.
+
+Import:
+
+- `import(input)` records a token from an earlier system, with `accountId`, `name`, `scopes`,
+  `expiresAt` (in the future, at most the longest `allowedExpiryDays` from now), optional
+  `createdAt` and `lastUsedAt` (neither in the future, and `lastUsedAt` not before a given
+  `createdAt`; a future `lastUsedAt` would stop every `lastUsedAt` write and `api_token.used`
+  event until that date), and exactly one of:
+  - `token`: the plaintext in the configured format. identkit stores its HMAC, as for a new
+    token. Prefer this form.
+  - `sha256Digest`: the unkeyed SHA-256 hex digest of the whole token. identkit stores it as a
+    legacy digest. This needs `acceptLegacyDigests: true`; without it, `import` throws
+    `NotConfiguredError`.
+- Results: `imported`, `already_imported` (idempotent), `revoked` (the account held it and it
+  was revoked; it stays revoked), `digest_taken` (another account holds it), `expired`,
+  `limit_reached`, `no_account` or `account_disabled`. Imports count against
+  `maxActiveTokensPerAccount`; raise it for the migration if accounts hold more tokens.
+- Imported tokens must have the configured format, or they never verify.
+- `name` follows the rules of `create`. A source token whose name is blank after the check for
+  blank characters (for example only spaces or Hangul fillers) fails to import with
+  `InvalidArgumentError`; give it a name first.
+- A legacy digest is weaker than the HMAC: whoever can read the table can test guesses offline
+  without a key. With 256-bit random tokens that is no practical attack, but a token from an
+  earlier system may have less entropy than its format suggests. Rotate legacy tokens out:
+  `list` marks them `legacyDigest: true`; ask the owners to create new tokens, revoke the legacy
+  ones after a deadline, then set `acceptLegacyDigests: false`. That stops every legacy token at
+  once. identkit does not replace a legacy digest on use.
+- A row verifies only with the digest of its own algorithm: a legacy row never matches the HMAC
+  of a token, and a keyed row never matches its SHA-256.
+- One token, one row. An import with `token` also looks for the legacy digest of that token (also
+  when `acceptLegacyDigests` is off now), so it reports `already_imported`, `revoked` or
+  `digest_taken` for a token that an earlier import stored as a legacy digest. A revoked copy
+  keeps the token revoked. The other direction has a limit: an import with `sha256Digest` cannot
+  find a keyed row of the same token, because the HMAC needs the plaintext. If you import one
+  token in both forms in that order (or both at once), `verify` refuses it as `ambiguous`,
+  whether `acceptLegacyDigests` is on or off, and revoking one copy does not change that: both
+  rows stay. Import each token in one form only. A token stored twice stays unusable; its owner
+  creates a new one. The two copies can sit on different accounts, and `list(accountId)` shows
+  only the copies of that account (`legacyDigest: true` marks a legacy copy). To move a legacy
+  token to the HMAC, the owner creates a new token; identkit does not replace a stored digest.
+
 ## Identity verification port
 
 Implement `IdentityVerificationAdapter` for a vendor: `start`, `parseCallback` (authenticate the
@@ -781,7 +993,8 @@ nobody. Without `callbackSecret` it signs callbacks with a random secret per ins
 ## Audit events
 
 identkit awaits `audit.emit` for every security-relevant event. If the sink throws, the call
-throws, but what identkit wrote before the event stands: a refused event undoes no revocation and
+throws, but what identkit wrote before the event stands (one exception: `api_token.used` is best
+effort, see "Personal API tokens"): a refused event undoes no revocation and
 no factor change (see Sessions; only `OperationRolledBackError` means that nothing took effect).
 `accounts.disable` records `account.disabled` only if the account was still active, so a retry
 does not record it twice; a refused `account.disabled` is then missing. Events carry ids and
@@ -791,6 +1004,9 @@ provisioning URI or e-mail address. `addressDigest` is the HMAC of the address, 
 OIDC events carry `provider` and, where one exists, `linkId`, never an ID token, code, client
 secret, subject or address: `oidc.signed_in`, `oidc.sign_in_failed` (reason), `oidc.binding_refused`
 (reason and `addressDigest`), `oidc.link_created`, `oidc.link_imported` and `oidc.link_removed`.
+
+API token events carry `tokenId`, never the token or its digest: `api_token.created`,
+`api_token.imported`, `api_token.revoked` and `api_token.used` (see "Personal API tokens").
 
 ## Cookies
 
@@ -838,6 +1054,22 @@ lose a newer method for good: it stays lost after every instance runs the newer 
 decision of identkit reads the session's methods, but if your code does (for example "only
 sessions with `oidc`"), it gets the wrong answer for such a session. This is one more reason to
 deploy a release to every instance before you turn on a method that it adds, as for `oidc`.
+
+Migration `0005_api_tokens.sql` (D1: `0003_api_tokens.sql`) adds the table `identkit_api_tokens`.
+It changes nothing else, so the previous release runs on the new schema. The previous release
+does not know the table: it does not revoke tokens on `accounts.disable`. Tokens of an account
+disabled by such an instance still fail `verify`, because `verify` checks the account status.
+
+Upgrade note: apply `0005_api_tokens.sql` (D1: `0003_api_tokens.sql`) before you deploy this
+release, also if you do not use API tokens. `accounts.disable` revokes the tokens of the account
+in every store that has `apiTokens`, and the built-in stores all have it. Without the table,
+every `accounts.disable` disables the account, revokes its sessions and runs
+`onAllSessionsRevoked`, and then throws the database error, until the migration runs.
+
+A custom store needs the member `apiTokens` (`insert`, `findByDigests`, `listByAccount`,
+`markUsed`, `revoke`, `revokeAllForAccount`, `delete`) to use personal API tokens. It is
+optional in the type, like `oidcLinks`. `insert` must apply the active-token limit atomically,
+and `findByDigests` must return the account status from the same read.
 
 A custom store needs the member `oidcLinks` (`insert(link, { exclusive })`, `findByKey`,
 `listByAccount`, `delete`) to use OIDC sign-in. It is optional in the type, so a custom store
@@ -958,7 +1190,8 @@ example `window_start < ?1 AND (locked_until IS NULL OR locked_until < ?1)` with
 
 identkit leaves these to the consumer:
 
-- Purge old rows. identkit does not delete them (see "Storage"). Each `passkeys.startSignIn` and
+- Purge old rows. identkit does not delete them (see "Storage"), revoked and expired API tokens
+  included. Each `passkeys.startSignIn` and
   each `emailSignIn.requestCode` writes rows without authentication (a challenge; a flow, a send
   gate and a mail), so without a scheduled job these tables grow with every call.
 - Purge `identkit_throttles` only by this rule, or not at all. A deleted row resets the failure
@@ -996,10 +1229,13 @@ identkit leaves these to the consumer:
     success or an unlock stays incomplete.
 
   A store does not need `lockDuration`: `applyThrottle` computes the lock. The PostgreSQL store
-  expects the isolation level READ COMMITTED, the PostgreSQL default.
+  expects the isolation level READ COMMITTED, the PostgreSQL default. Under REPEATABLE READ or
+  SERIALIZABLE, the `lastUsedAt` write of `apiTokens.verify` treats a serialization failure or a
+  deadlock (SQLSTATE 40001 or 40P01) as a lost race: no write, no event, and `verify` still
+  returns `valid`.
 
 - Limit unauthenticated calls in your HTTP layer: per client and in total, for `requestCode`,
-  `startSignIn` and every verify route. identkit limits per address and per account only.
+  `startSignIn`, every verify route and every route that calls `apiTokens.verify`. identkit limits per address and per account only.
 - Treat audit events as personal data where the payload is. Approval events carry
   `payloadHash`, a plain SHA-256 of the approved payload. If the payload has low entropy (for
   example an account number and an amount), a reader of the audit log can find it by trying
@@ -1042,8 +1278,10 @@ After a change in `migrations-d1/`, run `pnpm generate:d1-migrations`. A test fa
 
 - Token issuance: identkit is no OpenID Connect provider or authorization server. Sign-in
   through an external provider is built (see "External sign-in (OpenID Connect)").
-- Delegated access to provider APIs (refresh tokens for Microsoft Graph or Google APIs), personal
-  API tokens, SMS codes and delegated agent identities.
+- Delegated access to provider APIs (refresh tokens for Microsoft Graph or Google APIs), SMS codes
+  and delegated agent identities. API token scopes are opaque strings, so a later grant for an
+  agent can narrow them.
+- Replacing a legacy API token digest with the HMAC on use.
 - OpenID Connect discovery, `private_key_jwt` client authentication, `form_post` response mode
   and the `iss` callback parameter (RFC 9207).
 - QR code rendering: identkit returns the provisioning URI as a string.

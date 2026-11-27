@@ -47,6 +47,7 @@ describe.skipIf(!url)("postgresql", () => {
       "0002_totp.sql",
       "0003_lockout_and_enrollment_revocation.sql",
       "0004_oidc_links.sql",
+      "0005_api_tokens.sql",
     ]);
     expect(await migrateIdentkit(db)).toEqual([]);
     store = createPostgresStore(db);

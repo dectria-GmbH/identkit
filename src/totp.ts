@@ -1,4 +1,5 @@
 import { toAccountView, type AccountView } from "./accounts.js";
+import { emitApiTokensRevoked, revokeAllApiTokens } from "./api-tokens.js";
 import { addSeconds } from "./clock.js";
 import type { Context } from "./context.js";
 import { randomId } from "./crypto.js";
@@ -431,7 +432,13 @@ export function createTotp(
       // ends.
       const remove = async () => store.totp.delete(factor.id, factor.accountId);
       const removeAll = async () => store.totp.deleteAllForAccount(factor.accountId);
-      const disable = async () => store.accounts.setStatus(factor.accountId, "disabled");
+      // As `accounts.disable`: the status, then the account's API tokens, whose ids it returns.
+      // A token store error counts as a failed disable: an operator who enables the account
+      // again must know that its tokens may still be live.
+      const disable = async () => {
+        await store.accounts.setStatus(factor.accountId, "disabled");
+        return revokeAllApiTokens(ctx, factor.accountId, "account_disabled");
+      };
       // Removes the factor and revokes every session of the account. Returns the revocation, or
       // null and the store's error if the revocation failed, for `finishRollback`. If the factor
       // cannot be removed, the rollback is incomplete: `undo` disables the account, runs the
@@ -443,12 +450,10 @@ export function createTotp(
         } catch (error) {
           // The factor may still be active with a secret that someone without the grant
           // knows: fail closed and disable the account until an operator looks at it.
-          const disabled = await disable()
+          const tokenIds = await disable()
             .catch(disable)
-            .then(
-              () => true,
-              () => false,
-            );
+            .catch(() => null);
+          const disabled = tokenIds !== null;
           await ctx
             .emit({
               type: "totp.enrolment_failed",
@@ -467,6 +472,9 @@ export function createTotp(
                 reason: "totp_cleanup",
               })
               .catch(() => undefined);
+            await emitApiTokensRevoked(ctx, factor.accountId, tokenIds, "account_disabled").catch(
+              () => undefined,
+            );
           }
           cleanupFailure = { error };
         }

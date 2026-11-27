@@ -7,6 +7,7 @@ import {
   NotConfiguredError,
   OperationRolledBackError,
   SealedSecretError,
+  type IdentkitStore,
   type SecretSealer,
 } from "../src/index.js";
 import { base32Decode } from "../src/totp-core.js";
@@ -401,6 +402,79 @@ describe("TOTP enrolment", () => {
         expect(t.audit.ofType("totp.enrolment_failed").map((e) => e.reason)).toContain(
           "cleanup_failed_account_disabled",
         );
+      }
+    }
+  });
+
+  it("rule: a cleanup that disables the account also revokes its API tokens", async () => {
+    for (const tokenStoreFails of [false, true]) {
+      const label = tokenStoreFails ? "token store fails" : "token store works";
+      const hooked = hookedTotpStore();
+      const { inner, hooks } = hooked;
+      const tokens = inner.apiTokens;
+      if (!tokens) throw new Error("memory store has apiTokens");
+      let tokenFailures = 0;
+      const store: IdentkitStore = {
+        ...hooked.store,
+        apiTokens: {
+          ...tokens,
+          revokeAllForAccount: async (...args) => {
+            if (tokenFailures > 0) {
+              tokenFailures -= 1;
+              throw new Error("no such table: identkit_api_tokens");
+            }
+            return tokens.revokeAllForAccount(...args);
+          },
+        },
+      };
+      const t = setup({ store, apiTokens: { prefix: "pat_", allowedScopes: ["read:items"] } });
+      const user = await t.signIn("person@example.org");
+      const apiToken = await t.ik.apiTokens.create({
+        accountId: user.account.id,
+        name: "ci",
+        scopes: ["read:items"],
+        expiresInDays: 30,
+      });
+      if (apiToken.status !== "created") throw new Error(apiToken.status);
+      const start = await t.ik.totp.startEnrolment(user.token);
+      if (start.status !== "ok") throw new Error("denied");
+      hooks.beforeActivate = async () => {
+        await inner.sessions.revoke(user.session.id, t.clock.now(), "test");
+      };
+      hooks.failTotpDelete = 3;
+      tokenFailures = tokenStoreFails ? 2 : 0;
+      await expect(
+        t.ik.totp.confirmEnrolment(user.token, {
+          factorId: start.factorId,
+          code: t.totpCode(start.secret),
+        }),
+        label,
+      ).rejects.toThrow("store unavailable");
+      expect((await inner.accounts.findById(user.account.id))?.status, label).toBe("disabled");
+      const reasons = t.audit.ofType("totp.enrolment_failed").map((e) => e.reason);
+      if (tokenStoreFails) {
+        // The token revocation failed twice: the disable counts as failed, and the audit
+        // trail says so.
+        expect(reasons, label).toContain("cleanup_failed_disable_failed");
+        expect(t.audit.ofType("account.disabled"), label).toHaveLength(0);
+        expect(t.audit.ofType("api_token.revoked"), label).toHaveLength(0);
+        // The operator step from the README: call accounts.disable before the re-enable.
+        await t.ik.accounts.disable(user.account.id);
+      } else {
+        expect(reasons, label).toContain("cleanup_failed_account_disabled");
+      }
+      // Review r3: the cleanup disabled the account with a bare status write, so enabling it
+      // again in the store brought its API tokens back.
+      await inner.accounts.setStatus(user.account.id, "active");
+      expect(await t.ik.apiTokens.verify(apiToken.token), label).toEqual({
+        status: "refused",
+        reason: "revoked",
+      });
+      if (!tokenStoreFails) {
+        expect(
+          t.audit.ofType("api_token.revoked").map((e) => `${e.tokenId} ${e.reason}`),
+          label,
+        ).toEqual([`${apiToken.apiToken.id} account_disabled`]);
       }
     }
   });

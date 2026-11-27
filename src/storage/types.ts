@@ -201,6 +201,49 @@ export interface OidcLinkRecord {
  */
 export type InsertOidcLinkResult = "inserted" | "link_taken" | "account_has_link";
 
+/**
+ * How the stored digest of a personal API token was made. `hmac-sha256`: the keyed HMAC of the
+ * `SecretHasher` (purpose `api-token`), for every token that identkit creates. `sha256`: an
+ * unkeyed SHA-256 hex digest of the whole token, only for tokens imported from an earlier
+ * system. It is weaker: whoever reads the table can test guesses offline without a key.
+ */
+export type ApiTokenDigestAlgorithm = "hmac-sha256" | "sha256";
+
+/** `created`: by `apiTokens.create`. `import`: by `apiTokens.import`. */
+export type ApiTokenSource = "created" | "import";
+
+/** A personal API token. The store holds only its digest, never the token. */
+export interface ApiTokenRecord {
+  id: string;
+  accountId: string;
+  /** A label the owner chose, at most 64 characters. */
+  name: string;
+  /** Opaque scope strings, stored and returned as given. */
+  scopes: string[];
+  /** Lowercase hex digest of the whole token. Unique. */
+  digest: string;
+  digestAlgorithm: ApiTokenDigestAlgorithm;
+  source: ApiTokenSource;
+  createdAt: Date;
+  expiresAt: Date;
+  /** Updated at most once per `lastUsedIntervalSeconds`. */
+  lastUsedAt: Date | null;
+  revokedAt: Date | null;
+  revokeReason: string | null;
+}
+
+/** A token found by digest, with the status of its account from the same read. */
+export interface ApiTokenLookup {
+  record: ApiTokenRecord;
+  accountStatus: AccountStatus;
+}
+
+/**
+ * `limit_reached`: the account has `maxActive` active tokens (not revoked, not expired) already.
+ * `digest_taken`: a token with this digest exists, revoked or not, for any account.
+ */
+export type InsertApiTokenResult = "inserted" | "limit_reached" | "digest_taken";
+
 export type LinkPersonResult =
   "linked" | "already_linked" | "person_linked_elsewhere" | "account_has_other_person";
 
@@ -395,6 +438,41 @@ export interface IdentkitStore {
     /** The links of the account, oldest first. */
     listByAccount(accountId: string): Promise<OidcLinkRecord[]>;
     /** Deletes the link of the account. Returns false if there is none with this id. */
+    delete(id: string, accountId: string): Promise<boolean>;
+  };
+  /**
+   * Personal API tokens. Optional, so a store written for an earlier release still fits the
+   * type; `createIdentkit` throws `NotConfiguredError` if the `apiTokens` option is set and the
+   * store has no `apiTokens`. The built-in stores implement it.
+   */
+  apiTokens?: {
+    /**
+     * Atomically inserts the token unless a token with its digest exists (`digest_taken`) or
+     * the account has `limit.maxActive` or more active tokens at `limit.at` (`limit_reached`).
+     * Active means not revoked and `expiresAt` after `limit.at`. Concurrent inserts for one
+     * account never leave more than `limit.maxActive` active tokens.
+     */
+    insert(
+      token: ApiTokenRecord,
+      limit: { maxActive: number; at: Date },
+    ): Promise<InsertApiTokenResult>;
+    /**
+     * The tokens whose digest is one of `digests`, revoked and expired ones included, each with
+     * the status of its account, read in one query. identkit passes at most two digests.
+     */
+    findByDigests(digests: readonly string[]): Promise<ApiTokenLookup[]>;
+    /** The tokens of the account that are not revoked, expired ones included, oldest first. */
+    listByAccount(accountId: string): Promise<ApiTokenRecord[]>;
+    /**
+     * Atomically sets `lastUsedAt` to `at` if the token is not revoked and its `lastUsedAt` is
+     * null or at most `notAfter`. Returns false otherwise, so of concurrent calls one writes.
+     */
+    markUsed(id: string, at: Date, notAfter: Date): Promise<boolean>;
+    /** Revokes the token of the account. Returns true if this call revoked it. */
+    revoke(id: string, accountId: string, at: Date, reason: string): Promise<boolean>;
+    /** Revokes every token of the account that is not revoked yet. Returns their ids. */
+    revokeAllForAccount(accountId: string, at: Date, reason: string): Promise<string[]>;
+    /** Deletes the token of the account, for a rollback. Returns false if it is gone. */
     delete(id: string, accountId: string): Promise<boolean>;
   };
 }

@@ -1,3 +1,4 @@
+import { createHash, randomBytes } from "node:crypto";
 import { expect, it } from "vitest";
 import type { IdentkitStore } from "../src/storage/types.js";
 import { mfaPolicy, otherCode, setup, STEP, testConfig } from "./helpers.js";
@@ -172,5 +173,147 @@ export function runStoreFlows(name: string, store: () => IdentkitStore) {
     );
     expect(accounts.size).toBe(1);
     expect(await t.ik.oidc.listLinks(String([...accounts][0]))).toHaveLength(1);
+  });
+
+  it(`flows: API tokens, cap under parallel creates, verify, lastUsedAt, revoke and disable against ${name}`, async () => {
+    const t = setup({
+      store: store(),
+      apiTokens: {
+        prefix: "pat_",
+        allowedScopes: ["read", "write"],
+        maxActiveTokensPerAccount: 3,
+        acceptLegacyDigests: true,
+      },
+    });
+    const tag = randomBytes(6).toString("hex");
+    const created = await t.ik.accounts.create({ email: `flows-tokens-${tag}@example.org` });
+    if (created.status !== "created") throw new Error(created.status);
+    const accountId = created.account.id;
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        t.ik.apiTokens.create({
+          accountId,
+          name: "ci",
+          scopes: ["write", "read"],
+          expiresInDays: 7,
+        }),
+      ),
+    );
+    const tokens = results.flatMap((r) => (r.status === "created" ? [r] : []));
+    expect(tokens).toHaveLength(3);
+    expect(results.filter((r) => r.status === "limit_reached")).toHaveLength(5);
+    const [first, second] = tokens;
+    if (!first || !second) throw new Error("no tokens");
+
+    const verified = await Promise.all([0, 1, 2, 3].map(() => t.ik.apiTokens.verify(first.token)));
+    expect(verified.every((v) => v.status === "valid")).toBe(true);
+    expect(verified[0]).toEqual({
+      status: "valid",
+      accountId,
+      tokenId: first.apiToken.id,
+      scopes: ["write", "read"],
+      expiresAt: first.apiToken.expiresAt,
+    });
+    expect(t.audit.ofType("api_token.used")).toHaveLength(1);
+    t.clock.advanceSeconds(3600);
+    await t.ik.apiTokens.verify(first.token);
+    expect(t.audit.ofType("api_token.used")).toHaveLength(2);
+    const listed = await t.ik.apiTokens.list(accountId);
+    expect(listed).toHaveLength(3);
+    expect(listed.find((v) => v.id === first.apiToken.id)?.lastUsedAt).toEqual(t.clock.now());
+
+    expect(await t.ik.apiTokens.revoke({ accountId, tokenId: first.apiToken.id })).toBe(true);
+    expect(await t.ik.apiTokens.verify(first.token)).toEqual({
+      status: "refused",
+      reason: "revoked",
+    });
+
+    // A legacy SHA-256 digest imports, verifies, and counts against the cap.
+    const legacyToken = `pat_${randomBytes(32).toString("base64url")}`;
+    const imported = await t.ik.apiTokens.import({
+      accountId,
+      name: "legacy",
+      scopes: ["read"],
+      expiresAt: new Date(t.clock.now().getTime() + 86_400_000),
+      sha256Digest: createHash("sha256").update(legacyToken).digest("hex"),
+    });
+    expect(imported.status).toBe("imported");
+    expect((await t.ik.apiTokens.verify(legacyToken)).status).toBe("valid");
+    expect(
+      (await t.ik.apiTokens.create({ accountId, name: "x", scopes: ["read"], expiresInDays: 7 }))
+        .status,
+    ).toBe("limit_reached");
+
+    t.clock.advanceSeconds(7 * 86_400);
+    expect(await t.ik.apiTokens.verify(second.token)).toEqual({
+      status: "refused",
+      reason: "expired",
+    });
+    await t.ik.accounts.disable(accountId);
+    expect(await t.ik.apiTokens.verify(legacyToken)).toEqual({
+      status: "refused",
+      reason: "revoked",
+    });
+    expect(await t.ik.apiTokens.list(accountId)).toEqual([]);
+  });
+
+  it(`flows: API tokens, one token in two forms on two accounts never verifies against ${name}`, async () => {
+    const t = setup({
+      store: store(),
+      apiTokens: { prefix: "pat_", allowedScopes: ["read", "write"], acceptLegacyDigests: true },
+    });
+    const tag = randomBytes(6).toString("hex");
+    const ids: string[] = [];
+    for (const who of ["a", "b"]) {
+      const created = await t.ik.accounts.create({
+        email: `flows-twice-${who}-${tag}@example.org`,
+      });
+      if (created.status !== "created") throw new Error(created.status);
+      ids.push(created.account.id);
+    }
+    const [a, b] = ids;
+    if (!a || !b) throw new Error("no accounts");
+    const base = {
+      name: "twice",
+      scopes: ["read"],
+      expiresAt: new Date(t.clock.now().getTime() + 86_400_000),
+    };
+
+    // Legacy first: the plaintext import finds the legacy row.
+    const first = `pat_${randomBytes(32).toString("base64url")}`;
+    expect(
+      (
+        await t.ik.apiTokens.import({
+          ...base,
+          accountId: a,
+          sha256Digest: createHash("sha256").update(first).digest("hex"),
+        })
+      ).status,
+    ).toBe("imported");
+    expect(await t.ik.apiTokens.import({ ...base, accountId: b, token: first })).toEqual({
+      status: "digest_taken",
+    });
+    expect(await t.ik.apiTokens.verify(first)).toMatchObject({ status: "valid", accountId: a });
+
+    // Keyed first: both rows stand, and verify refuses whatever order the store returns.
+    const second = `pat_${randomBytes(32).toString("base64url")}`;
+    expect((await t.ik.apiTokens.import({ ...base, accountId: b, token: second })).status).toBe(
+      "imported",
+    );
+    expect(
+      (
+        await t.ik.apiTokens.import({
+          ...base,
+          accountId: a,
+          sha256Digest: createHash("sha256").update(second).digest("hex"),
+        })
+      ).status,
+    ).toBe("imported");
+    const results = await Promise.all(
+      Array.from({ length: 5 }, () => t.ik.apiTokens.verify(second)),
+    );
+    for (const result of results) {
+      expect(result).toEqual({ status: "refused", reason: "ambiguous" });
+    }
   });
 }

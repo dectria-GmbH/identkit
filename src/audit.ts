@@ -1,6 +1,6 @@
 /**
- * Security-relevant events. Events never carry a code, token, challenge, key, TOTP secret,
- * sealed secret, provisioning URI, e-mail address, ID token or provider subject. `addressDigest` is a keyed hash of the normalized address, so a consumer can
+ * Security-relevant events. Events never carry a code, token, token digest, challenge, key, TOTP
+ * secret, sealed secret, provisioning URI, e-mail address, ID token or provider subject. `addressDigest` is a keyed hash of the normalized address, so a consumer can
  * correlate events for one address without identkit writing the address itself.
  */
 export type AuditEventType =
@@ -51,7 +51,11 @@ export type AuditEventType =
   | "oidc.binding_refused"
   | "oidc.link_created"
   | "oidc.link_imported"
-  | "oidc.link_removed";
+  | "oidc.link_removed"
+  | "api_token.created"
+  | "api_token.imported"
+  | "api_token.revoked"
+  | "api_token.used";
 
 export interface AuditEvent {
   type: AuditEventType;
@@ -76,11 +80,17 @@ export interface AuditEvent {
   provider?: string;
   /** OIDC events: id of the link between an account and a provider subject. */
   linkId?: string;
+  /** API token events: the token's id, never the token or its digest. */
+  tokenId?: string;
+  /** `api_token.created` and `api_token.imported`: the scopes the token was given. */
+  scopes?: string[];
 }
 
 /**
  * Receives audit events. identkit awaits `emit`; if it throws, the calling operation
- * fails, so an operation never succeeds without its audit record.
+ * fails, so an operation never succeeds without its audit record. One exception:
+ * `api_token.used` is best effort, and `apiTokens.verify` still succeeds (see the option
+ * `apiTokens.onAuditError`).
  */
 export interface AuditSink {
   emit(event: AuditEvent): void | Promise<void>;

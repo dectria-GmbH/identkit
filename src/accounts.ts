@@ -1,7 +1,9 @@
+import { emitApiTokensRevoked, revokeAllApiTokens } from "./api-tokens.js";
 import type { Context } from "./context.js";
 import { randomBytes, toBase64Url } from "./bytes.js";
 import { randomId } from "./crypto.js";
 import { normalizeEmail } from "./email.js";
+import { AllSessionsRevokedHookError } from "./errors.js";
 import { throttleKey as otpThrottleKey } from "./email-otp.js";
 import { totpEnrolmentThrottleKey, totpThrottleKey } from "./throttle-keys.js";
 import { finishThenRunHook, type Revocation } from "./sessions.js";
@@ -33,8 +35,9 @@ export interface Accounts {
   get(accountId: string): Promise<AccountView | null>;
   findByEmail(email: string): Promise<AccountView | null>;
   /**
-   * Disables the account and revokes all its sessions. Records `account.disabled` only if the
-   * account was not disabled yet, so a retry after an error does not record it twice.
+   * Disables the account and revokes all its sessions and personal API tokens. Records
+   * `account.disabled` only if the account was not disabled yet, so a retry after an error does
+   * not record it twice.
    */
   disable(accountId: string): Promise<void>;
   /**
@@ -144,19 +147,63 @@ export function createAccounts(
       const changed = record.status !== "disabled";
       const event = { type: "account.disabled", accountId } as const;
       await store.accounts.setStatus(accountId, "disabled");
+      // API tokens first, but sessions and the hook do not depend on them: a store error there
+      // (for example a schema without the token table) must not leave the account's sessions
+      // live. That error goes up at the end; `verify` refuses tokens of a disabled account anyway.
+      let tokenIds: string[] = [];
+      let tokenFailure: { error: unknown } | null = null;
+      try {
+        tokenIds = await revokeAllApiTokens(ctx, accountId, "account_disabled");
+      } catch (error) {
+        tokenFailure = { error };
+      }
       let revoked: Revocation;
       try {
         revoked = await revokeAll(accountId);
       } catch (error) {
-        // A retry finds the account disabled and does not record it: record it now.
+        // A retry finds the account disabled and these tokens revoked, and records neither:
+        // record them now.
         if (changed) await ctx.emit(event).catch(() => undefined);
+        await emitApiTokensRevoked(ctx, accountId, tokenIds, "account_disabled").catch(
+          () => undefined,
+        );
         throw error;
       }
-      // Hook last: a throwing hook must not skip the audit event, nor a throwing sink the hook.
-      // A retry revokes and runs the hook again.
-      await finishThenRunHook(revoked, async () => {
-        if (changed) await ctx.emit(event);
+      // Hook last: a throwing hook must not skip the audit events, nor a throwing sink the hook.
+      // Which error goes up: the hook's, then the sink's, then the token store's. Only a failed
+      // hook leaves something live, and a refused event is lost for good: a retry of `disable`
+      // repeats the token revocation, its `api_token.revoked` events and the hook, but records
+      // neither `account.disabled` (the account is disabled already) nor `session.revoked` (the
+      // sessions are revoked already). The tokens stay unusable while the account is disabled,
+      // but a retry is the only call that revokes them. The hook's error carries the token
+      // store's error as `tokenRevocationError`; the sink's error is not changed, so after it
+      // the token store's error shows only on the retry.
+      const finished = finishThenRunHook(revoked, async () => {
+        let failure: { error: unknown } | null = null;
+        try {
+          if (changed) await ctx.emit(event);
+        } catch (error) {
+          failure = { error };
+        }
+        try {
+          await emitApiTokensRevoked(ctx, accountId, tokenIds, "account_disabled");
+        } catch (error) {
+          failure ??= { error };
+        }
+        if (failure) throw failure.error;
       });
+      if (!tokenFailure) return finished;
+      try {
+        await finished;
+      } catch (error) {
+        if (!(error instanceof AllSessionsRevokedHookError)) throw error;
+        throw new AllSessionsRevokedHookError(error.accountId, error.exceptSessionId, {
+          cause: error.cause,
+          auditError: error.auditError,
+          tokenRevocationError: tokenFailure.error,
+        });
+      }
+      throw tokenFailure.error;
     },
   };
 }

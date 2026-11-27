@@ -401,6 +401,103 @@ describe("passkey registration races", () => {
     );
   });
 
+  it("a cleanup that disables the account also revokes its API tokens", async () => {
+    for (const tokenStoreFails of [false, true]) {
+      const label = tokenStoreFails ? "token store fails" : "token store works";
+      const inner = createMemoryStore();
+      const tokens = inner.apiTokens;
+      if (!tokens) throw new Error("memory store has apiTokens");
+      const fail = { delete: 0, tokens: 0 };
+      let afterActivate: (() => Promise<void>) | null = null;
+      const store: IdentkitStore = {
+        ...inner,
+        apiTokens: {
+          ...tokens,
+          revokeAllForAccount: async (...args) => {
+            if (fail.tokens > 0) {
+              fail.tokens -= 1;
+              throw new Error("no such table: identkit_api_tokens");
+            }
+            return tokens.revokeAllForAccount(...args);
+          },
+        },
+        credentials: {
+          ...inner.credentials,
+          activate: async (...args) => {
+            const result = await inner.credentials.activate(...args);
+            const hook = afterActivate;
+            afterActivate = null;
+            if (hook) await hook();
+            return result;
+          },
+          delete: async (...args) => {
+            if (fail.delete > 0) {
+              fail.delete -= 1;
+              throw new Error("connection reset");
+            }
+            return inner.credentials.delete(...args);
+          },
+        },
+      };
+      const t = setup({
+        store,
+        policy: { ...emailFirstPolicy, createAccountOnFirstSignIn: false },
+        apiTokens: { prefix: "pat_", allowedScopes: ["read:items"] },
+      });
+      const created = await t.ik.accounts.create({ email: "staff@example.org" });
+      if (created.status !== "created") throw new Error("not created");
+      const accountId = created.account.id;
+      const apiToken = await t.ik.apiTokens.create({
+        accountId,
+        name: "ci",
+        scopes: ["read:items"],
+        expiresInDays: 30,
+      });
+      if (apiToken.status !== "created") throw new Error(apiToken.status);
+      const { token } = await t.ik.passkeys.issueEnrollmentToken(accountId);
+      const start = await t.ik.passkeys.startRegistration({ enrollmentToken: token });
+      if (start.status !== "ok") throw new Error("denied");
+      afterActivate = async () => {
+        await t.ik.passkeys.revokeEnrollmentTokens(accountId);
+        fail.delete = 2;
+        fail.tokens = tokenStoreFails ? 2 : 0;
+      };
+      const error: unknown = await t.ik.passkeys
+        .finishRegistration({ enrollmentToken: token }, t.authenticator.register(start.options))
+        .then(
+          () => null,
+          (e: unknown) => e,
+        );
+      expect((await t.ik.accounts.get(accountId))?.status, label).toBe("disabled");
+      const reasons = t.audit.ofType("passkey.registration_failed").map((e) => e.reason);
+      if (tokenStoreFails) {
+        // The token revocation failed twice: the disable counts as failed, so the caller and
+        // the audit trail learn that the account's tokens may still be live.
+        expect(error, label).toBeInstanceOf(PasskeyCleanupError);
+        expect(reasons, label).toContain("cleanup_failed_disable_failed");
+        expect(t.audit.ofType("api_token.revoked"), label).toHaveLength(0);
+        // The operator step from the README: call accounts.disable before the re-enable.
+        await t.ik.accounts.disable(accountId);
+      } else {
+        expect(error, label).toEqual(new Error("connection reset"));
+        expect(reasons, label).toContain("cleanup_failed_account_disabled");
+      }
+      // Review r3: the cleanup disabled the account with a bare status write, so enabling it
+      // again in the store brought its API tokens back.
+      await inner.accounts.setStatus(accountId, "active");
+      expect(await t.ik.apiTokens.verify(apiToken.token), label).toEqual({
+        status: "refused",
+        reason: "revoked",
+      });
+      if (!tokenStoreFails) {
+        expect(
+          t.audit.ofType("api_token.revoked").map((e) => `${e.tokenId} ${e.reason}`),
+          label,
+        ).toEqual([`${apiToken.apiToken.id} account_disabled`]);
+      }
+    }
+  });
+
   it("a cleanup whose deletes and disables all fail throws PasskeyCleanupError", async () => {
     for (const scenario of ["grant lost", "grant lost, revokeAll fails", "activate throws"]) {
       const inner = createMemoryStore();

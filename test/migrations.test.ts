@@ -48,4 +48,14 @@ describe("migrations", () => {
     ]);
     expect(text).not.toMatch(/\b(DROP|RENAME|ALTER)\b/i);
   });
+
+  it("splits the API token migration into its statements, a new table only", () => {
+    const text = readFileSync(join(MIGRATIONS_DIR, "0005_api_tokens.sql"), "utf8");
+    const statements = splitStatements(text);
+    expect(statements.map((s) => s.split(/\s+/).slice(0, 3).join(" "))).toEqual([
+      "CREATE TABLE identkit_api_tokens",
+      "CREATE INDEX identkit_api_tokens_account_idx",
+    ]);
+    expect(text).not.toMatch(/\b(DROP|RENAME|ALTER)\b/i);
+  });
 });
