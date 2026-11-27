@@ -818,6 +818,7 @@ Options (configurable; the defaults are design choices, not values from a standa
 | `maxActiveTokensPerAccount` | 5             | 1 to 1000                                                    |
 | `lastUsedIntervalSeconds`   | 3600          | 0 to 86400                                                   |
 | `acceptLegacyDigests`       | `false`       | see "Import"                                                 |
+| `onAuditError`              | none          | a function; see "Audit and errors"                           |
 
 The token:
 
@@ -832,7 +833,9 @@ The token:
 
 Rules:
 
-- `create` takes a name (1 to 64 characters, no control characters), scopes (a non-empty set from
+- `create` takes a name (1 to 64 characters; no control characters, no format characters such as
+  bidi controls and zero-width characters, no lone surrogates and no line or paragraph
+  separators, so a list shows the name as it reads), scopes (a non-empty set from
   `allowedScopes`, stored in the given order) and `expiresInDays` (one of `allowedExpiryDays`).
   Invalid input throws `InvalidArgumentError`. It returns `limit_reached` if the account has
   `maxActiveTokensPerAccount` active tokens (not revoked and not expired). Every store enforces
@@ -840,7 +843,9 @@ Rules:
 - `verify` refuses a value that is not a string of the configured format (`malformed`) before
   any digest or read. Then it makes one indexed read by digest, which also returns the status
   of the account, and compares the stored digest again in constant time. It refuses `unknown`,
-  `revoked`, `expired` (at `expiresAt` and after) and `account_disabled`.
+  `revoked`, `expired` (at `expiresAt` and after) and `account_disabled`. If more than one stored
+  token matches (one token imported twice, see "Import"), it refuses `ambiguous`, whatever the
+  state, account or scopes of the copies: it never picks one.
 - `verify` returns the account id, the token id, `expiresAt` and the stored scopes that
   `allowedScopes` still lists, in stored order. If you remove a scope from `allowedScopes`,
   tokens lose it at once (fewer rights, never more). A token with no listed scope left is
@@ -866,6 +871,9 @@ Accounts and sessions:
 - `accounts.disable` revokes every token of the account (reason `account_disabled`), also when
   the option `apiTokens` is not set, if the store has `apiTokens`. And `verify` refuses a token
   whose account is not active, also one that a parallel `create` stored after the revocation.
+  If the token revocation throws (for example on a schema without the token table),
+  `accounts.disable` still revokes the sessions, records its events and runs
+  `onAllSessionsRevoked`, then throws the store's error. The writes stand; call it again.
 - Tokens are separate from sessions. `sessions.revokeAll`, a passkey or TOTP change and
   `oidc.removeLink` do not revoke tokens, and `onAllSessionsRevoked` is not called for tokens.
   Call `apiTokens.revokeAll(accountId)` where a sign-out everywhere must also end tokens, for
@@ -881,17 +889,31 @@ Audit and errors:
 - If the sink refuses the event of `create` or `import`, identkit deletes the new token and throws
   `OperationRolledBackError` (`hookFailed` false): nothing took effect. If that delete fails, the
   store's error goes up and the token stands; a created token is then unusable, because its
-  plaintext was never returned, and it counts against the limit until you revoke it.
+  plaintext was never returned, and it counts against the limit until you revoke it. An imported
+  token is different: its holder already has the plaintext, so the token verifies at once, and
+  no `api_token.imported` record exists. A retry of the import returns `already_imported` and
+  records nothing. So after such an error, either revoke the token (`list` shows it with
+  `source: "import"`; its owner then needs a new one), or keep it and record the import in your
+  own log.
 - If the sink refuses `api_token.revoked`, the revocation stands and the sink's error goes up.
   `revokeAll` and `accounts.disable` offer every event to the sink before the first error goes
-  up. If the sink refuses `api_token.used`, `verify` throws: the sink error contract applies to
-  every call.
+  up.
+- `api_token.used` is the one exception to the sink contract (see "Audit events"): it is best
+  effort. If the sink refuses it, `verify` still returns `valid`, and identkit passes the error and
+  the event to the option `onAuditError(error, event)`; without the option the error is dropped.
+  `verify` awaits `onAuditError` and drops what it throws. The reason: the event is recorded on
+  the path of every API request, and a sink outage must not fail every request that a token
+  authenticates. The authentication decision does not depend on the event, and `lastUsedAt` is
+  written before it, so the next verify in the interval records nothing; the refused event is
+  lost. Report it from `onAuditError` if you need it.
 
 Import:
 
 - `import(input)` records a token from an earlier system, with `accountId`, `name`, `scopes`,
   `expiresAt` (in the future, at most the longest `allowedExpiryDays` from now), optional
-  `createdAt` and `lastUsedAt`, and exactly one of:
+  `createdAt` and `lastUsedAt` (neither in the future, and `lastUsedAt` not before a given
+  `createdAt`; a future `lastUsedAt` would stop every `lastUsedAt` write and `api_token.used`
+  event until that date), and exactly one of:
   - `token`: the plaintext in the configured format. identkit stores its HMAC, as for a new
     token. Prefer this form.
   - `sha256Digest`: the unkeyed SHA-256 hex digest of the whole token. identkit stores it as a
@@ -910,6 +932,15 @@ Import:
   once. identkit does not replace a legacy digest on use.
 - A row verifies only with the digest of its own algorithm: a legacy row never matches the HMAC
   of a token, and a keyed row never matches its SHA-256.
+- One token, one row. An import with `token` also looks for the legacy digest of that token (also
+  when `acceptLegacyDigests` is off now), so it reports `already_imported`, `revoked` or
+  `digest_taken` for a token that an earlier import stored as a legacy digest. A revoked copy
+  keeps the token revoked. The other direction has a limit: an import with `sha256Digest` cannot
+  find a keyed row of the same token, because the HMAC needs the plaintext. If you import one
+  token in both forms in that order, `verify` refuses it as `ambiguous` while
+  `acceptLegacyDigests` is on. Revoke the legacy copy (`legacyDigest: true` in `list`) and turn
+  `acceptLegacyDigests` off, or import each token in one form only. To move a legacy token to
+  the HMAC, the owner creates a new token; identkit does not replace a stored digest.
 
 ## Identity verification port
 
@@ -923,7 +954,8 @@ nobody. Without `callbackSecret` it signs callbacks with a random secret per ins
 ## Audit events
 
 identkit awaits `audit.emit` for every security-relevant event. If the sink throws, the call
-throws, but what identkit wrote before the event stands: a refused event undoes no revocation and
+throws, but what identkit wrote before the event stands (one exception: `api_token.used` is best
+effort, see "Personal API tokens"): a refused event undoes no revocation and
 no factor change (see Sessions; only `OperationRolledBackError` means that nothing took effect).
 `accounts.disable` records `account.disabled` only if the account was still active, so a retry
 does not record it twice; a refused `account.disabled` is then missing. Events carry ids and
@@ -988,6 +1020,12 @@ Migration `0005_api_tokens.sql` (D1: `0003_api_tokens.sql`) adds the table `iden
 It changes nothing else, so the previous release runs on the new schema. The previous release
 does not know the table: it does not revoke tokens on `accounts.disable`. Tokens of an account
 disabled by such an instance still fail `verify`, because `verify` checks the account status.
+
+Upgrade note: apply `0005_api_tokens.sql` (D1: `0003_api_tokens.sql`) before you deploy this
+release, also if you do not use API tokens. `accounts.disable` revokes the tokens of the account
+in every store that has `apiTokens`, and the built-in stores all have it. Without the table,
+every `accounts.disable` disables the account, revokes its sessions and runs
+`onAllSessionsRevoked`, and then throws the database error, until the migration runs.
 
 A custom store needs the member `apiTokens` (`insert`, `findByDigests`, `listByAccount`,
 `markUsed`, `revoke`, `revokeAllForAccount`, `delete`) to use personal API tokens. It is
@@ -1152,7 +1190,10 @@ identkit leaves these to the consumer:
     success or an unlock stays incomplete.
 
   A store does not need `lockDuration`: `applyThrottle` computes the lock. The PostgreSQL store
-  expects the isolation level READ COMMITTED, the PostgreSQL default.
+  expects the isolation level READ COMMITTED, the PostgreSQL default. Under REPEATABLE READ or
+  SERIALIZABLE, the `lastUsedAt` write of `apiTokens.verify` treats a serialization failure or a
+  deadlock (SQLSTATE 40001 or 40P01) as a lost race: no write, no event, and `verify` still
+  returns `valid`.
 
 - Limit unauthenticated calls in your HTTP layer: per client and in total, for `requestCode`,
   `startSignIn`, every verify route and every route that calls `apiTokens.verify`. identkit limits per address and per account only.
