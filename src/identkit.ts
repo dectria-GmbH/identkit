@@ -21,6 +21,7 @@ import {
 import { createPasskeyCore } from "./passkey-core.js";
 import { createPasskeys, type Passkeys } from "./passkeys.js";
 import { NotConfiguredError } from "./errors.js";
+import { createOAuth, unconfiguredOAuth, type OAuth, type OAuthOptions } from "./oauth/index.js";
 import { createOidc, unconfiguredOidc, type Oidc, type OidcOptions } from "./oidc.js";
 import type { SecretSealer } from "./sealer.js";
 import { createSessions, type AllSessionsRevokedHook, type Sessions } from "./sessions.js";
@@ -84,6 +85,13 @@ export interface IdentkitOptions {
    * Without this option, every `identkit.apiTokens` call throws `NotConfiguredError`.
    */
   apiTokens?: ApiTokenOptions;
+  /**
+   * The OAuth authorization server for MCP clients. Needs a `sealer` and a store with `oauth`;
+   * `createIdentkit` throws `NotConfiguredError` if one is missing, and `InvalidArgumentError`
+   * for invalid options or a prefix that overlaps `apiTokens.prefix`. Without this option,
+   * every `identkit.oauth` call throws `NotConfiguredError`.
+   */
+  oauth?: OAuthOptions;
 }
 
 export interface Identkit {
@@ -97,6 +105,7 @@ export interface Identkit {
   identityVerification: IdentityVerification;
   oidc: Oidc;
   apiTokens: ApiTokens;
+  oauth: OAuth;
 }
 
 export function createIdentkit(options: IdentkitOptions): Identkit {
@@ -150,6 +159,9 @@ export function createIdentkit(options: IdentkitOptions): Identkit {
   const totpEngine = createTotpEngine(ctx);
   // Checked here, so invalid options fail at `createIdentkit`, not at the first call.
   const apiTokens = options.apiTokens ? createApiTokens(ctx, options.apiTokens) : null;
+  const oauth = options.oauth
+    ? createOAuth(ctx, options.oauth, options.apiTokens?.prefix ?? null)
+    : null;
 
   return {
     emailSignIn: createEmailSignIn(ctx, otp, internals),
@@ -162,5 +174,6 @@ export function createIdentkit(options: IdentkitOptions): Identkit {
     identityVerification: createIdentityVerification(ctx),
     oidc: options.oidc ? createOidc(ctx, internals, options.oidc) : unconfiguredOidc(),
     apiTokens: apiTokens ?? unconfiguredApiTokens(),
+    oauth: oauth ?? unconfiguredOAuth(),
   };
 }

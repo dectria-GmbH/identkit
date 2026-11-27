@@ -3,6 +3,10 @@ import { addSeconds } from "../src/clock.js";
 import type {
   ApiTokenRecord,
   IdentkitStore,
+  OAuthAccessTokenRecord,
+  OAuthClientRecord,
+  OAuthCodeRecord,
+  OAuthGrantRecord,
   OidcLinkRecord,
   OtpFlowRecord,
   SessionRecord,
@@ -115,11 +119,102 @@ function apiToken(accountId: string, overrides: Partial<ApiTokenRecord> = {}): A
   };
 }
 
+function oauthClient(overrides: Partial<OAuthClientRecord> = {}): OAuthClientRecord {
+  return {
+    id: uid("client"),
+    secretDigest: uid("secret"),
+    secretDigestAlgorithm: "hmac-sha256",
+    authMethod: "client_secret_basic",
+    grantTypes: ["authorization_code", "refresh_token"],
+    redirectUris: ["https://app.example.com/cb", "http://127.0.0.1/cb"],
+    name: "Example client",
+    source: "dynamic",
+    createdAt: T0,
+    lastUsedAt: null,
+    ...overrides,
+  };
+}
+
+function oauthGrant(
+  accountId: string,
+  clientId: string,
+  overrides: Partial<OAuthGrantRecord> = {},
+): OAuthGrantRecord {
+  return {
+    id: uid("grant"),
+    accountId,
+    clientId,
+    scopes: ["mcp:read", "mcp:events"],
+    resource: "https://example.com/mcp",
+    createdAt: T0,
+    expiresAt: addSeconds(T0, 90 * 86_400),
+    generation: 1,
+    refreshRefDigest: uid("ref"),
+    refreshDigest: uid("refresh"),
+    refreshDigestAlgorithm: "hmac-sha256",
+    previousRefreshDigest: null,
+    refreshedAt: null,
+    refreshExpiresAt: addSeconds(T0, 30 * 86_400),
+    codeDigest: uid("code"),
+    source: "created",
+    ...overrides,
+  };
+}
+
+function oauthAccessToken(
+  grantId: string,
+  overrides: Partial<OAuthAccessTokenRecord> = {},
+): OAuthAccessTokenRecord {
+  return {
+    digest: uid("access"),
+    grantId,
+    generation: 1,
+    scopes: ["mcp:read"],
+    createdAt: T0,
+    expiresAt: addSeconds(T0, 3600),
+    ...overrides,
+  };
+}
+
+function oauthCode(
+  clientId: string,
+  accountId: string,
+  overrides: Partial<OAuthCodeRecord> = {},
+): OAuthCodeRecord {
+  return {
+    digest: uid("code"),
+    clientId,
+    accountId,
+    redirectUri: "http://127.0.0.1:5000/cb",
+    redirectUriExplicit: true,
+    codeChallenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+    resource: "https://example.com/mcp",
+    scopes: ["mcp:read"],
+    createdAt: T0,
+    expiresAt: addSeconds(T0, 300),
+    ...overrides,
+  };
+}
+
+const byId = (a: { id: string }, b: { id: string }) => (a.id < b.id ? -1 : 1);
+
 /** Behaviour every `IdentkitStore` implementation must show. */
 export function runStoreContract(
   name: string,
   factory: () => Promise<IdentkitStore> | IdentkitStore,
 ) {
+  /** The store's `oauth` member, with an active account and a client in it. */
+  async function oauthFixture() {
+    const store = await factory();
+    const oauth = store.oauth;
+    if (!oauth) throw new Error("store has no oauth");
+    const a = account();
+    await store.accounts.insert(a);
+    const client = oauthClient();
+    expect(await oauth.insertClient(client)).toBe("inserted");
+    return { store, oauth, accountId: a.id, client };
+  }
+
   describe(`store contract: ${name}`, () => {
     it("accounts: one account per address, and one person per account", async () => {
       const store = await factory();
@@ -923,6 +1018,586 @@ export function runStoreContract(
       const after = addSeconds(due, 7200);
       expect(await tokens.markUsed(t.id, after, addSeconds(after, -3600))).toBe(false);
       expect(await tokens.markUsed(uid("none"), after, after)).toBe(false);
+    });
+
+    it("oauth clients: unique id, lists keep order, last use once per interval, secret compare-and-set", async () => {
+      const { oauth, client } = await oauthFixture();
+      expect(await oauth.insertClient({ ...oauthClient(), id: client.id })).toBe("id_taken");
+      expect(await oauth.findClient(client.id)).toEqual(client);
+      expect(await oauth.findClient(uid("none"))).toBeNull();
+      const pub = oauthClient({
+        secretDigest: null,
+        secretDigestAlgorithm: null,
+        authMethod: "none",
+        name: null,
+        source: "import",
+        redirectUris: ["https://z.example.com/cb", "https://a.example.com/cb"],
+      });
+      expect(await oauth.insertClient(pub)).toBe("inserted");
+      expect(await oauth.findClient(pub.id)).toEqual(pub);
+
+      const at = addSeconds(T0, 10);
+      const writes = await Promise.all(
+        Array.from({ length: 6 }, () =>
+          oauth.markClientUsed(client.id, at, addSeconds(at, -86_400)),
+        ),
+      );
+      expect(writes.filter(Boolean)).toHaveLength(1);
+      expect((await oauth.findClient(client.id))?.lastUsedAt).toEqual(at);
+      const soon = addSeconds(at, 3600);
+      expect(await oauth.markClientUsed(client.id, soon, addSeconds(soon, -86_400))).toBe(false);
+      expect(await oauth.markClientUsed(uid("none"), soon, soon)).toBe(false);
+
+      const legacy = oauthClient({ secretDigestAlgorithm: "sha256", source: "import" });
+      await oauth.insertClient(legacy);
+      const keyed = uid("keyed");
+      const upgrades = await Promise.all(
+        Array.from({ length: 4 }, () =>
+          oauth.upgradeClientSecret(legacy.id, legacy.secretDigest ?? "", keyed),
+        ),
+      );
+      expect(upgrades.filter(Boolean)).toHaveLength(1);
+      const upgraded = await oauth.findClient(legacy.id);
+      expect(upgraded?.secretDigest).toBe(keyed);
+      expect(upgraded?.secretDigestAlgorithm).toBe("hmac-sha256");
+      expect(await oauth.upgradeClientSecret(legacy.id, legacy.secretDigest ?? "", uid("x"))).toBe(
+        false,
+      );
+    });
+
+    it("oauth registration counts: each key stops at its max, in order, also under concurrency", async () => {
+      const { oauth } = await oauthFixture();
+      const day = new Date("2030-01-01T00:00:00.000Z");
+      const address = uid("address");
+      const deployment = uid("deployment");
+      const keys = [
+        { key: address, max: 2 },
+        { key: deployment, max: 3 },
+      ];
+      expect(await oauth.reserveRegistration({ keys, windowStart: day })).toBe("reserved");
+      expect(await oauth.reserveRegistration({ keys, windowStart: day })).toBe("reserved");
+      // The address refuses first, so the deployment key is not counted.
+      expect(await oauth.reserveRegistration({ keys, windowStart: day })).toEqual({
+        limitReached: address,
+      });
+      const other = { key: uid("address"), max: 2 };
+      expect(
+        await oauth.reserveRegistration({ keys: [other, keys[1] ?? other], windowStart: day }),
+      ).toBe("reserved");
+      // The deployment refuses; the earlier key keeps its count (counts high, never low).
+      expect(
+        await oauth.reserveRegistration({ keys: [other, keys[1] ?? other], windowStart: day }),
+      ).toEqual({ limitReached: deployment });
+      expect(
+        await oauth.reserveRegistration({ keys: [other, keys[1] ?? other], windowStart: day }),
+      ).toEqual({ limitReached: other.key });
+      // A new window starts at zero.
+      const next = new Date("2030-01-02T00:00:00.000Z");
+      expect(await oauth.reserveRegistration({ keys, windowStart: next })).toBe("reserved");
+
+      const burst = { key: uid("burst"), max: 5 };
+      const results = await Promise.all(
+        Array.from({ length: 20 }, () =>
+          oauth.reserveRegistration({ keys: [burst], windowStart: day }),
+        ),
+      );
+      expect(results.filter((r) => r === "reserved")).toHaveLength(5);
+      expect(results.filter((r) => r !== "reserved")).toHaveLength(15);
+    });
+
+    it("oauth codes: consumed once, also under concurrency; the grant of a code ends by it", async () => {
+      const { oauth, accountId, client } = await oauthFixture();
+      const code = oauthCode(client.id, accountId, { scopes: ["z:last", "a:first"] });
+      await oauth.insertCode(code);
+      const consumed = await Promise.all(
+        Array.from({ length: 10 }, () => oauth.consumeCode(code.digest)),
+      );
+      expect(consumed.filter((c) => c !== null)).toEqual([code]);
+      expect(await oauth.consumeCode(code.digest)).toBeNull();
+      // The flag round-trips both ways, not only true.
+      const implicit = oauthCode(client.id, accountId, { redirectUriExplicit: false });
+      await oauth.insertCode(implicit);
+      expect(await oauth.consumeCode(implicit.digest)).toEqual(implicit);
+
+      const grant = oauthGrant(accountId, client.id, { codeDigest: code.digest });
+      const token = oauthAccessToken(grant.id);
+      expect(await oauth.insertGrant(grant, token, { maxOtherGrants: 10, at: T0 })).toEqual({
+        status: "inserted",
+        replaced: null,
+      });
+      const ended = await Promise.all(
+        Array.from({ length: 4 }, () => oauth.endGrantByCode(code.digest, T0)),
+      );
+      expect(ended.filter((g) => g !== null)).toEqual([grant]);
+      expect(await oauth.findGrant(grant.id)).toBeNull();
+      expect(await oauth.findAccessToken(token.digest)).toBeNull();
+    });
+
+    it("oauth grants: insert with its first token, one per account and client, joined lookups", async () => {
+      const { store, oauth, accountId, client } = await oauthFixture();
+      const limit = { maxOtherGrants: 10, at: T0 };
+      const first = oauthGrant(accountId, client.id, { scopes: ["z:last", "a:first"] });
+      const firstToken = oauthAccessToken(first.id, { scopes: ["z:last"] });
+      expect(await oauth.insertGrant(first, firstToken, limit)).toEqual({
+        status: "inserted",
+        replaced: null,
+      });
+      expect(await oauth.findGrant(first.id)).toEqual({ grant: first, accountStatus: "active" });
+      expect(await oauth.findGrantByRefreshRef(first.refreshRefDigest ?? "")).toEqual({
+        grant: first,
+        accountStatus: "active",
+      });
+      expect(await oauth.findGrantByRefreshRef(uid("none"))).toBeNull();
+      expect(await oauth.findAccessToken(firstToken.digest)).toEqual({
+        token: firstToken,
+        grant: first,
+        accountStatus: "active",
+      });
+      expect(await oauth.findAccessToken(uid("none"))).toBeNull();
+
+      // A second grant of the same client replaces the first, and the first's tokens go.
+      const second = oauthGrant(accountId, client.id, { createdAt: addSeconds(T0, 5) });
+      const secondToken = oauthAccessToken(second.id);
+      expect(await oauth.insertGrant(second, secondToken, limit)).toEqual({
+        status: "inserted",
+        replaced: first,
+      });
+      expect(await oauth.findGrant(first.id)).toBeNull();
+      expect(await oauth.findAccessToken(firstToken.digest)).toBeNull();
+      expect((await oauth.listGrants(accountId, T0)).map((g) => g.id)).toEqual([second.id]);
+
+      // A grant without a refresh token, and the account status in every joined read.
+      const other = oauthClient();
+      await oauth.insertClient(other);
+      const bare = oauthGrant(accountId, other.id, {
+        refreshRefDigest: null,
+        refreshDigest: null,
+        refreshDigestAlgorithm: null,
+        refreshExpiresAt: null,
+        createdAt: addSeconds(T0, 9),
+      });
+      await oauth.insertGrant(bare, oauthAccessToken(bare.id), limit);
+      expect((await oauth.findGrant(bare.id))?.grant).toEqual(bare);
+      await store.accounts.setStatus(accountId, "disabled");
+      expect((await oauth.findGrant(second.id))?.accountStatus).toBe("disabled");
+      expect((await oauth.findAccessToken(secondToken.digest))?.accountStatus).toBe("disabled");
+      expect(
+        (await oauth.findGrantByRefreshRef(second.refreshRefDigest ?? ""))?.accountStatus,
+      ).toBe("disabled");
+      // A disabled account gets no grant, and its grant of this client stays.
+      expect(
+        await oauth.insertGrant(
+          oauthGrant(accountId, client.id),
+          oauthAccessToken(uid("g")),
+          limit,
+        ),
+      ).toEqual({ status: "account_inactive" });
+      expect(
+        await oauth.insertGrant(
+          oauthGrant(uid("none"), client.id),
+          oauthAccessToken(uid("g")),
+          limit,
+        ),
+      ).toEqual({ status: "account_inactive" });
+      expect(await oauth.findGrant(second.id)).not.toBeNull();
+    });
+
+    it("oauth grants: the cap counts live grants of other clients, also under concurrency", async () => {
+      const { oauth, accountId } = await oauthFixture();
+      const clients = Array.from({ length: 20 }, () => oauthClient());
+      for (const c of clients) await oauth.insertClient(c);
+      const limit = { maxOtherGrants: 10, at: T0 };
+      const results = await Promise.all(
+        clients.map((c) => {
+          const grant = oauthGrant(accountId, c.id);
+          return oauth.insertGrant(grant, oauthAccessToken(grant.id), limit);
+        }),
+      );
+      expect(results.filter((r) => r.status === "inserted")).toHaveLength(10);
+      expect(results.filter((r) => r.status === "limit_reached")).toHaveLength(10);
+      const live = await oauth.listGrants(accountId, T0);
+      expect(live).toHaveLength(10);
+
+      // Replacing the grant of a client that holds one passes at the cap.
+      const held = live[0];
+      if (!held) throw new Error("no grant");
+      const again = oauthGrant(accountId, held.clientId);
+      expect((await oauth.insertGrant(again, oauthAccessToken(again.id), limit)).status).toBe(
+        "inserted",
+      );
+      const outsider = clients.find((c) => !live.some((g) => g.clientId === c.id));
+      if (!outsider) throw new Error("no outsider");
+      const refused = oauthGrant(accountId, outsider.id, {
+        expiresAt: addSeconds(T0, 120 * 86_400),
+      });
+      expect(await oauth.insertGrant(refused, oauthAccessToken(refused.id), limit)).toEqual({
+        status: "limit_reached",
+      });
+      expect(await oauth.findGrant(refused.id)).toBeNull();
+      // At their expiry, grants no longer count, and listGrants no longer returns them.
+      const later = { maxOtherGrants: 10, at: addSeconds(T0, 90 * 86_400) };
+      expect((await oauth.insertGrant(refused, oauthAccessToken(refused.id), later)).status).toBe(
+        "inserted",
+      );
+      expect((await oauth.listGrants(accountId, later.at)).map((g) => g.id)).toEqual([refused.id]);
+    });
+
+    it("oauth grants: rotation is compare-and-set; only the winner's token exists; expired tokens are pruned", async () => {
+      const { oauth, accountId, client } = await oauthFixture();
+      const grant = oauthGrant(accountId, client.id);
+      const firstToken = oauthAccessToken(grant.id, { expiresAt: addSeconds(T0, 60) });
+      await oauth.insertGrant(grant, firstToken, { maxOtherGrants: 10, at: T0 });
+      const at = addSeconds(T0, 120);
+      const attempts = Array.from({ length: 10 }, () => {
+        const refreshDigest = uid("refresh");
+        return {
+          update: {
+            generation: 2,
+            refreshRefDigest: grant.refreshRefDigest ?? "",
+            refreshDigest,
+            refreshDigestAlgorithm: "hmac-sha256" as const,
+            previousRefreshDigest: grant.refreshDigest,
+            refreshedAt: at,
+            refreshExpiresAt: addSeconds(at, 30 * 86_400),
+          },
+          token: oauthAccessToken(grant.id, {
+            generation: 2,
+            createdAt: at,
+            expiresAt: addSeconds(at, 3600),
+          }),
+        };
+      });
+      const won = await Promise.all(
+        attempts.map((a) => oauth.rotateGrant(grant.id, 1, a.update, a.token, at)),
+      );
+      expect(won.filter(Boolean)).toHaveLength(1);
+      const winner = attempts[won.indexOf(true)];
+      if (!winner) throw new Error("no winner");
+      const found = await oauth.findGrant(grant.id);
+      expect(found?.grant).toEqual({ ...grant, ...winner.update });
+      for (const a of attempts) {
+        const lookup = await oauth.findAccessToken(a.token.digest);
+        if (a === winner) expect(lookup?.token).toEqual(a.token);
+        else expect(lookup).toBeNull();
+      }
+      // A late rotation of the old generation, with its own new digest, loses.
+      const stale = { ...winner.update, refreshDigest: uid("refresh") };
+      // The expired first token was pruned with the rotation.
+      expect(await oauth.findAccessToken(firstToken.digest)).toBeNull();
+      expect(await oauth.rotateGrant(grant.id, 1, stale, oauthAccessToken(grant.id), at)).toBe(
+        false,
+      );
+      expect(await oauth.rotateGrant(uid("none"), 1, stale, oauthAccessToken(grant.id), at)).toBe(
+        false,
+      );
+    });
+
+    it("oauth grants: deletes are scoped to the client or the account; an account delete takes its codes", async () => {
+      const { oauth, accountId, client } = await oauthFixture();
+      const limit = { maxOtherGrants: 10, at: T0 };
+      const grant = oauthGrant(accountId, client.id);
+      const token = oauthAccessToken(grant.id);
+      await oauth.insertGrant(grant, token, limit);
+      const stranger = oauthClient();
+      await oauth.insertClient(stranger);
+      expect(await oauth.deleteGrant(grant.id, { clientId: stranger.id }, T0)).toBeNull();
+      expect(await oauth.deleteGrant(grant.id, { accountId: uid("acc") }, T0)).toBeNull();
+      expect(await oauth.deleteGrant(grant.id, { clientId: client.id }, T0)).toEqual(grant);
+      expect(await oauth.deleteGrant(grant.id, { clientId: client.id }, T0)).toBeNull();
+      expect(await oauth.findAccessToken(token.digest)).toBeNull();
+
+      const again = oauthGrant(accountId, client.id);
+      await oauth.insertGrant(again, oauthAccessToken(again.id), limit);
+      expect(await oauth.deleteGrant(again.id, { accountId }, T0)).toEqual(again);
+
+      const g1 = oauthGrant(accountId, client.id);
+      const g2 = oauthGrant(accountId, stranger.id);
+      const t1 = oauthAccessToken(g1.id);
+      await oauth.insertGrant(g1, t1, limit);
+      await oauth.insertGrant(g2, oauthAccessToken(g2.id), limit);
+      const code = oauthCode(client.id, accountId);
+      await oauth.insertCode(code);
+      const ended = await oauth.deleteGrantsForAccount(accountId, T0);
+      expect(ended.map((g) => g.id).toSorted()).toEqual([g1.id, g2.id].toSorted());
+      expect(await oauth.deleteGrantsForAccount(accountId, T0)).toEqual([]);
+      expect(await oauth.consumeCode(code.digest)).toBeNull();
+      expect(await oauth.findAccessToken(t1.digest)).toBeNull();
+    });
+
+    it("oauth clients: a client delete takes and returns its grants, their tokens and its codes", async () => {
+      const { store, oauth, accountId, client } = await oauthFixture();
+      const limit = { maxOtherGrants: 10, at: T0 };
+      const other = account();
+      await store.accounts.insert(other);
+      const stranger = oauthClient();
+      await oauth.insertClient(stranger);
+      const grant = oauthGrant(accountId, client.id);
+      const token = oauthAccessToken(grant.id);
+      await oauth.insertGrant(grant, token, limit);
+      const second = oauthGrant(other.id, client.id);
+      await oauth.insertGrant(second, oauthAccessToken(second.id), limit);
+      const kept = oauthGrant(accountId, stranger.id);
+      await oauth.insertGrant(kept, oauthAccessToken(kept.id), limit);
+      const code = oauthCode(client.id, accountId);
+      await oauth.insertCode(code);
+      const ended = await oauth.deleteClient(client.id, T0);
+      expect(ended?.toSorted(byId)).toEqual([grant, second].toSorted(byId));
+      expect(await oauth.deleteClient(client.id, T0)).toBeNull();
+      expect(await oauth.findClient(client.id)).toBeNull();
+      expect(await oauth.findGrant(grant.id)).toBeNull();
+      expect(await oauth.findAccessToken(token.digest)).toBeNull();
+      expect(await oauth.consumeCode(code.digest)).toBeNull();
+      expect((await oauth.findGrant(kept.id))?.grant).toEqual(kept);
+      const empty = oauthClient();
+      await oauth.insertClient(empty);
+      expect(await oauth.deleteClient(empty.id, T0)).toEqual([]);
+    });
+
+    it("oauth grants: an import never replaces and names why it did not insert", async () => {
+      const { store, oauth, accountId, client } = await oauthFixture();
+      const limit = { maxOtherGrants: 1, at: T0 };
+      const imported = oauthGrant(accountId, client.id, {
+        source: "import",
+        refreshRefDigest: null,
+        refreshDigestAlgorithm: "sha256",
+        codeDigest: null,
+        generation: 7,
+      });
+      expect(await oauth.importGrant(imported, limit)).toBe("inserted");
+      expect((await oauth.findGrant(imported.id))?.grant).toEqual(imported);
+      expect(await oauth.importGrant(imported, limit)).toBe("id_taken");
+      expect(
+        await oauth.importGrant(
+          oauthGrant(accountId, client.id, { refreshRefDigest: null, codeDigest: null }),
+          limit,
+        ),
+      ).toBe("account_client_taken");
+      const other = oauthClient();
+      await oauth.insertClient(other);
+      const third = oauthClient();
+      await oauth.insertClient(third);
+      expect(
+        await oauth.importGrant(oauthGrant(accountId, other.id, { refreshRefDigest: null }), {
+          maxOtherGrants: 2,
+          at: T0,
+        }),
+      ).toBe("inserted");
+      expect(
+        await oauth.importGrant(oauthGrant(accountId, third.id, { refreshRefDigest: null }), {
+          maxOtherGrants: 2,
+          at: T0,
+        }),
+      ).toBe("limit_reached");
+      await store.accounts.setStatus(accountId, "disabled");
+      expect(
+        await oauth.importGrant(oauthGrant(accountId, third.id, { refreshRefDigest: null }), limit),
+      ).toBe("account_inactive");
+    });
+
+    it("oauth purge: expired rows go; a client with a live grant or code stays", async () => {
+      const { oauth, accountId } = await oauthFixture();
+      const day = 86_400;
+      const at = addSeconds(T0, 200 * day);
+      const limit = { maxOtherGrants: 10, at: T0 };
+      // Unused: created long ago, never used, nothing live.
+      const unused = oauthClient();
+      // Idle: used long ago; its grant expired.
+      const idle = oauthClient({ lastUsedAt: addSeconds(T0, day) });
+      // Idle by date, but a live grant keeps it.
+      const busy = oauthClient({ lastUsedAt: addSeconds(T0, day) });
+      // Unused by date, but a live code keeps it.
+      const pending = oauthClient();
+      // Recent: kept.
+      const recent = oauthClient({ createdAt: addSeconds(at, -day) });
+      for (const c of [unused, idle, busy, pending, recent]) await oauth.insertClient(c);
+      const expired = oauthGrant(accountId, idle.id, { expiresAt: addSeconds(T0, 90 * day) });
+      const expiredToken = oauthAccessToken(expired.id);
+      await oauth.insertGrant(expired, expiredToken, limit);
+      const live = oauthGrant(accountId, busy.id, { expiresAt: addSeconds(at, day) });
+      const liveToken = oauthAccessToken(live.id, { expiresAt: addSeconds(at, 3600) });
+      const oldToken = oauthAccessToken(live.id);
+      await oauth.insertGrant(live, liveToken, limit);
+      await oauth.rotateGrant(
+        live.id,
+        1,
+        {
+          generation: 2,
+          refreshRefDigest: live.refreshRefDigest ?? "",
+          refreshDigest: uid("refresh"),
+          refreshDigestAlgorithm: "hmac-sha256",
+          previousRefreshDigest: live.refreshDigest,
+          refreshedAt: T0,
+          refreshExpiresAt: addSeconds(at, day),
+        },
+        oldToken,
+        T0,
+      );
+      const liveCode = oauthCode(pending.id, accountId, { expiresAt: addSeconds(at, 300) });
+      const oldCode = oauthCode(busy.id, accountId);
+      await oauth.insertCode(liveCode);
+      await oauth.insertCode(oldCode);
+      await oauth.reserveRegistration({
+        keys: [{ key: uid("old"), max: 5 }],
+        windowStart: T0,
+      });
+
+      const result = await oauth.purge({
+        at,
+        unusedBefore: addSeconds(at, -30 * day),
+        idleBefore: addSeconds(at, -180 * day),
+        windowBefore: addSeconds(at, -day),
+      });
+      // A shared database holds rows of earlier cases too: look only at this case's rows.
+      const mine = new Set([unused, idle, busy, pending, recent].map((c) => c.id));
+      expect(result.clients.filter((c) => mine.has(c.id)).toSorted(byId)).toEqual(
+        [
+          { id: unused.id, reason: "unused" },
+          { id: idle.id, reason: "idle" },
+        ].toSorted(byId),
+      );
+      expect(result.grants.filter((g) => g.accountId === accountId)).toEqual([expired]);
+      expect(result.codes).toBeGreaterThanOrEqual(1);
+      expect(result.accessTokens).toBeGreaterThanOrEqual(1);
+      expect(result.registrationWindows).toBeGreaterThanOrEqual(1);
+      for (const kept of [busy, pending, recent]) {
+        expect(await oauth.findClient(kept.id)).not.toBeNull();
+      }
+      expect(await oauth.findGrant(live.id)).not.toBeNull();
+      expect(await oauth.findAccessToken(liveToken.digest)).not.toBeNull();
+      expect(await oauth.findAccessToken(oldToken.digest)).toBeNull();
+      expect(await oauth.consumeCode(oldCode.digest)).toBeNull();
+      expect(await oauth.consumeCode(liveCode.digest)).toEqual(liveCode);
+    });
+
+    it("oauth import tombstones: every end of an imported row writes one; a rollback writes none", async () => {
+      const { store, oauth, accountId } = await oauthFixture();
+      const day = 86_400;
+      const limit = { maxOtherGrants: 50, at: T0 };
+      const ended = addSeconds(T0, 7);
+      const importedClient = () => oauthClient({ source: "import" });
+      const importedGrant = (clientId: string, overrides: Partial<OAuthGrantRecord> = {}) =>
+        oauthGrant(accountId, clientId, {
+          source: "import",
+          refreshRefDigest: null,
+          refreshDigestAlgorithm: "sha256",
+          codeDigest: null,
+          ...overrides,
+        });
+      /** A fresh imported client with an imported grant of the fixture's account. */
+      async function pair(grantOverrides: Partial<OAuthGrantRecord> = {}) {
+        const client = importedClient();
+        expect(await oauth.insertClient(client)).toBe("inserted");
+        const grant = importedGrant(client.id, grantOverrides);
+        expect(await oauth.importGrant(grant, limit)).toBe("inserted");
+        return { client, grant };
+      }
+      const tombstone = (kind: "grant" | "client", id: string) =>
+        oauth.findImportTombstone(kind, id);
+
+      // The control: a live imported grant has no tombstone.
+      const byClient = await pair();
+      expect(await tombstone("grant", byClient.grant.id)).toBeNull();
+      // A grant end scoped to the client, then to the account.
+      expect(
+        await oauth.deleteGrant(byClient.grant.id, { clientId: byClient.client.id }, ended),
+      ).not.toBeNull();
+      expect(await tombstone("grant", byClient.grant.id)).toEqual(ended);
+      expect(await oauth.importGrant(byClient.grant, limit)).toBe("revoked");
+      expect(await oauth.findGrant(byClient.grant.id)).toBeNull();
+      const byAccount = await pair();
+      await oauth.deleteGrant(byAccount.grant.id, { accountId }, ended);
+      expect(await tombstone("grant", byAccount.grant.id)).toEqual(ended);
+
+      // A code reuse.
+      const byCode = await pair({ codeDigest: uid("code") });
+      await oauth.endGrantByCode(byCode.grant.codeDigest ?? "", ended);
+      expect(await tombstone("grant", byCode.grant.id)).toEqual(ended);
+
+      // A replacing insert of the same account and client.
+      const replaced = await pair();
+      const replacement = oauthGrant(accountId, replaced.client.id);
+      const inserted = await oauth.insertGrant(replacement, oauthAccessToken(replacement.id), {
+        maxOtherGrants: 50,
+        at: ended,
+      });
+      expect(inserted).toMatchObject({ status: "inserted", replaced: { id: replaced.grant.id } });
+      expect(await tombstone("grant", replaced.grant.id)).toEqual(ended);
+      // A grant that identkit created gets none when it ends.
+      await oauth.deleteGrant(replacement.id, { accountId }, ended);
+      expect(await tombstone("grant", replacement.id)).toBeNull();
+
+      // A client delete: the client and its imported grants.
+      const deleted = await pair();
+      expect(await oauth.deleteClient(deleted.client.id, ended)).toHaveLength(1);
+      expect(await tombstone("client", deleted.client.id)).toEqual(ended);
+      expect(await tombstone("grant", deleted.grant.id)).toEqual(ended);
+      expect(await oauth.insertClient(deleted.client)).toBe("revoked");
+      expect(await oauth.findClient(deleted.client.id)).toBeNull();
+      const dynamic = oauthClient();
+      await oauth.insertClient(dynamic);
+      await oauth.deleteClient(dynamic.id, ended);
+      expect(await tombstone("client", dynamic.id)).toBeNull();
+
+      // A rollback writes none for its own row, so the import can run again.
+      const rolled = await pair();
+      expect(await oauth.rollBackImport("grant", rolled.grant.id, ended)).toEqual([]);
+      expect(await oauth.findGrant(rolled.grant.id)).toBeNull();
+      expect(await tombstone("grant", rolled.grant.id)).toBeNull();
+      expect(await oauth.importGrant(rolled.grant, limit)).toBe("inserted");
+      // A client rollback returns the grants it takes. These did happen: an imported one gets
+      // its tombstone, and its import stays refused.
+      const cascaded = await oauth.rollBackImport("client", rolled.client.id, ended);
+      expect(cascaded?.map((g) => g.id)).toEqual([rolled.grant.id]);
+      expect(await oauth.findClient(rolled.client.id)).toBeNull();
+      expect(await oauth.findGrant(rolled.grant.id)).toBeNull();
+      expect(await tombstone("client", rolled.client.id)).toBeNull();
+      expect(await tombstone("grant", rolled.grant.id)).toEqual(ended);
+      expect(await oauth.insertClient(rolled.client)).toBe("inserted");
+      expect(await oauth.importGrant(rolled.grant, limit)).toBe("revoked");
+      // Only an imported row: a rollback leaves a dynamic client and a created grant alone.
+      const standing = oauthClient();
+      await oauth.insertClient(standing);
+      expect(await oauth.rollBackImport("client", standing.id, ended)).toBeNull();
+      expect(await oauth.findClient(standing.id)).not.toBeNull();
+      const created = oauthGrant(accountId, rolled.client.id);
+      await oauth.insertGrant(created, oauthAccessToken(created.id), limit);
+      expect(await oauth.rollBackImport("grant", created.id, ended)).toBeNull();
+      expect(await oauth.findGrant(created.id)).not.toBeNull();
+      // A created grant that a client rollback takes is returned, without a tombstone.
+      const taken = await oauth.rollBackImport("client", rolled.client.id, ended);
+      expect(taken?.map((g) => g.id)).toEqual([created.id]);
+      expect(await tombstone("grant", created.id)).toBeNull();
+      expect(await tombstone("client", rolled.client.id)).toBeNull();
+
+      // Purge: an expired imported grant and an unused imported client.
+      const expiring = await pair({ expiresAt: addSeconds(T0, day) });
+      const unused = importedClient();
+      await oauth.insertClient(unused);
+      const at = addSeconds(T0, 200 * day);
+      await oauth.purge({
+        at,
+        unusedBefore: addSeconds(at, -30 * day),
+        idleBefore: addSeconds(at, -180 * day),
+        windowBefore: addSeconds(at, -day),
+      });
+      expect(await tombstone("grant", expiring.grant.id)).toEqual(at);
+      expect(await tombstone("client", unused.id)).toEqual(at);
+
+      // An account disable.
+      const other = account();
+      await store.accounts.insert(other);
+      const held = importedClient();
+      await oauth.insertClient(held);
+      const disabled = oauthGrant(other.id, held.id, {
+        source: "import",
+        refreshRefDigest: null,
+        codeDigest: null,
+        expiresAt: addSeconds(at, 90 * day),
+      });
+      expect(await oauth.importGrant(disabled, { maxOtherGrants: 5, at })).toBe("inserted");
+      expect(await oauth.deleteGrantsForAccount(other.id, ended)).toHaveLength(1);
+      expect(await tombstone("grant", disabled.id)).toEqual(ended);
+      expect(await oauth.importGrant(disabled, { maxOtherGrants: 5, at })).toBe("revoked");
     });
   });
 }

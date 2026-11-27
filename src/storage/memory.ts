@@ -8,6 +8,12 @@ import type {
   CredentialRecord,
   EnrollmentTokenRecord,
   IdentkitStore,
+  OAuthAccessTokenRecord,
+  OAuthClientRecord,
+  OAuthCodeRecord,
+  OAuthGrantRecord,
+  OAuthImportTombstoneKind,
+  OAuthPurgeStoreResult,
   OidcLinkRecord,
   OtpFlowRecord,
   SessionRecord,
@@ -38,6 +44,9 @@ function isFlowOpen(flow: OtpFlowRecord, at: Date): boolean {
  * In-memory store for tests, demos and single-process prototypes. JavaScript runs each
  * method body without interruption, so every method is atomic. Data is lost on exit.
  */
+/** The key of an import tombstone in the memory store. */
+const tombstoneKey = (kind: OAuthImportTombstoneKind, id: string) => `${kind}\u0000${id}`;
+
 export function createMemoryStore(): IdentkitStore {
   const accounts = new Map<string, AccountRecord>();
   const flows = new Map<string, OtpFlowRecord>();
@@ -51,6 +60,79 @@ export function createMemoryStore(): IdentkitStore {
   const verifications = new Map<string, VerificationRecord>();
   const oidcLinks = new Map<string, OidcLinkRecord>();
   const apiTokens = new Map<string, ApiTokenRecord>();
+  const oauthClients = new Map<string, OAuthClientRecord>();
+  const oauthGrants = new Map<string, OAuthGrantRecord>();
+  const oauthAccessTokens = new Map<string, OAuthAccessTokenRecord>();
+  const oauthCodes = new Map<string, OAuthCodeRecord>();
+  /** Registration counts by key and window start (ms). */
+  const registrationCounts = new Map<string, number>();
+  /** Import tombstones by kind and id. */
+  const importTombstones = new Map<string, Date>();
+
+  /**
+   * Deletes the grant and its access tokens, as the foreign key cascade does. An imported grant
+   * gets its tombstone, unless `at` is null (a rolled-back import).
+   */
+  function dropGrant(id: string, at: Date | null): OAuthGrantRecord | null {
+    const grant = oauthGrants.get(id);
+    if (!grant) return null;
+    oauthGrants.delete(id);
+    for (const [digest, token] of oauthAccessTokens) {
+      if (token.grantId === id) oauthAccessTokens.delete(digest);
+    }
+    if (at !== null && grant.source === "import") {
+      importTombstones.set(tombstoneKey("grant", id), at);
+    }
+    return grant;
+  }
+
+  /**
+   * Deletes the client, its grants and its codes. Returns the grants, or null. Imported rows get
+   * their tombstones; a rolled-back client (`clientTombstone` false) gets none, its grants do.
+   */
+  function dropClient(id: string, at: Date, clientTombstone = true): OAuthGrantRecord[] | null {
+    const client = oauthClients.get(id);
+    if (!client) return null;
+    oauthClients.delete(id);
+    if (clientTombstone && client.source === "import") {
+      importTombstones.set(tombstoneKey("client", id), at);
+    }
+    const ended: OAuthGrantRecord[] = [];
+    for (const grant of oauthGrants.values()) {
+      if (grant.clientId !== id) continue;
+      const dropped = dropGrant(grant.id, at);
+      if (dropped) ended.push(dropped);
+    }
+    for (const [digest, code] of oauthCodes) {
+      if (code.clientId === id) oauthCodes.delete(digest);
+    }
+    return ended;
+  }
+
+  /** Live grants of the account, other than those of `exceptClientId`. */
+  function liveOtherGrants(accountId: string, exceptClientId: string, at: Date): number {
+    let count = 0;
+    for (const grant of oauthGrants.values()) {
+      if (
+        grant.accountId === accountId &&
+        grant.clientId !== exceptClientId &&
+        grant.expiresAt.getTime() > at.getTime()
+      ) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  function findGrantBy(match: (grant: OAuthGrantRecord) => boolean) {
+    for (const grant of oauthGrants.values()) {
+      if (!match(grant)) continue;
+      const account = accounts.get(grant.accountId);
+      if (!account) return null;
+      return { grant: copy(grant), accountStatus: account.status };
+    }
+    return null;
+  }
 
   function revokeEnrollment(accountId: string, at: Date): number {
     let revoked = 0;
@@ -515,6 +597,248 @@ export function createMemoryStore(): IdentkitStore {
         if (!found || found.accountId !== accountId) return Promise.resolve(false);
         apiTokens.delete(id);
         return Promise.resolve(true);
+      },
+    },
+    oauth: {
+      insertClient(client) {
+        if (oauthClients.has(client.id)) return Promise.resolve("id_taken");
+        if (importTombstones.has(tombstoneKey("client", client.id))) {
+          return Promise.resolve("revoked");
+        }
+        oauthClients.set(client.id, copy(client));
+        return Promise.resolve("inserted");
+      },
+      findClient(id) {
+        const found = oauthClients.get(id);
+        return Promise.resolve(found ? copy(found) : null);
+      },
+      markClientUsed(id, at, notAfter) {
+        const found = oauthClients.get(id);
+        if (
+          !found ||
+          (found.lastUsedAt !== null && found.lastUsedAt.getTime() > notAfter.getTime())
+        ) {
+          return Promise.resolve(false);
+        }
+        found.lastUsedAt = at;
+        return Promise.resolve(true);
+      },
+      upgradeClientSecret(id, oldDigest, newDigest) {
+        const found = oauthClients.get(id);
+        if (!found || found.secretDigest !== oldDigest) return Promise.resolve(false);
+        found.secretDigest = newDigest;
+        found.secretDigestAlgorithm = "hmac-sha256";
+        return Promise.resolve(true);
+      },
+      deleteClient(id, at) {
+        return Promise.resolve(dropClient(id, at));
+      },
+      reserveRegistration({ keys, windowStart }) {
+        for (const { key, max } of keys) {
+          const slot = `${windowStart.getTime()}\u0000${key}`;
+          const count = registrationCounts.get(slot) ?? 0;
+          if (count >= max) return Promise.resolve({ limitReached: key });
+          registrationCounts.set(slot, count + 1);
+        }
+        return Promise.resolve("reserved");
+      },
+      insertCode(code) {
+        if (oauthCodes.has(code.digest)) return Promise.reject(new Error("duplicate oauth code"));
+        if (!oauthClients.has(code.clientId) || !accounts.has(code.accountId)) {
+          return Promise.reject(new Error("oauth code references a missing row"));
+        }
+        oauthCodes.set(code.digest, copy(code));
+        return Promise.resolve();
+      },
+      consumeCode(digest) {
+        const found = oauthCodes.get(digest);
+        if (!found) return Promise.resolve(null);
+        oauthCodes.delete(digest);
+        return Promise.resolve(found);
+      },
+      endGrantByCode(codeDigest, at) {
+        for (const grant of oauthGrants.values()) {
+          if (grant.codeDigest === codeDigest) return Promise.resolve(dropGrant(grant.id, at));
+        }
+        return Promise.resolve(null);
+      },
+      insertGrant(grant, firstAccessToken, limit) {
+        const account = accounts.get(grant.accountId);
+        if (!account || account.status !== "active") {
+          return Promise.resolve({ status: "account_inactive" });
+        }
+        if (liveOtherGrants(grant.accountId, grant.clientId, limit.at) >= limit.maxOtherGrants) {
+          return Promise.resolve({ status: "limit_reached" });
+        }
+        if (!oauthClients.has(grant.clientId)) {
+          return Promise.reject(new Error("oauth grant references a missing client"));
+        }
+        const clash = [...oauthGrants.values()].some(
+          (g) =>
+            g.id === grant.id ||
+            (grant.codeDigest !== null && g.codeDigest === grant.codeDigest) ||
+            (grant.refreshRefDigest !== null && g.refreshRefDigest === grant.refreshRefDigest),
+        );
+        if (clash || oauthAccessTokens.has(firstAccessToken.digest)) {
+          return Promise.reject(new Error("duplicate oauth grant or token"));
+        }
+        let replaced: OAuthGrantRecord | null = null;
+        for (const existing of oauthGrants.values()) {
+          if (existing.accountId === grant.accountId && existing.clientId === grant.clientId) {
+            replaced = dropGrant(existing.id, limit.at);
+          }
+        }
+        oauthGrants.set(grant.id, copy(grant));
+        oauthAccessTokens.set(firstAccessToken.digest, copy(firstAccessToken));
+        return Promise.resolve({ status: "inserted", replaced });
+      },
+      importGrant(grant, limit) {
+        if (oauthGrants.has(grant.id)) return Promise.resolve("id_taken");
+        if (importTombstones.has(tombstoneKey("grant", grant.id))) {
+          return Promise.resolve("revoked");
+        }
+        const account = accounts.get(grant.accountId);
+        if (!account || account.status !== "active") return Promise.resolve("account_inactive");
+        const taken = [...oauthGrants.values()].some(
+          (g) => g.accountId === grant.accountId && g.clientId === grant.clientId,
+        );
+        if (taken) return Promise.resolve("account_client_taken");
+        if (liveOtherGrants(grant.accountId, grant.clientId, limit.at) >= limit.maxOtherGrants) {
+          return Promise.resolve("limit_reached");
+        }
+        if (!oauthClients.has(grant.clientId)) {
+          return Promise.reject(new Error("oauth grant references a missing client"));
+        }
+        oauthGrants.set(grant.id, copy(grant));
+        return Promise.resolve("inserted");
+      },
+      findGrantByRefreshRef(refDigest) {
+        return Promise.resolve(findGrantBy((g) => g.refreshRefDigest === refDigest));
+      },
+      findGrant(id) {
+        return Promise.resolve(findGrantBy((g) => g.id === id));
+      },
+      rotateGrant(id, expectedGeneration, update, accessToken, pruneBefore) {
+        const found = oauthGrants.get(id);
+        if (!found || found.generation !== expectedGeneration) return Promise.resolve(false);
+        if (oauthAccessTokens.has(accessToken.digest)) {
+          return Promise.reject(new Error("duplicate oauth access token"));
+        }
+        Object.assign(found, copy(update));
+        oauthAccessTokens.set(accessToken.digest, copy(accessToken));
+        for (const [digest, token] of oauthAccessTokens) {
+          if (token.grantId === id && token.expiresAt.getTime() <= pruneBefore.getTime()) {
+            oauthAccessTokens.delete(digest);
+          }
+        }
+        return Promise.resolve(true);
+      },
+      findAccessToken(digest) {
+        const token = oauthAccessTokens.get(digest);
+        const grant = token ? oauthGrants.get(token.grantId) : undefined;
+        const account = grant ? accounts.get(grant.accountId) : undefined;
+        if (!token || !grant || !account) return Promise.resolve(null);
+        return Promise.resolve({
+          token: copy(token),
+          grant: copy(grant),
+          accountStatus: account.status,
+        });
+      },
+      deleteGrant(id, match, at) {
+        const found = oauthGrants.get(id);
+        if (!found) return Promise.resolve(null);
+        const owned =
+          "clientId" in match
+            ? found.clientId === match.clientId
+            : found.accountId === match.accountId;
+        return Promise.resolve(owned ? dropGrant(id, at) : null);
+      },
+      deleteGrantsForAccount(accountId, at) {
+        const ended: OAuthGrantRecord[] = [];
+        for (const grant of oauthGrants.values()) {
+          if (grant.accountId !== accountId) continue;
+          const dropped = dropGrant(grant.id, at);
+          if (dropped) ended.push(dropped);
+        }
+        for (const [digest, code] of oauthCodes) {
+          if (code.accountId === accountId) oauthCodes.delete(digest);
+        }
+        return Promise.resolve(ended);
+      },
+      listGrants(accountId, at) {
+        return Promise.resolve(
+          [...oauthGrants.values()]
+            .filter((g) => g.accountId === accountId && g.expiresAt.getTime() > at.getTime())
+            .toSorted(
+              (a, b) => a.createdAt.getTime() - b.createdAt.getTime() || (a.id < b.id ? -1 : 1),
+            )
+            .map(copy),
+        );
+      },
+      purge({ at, unusedBefore, idleBefore, windowBefore }) {
+        const now = at.getTime();
+        const grants: OAuthGrantRecord[] = [];
+        for (const grant of oauthGrants.values()) {
+          if (grant.expiresAt.getTime() > now) continue;
+          const dropped = dropGrant(grant.id, at);
+          if (dropped) grants.push(dropped);
+        }
+        let codes = 0;
+        for (const [digest, code] of oauthCodes) {
+          if (code.expiresAt.getTime() <= now) {
+            oauthCodes.delete(digest);
+            codes += 1;
+          }
+        }
+        let accessTokens = 0;
+        for (const [digest, token] of oauthAccessTokens) {
+          if (token.expiresAt.getTime() <= now) {
+            oauthAccessTokens.delete(digest);
+            accessTokens += 1;
+          }
+        }
+        const busy = new Set([
+          ...[...oauthGrants.values()].map((g) => g.clientId),
+          ...[...oauthCodes.values()].map((c) => c.clientId),
+        ]);
+        const clients: OAuthPurgeStoreResult["clients"] = [];
+        for (const client of oauthClients.values()) {
+          if (busy.has(client.id)) continue;
+          const reason =
+            client.lastUsedAt === null
+              ? client.createdAt.getTime() < unusedBefore.getTime()
+                ? "unused"
+                : null
+              : client.lastUsedAt.getTime() < idleBefore.getTime()
+                ? "idle"
+                : null;
+          if (reason === null) continue;
+          // No grant of it is left (no live one, the expired ones went above): nothing cascades.
+          dropClient(client.id, at);
+          clients.push({ id: client.id, reason });
+        }
+        let registrationWindows = 0;
+        for (const slot of registrationCounts.keys()) {
+          const start = Number(slot.slice(0, slot.indexOf("\u0000")));
+          if (start < windowBefore.getTime()) {
+            registrationCounts.delete(slot);
+            registrationWindows += 1;
+          }
+        }
+        return Promise.resolve({ clients, grants, codes, accessTokens, registrationWindows });
+      },
+      findImportTombstone(kind, id) {
+        const at = importTombstones.get(tombstoneKey(kind, id));
+        return Promise.resolve(at ? new Date(at) : null);
+      },
+      rollBackImport(kind, id, at) {
+        if (kind === "grant") {
+          if (oauthGrants.get(id)?.source !== "import") return Promise.resolve(null);
+          dropGrant(id, null);
+          return Promise.resolve([]);
+        }
+        if (oauthClients.get(id)?.source !== "import") return Promise.resolve(null);
+        return Promise.resolve(dropClient(id, at, false));
       },
     },
   };

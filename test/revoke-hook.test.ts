@@ -8,8 +8,9 @@ import {
   type AuditEventType,
 } from "../src/index.js";
 import type { IdentkitStore } from "../src/storage/types.js";
-import type { RecordingAuditSink } from "../src/testing/index.js";
+import { createOAuthTestClient, type RecordingAuditSink } from "../src/testing/index.js";
 import { googleClaims, oidcSetup } from "./oidc-helpers.js";
+import { baseOAuthOptions } from "./oauth-helpers.js";
 import { emailFirstPolicy, hookedTotpStore, setup, STEP, testConfig } from "./helpers.js";
 
 /** A hook that throws while `failing` is true and records every call. */
@@ -1118,5 +1119,147 @@ describe("a retried accounts.disable", () => {
     expect(await t.ik.sessions.validate(a.token)).toBeNull();
     await t.ik.accounts.disable(a.account.id);
     expect(t.audit.ofType("account.disabled")).toHaveLength(1);
+  });
+});
+
+/**
+ * A memory store whose API token revocation and OAuth grant end throw while their flag is on.
+ * Both are on at the start.
+ */
+function brokenRevocationStores() {
+  const memory = createMemoryStore();
+  const tokens = memory.apiTokens;
+  const oauth = memory.oauth;
+  if (!tokens || !oauth) throw new Error("memory store has apiTokens and oauth");
+  const broken = { tokens: true, grants: true };
+  const store: IdentkitStore = {
+    ...memory,
+    apiTokens: {
+      ...tokens,
+      revokeAllForAccount: (...args) =>
+        broken.tokens
+          ? Promise.reject(new Error("no such table: identkit_api_tokens"))
+          : tokens.revokeAllForAccount(...args),
+    },
+    oauth: {
+      ...oauth,
+      deleteGrantsForAccount: (...args) =>
+        broken.grants
+          ? Promise.reject(new Error("no such table: identkit_oauth_grants"))
+          : oauth.deleteGrantsForAccount(...args),
+    },
+  };
+  return { store, broken };
+}
+
+/** identkit with OAuth over a broken store, an account and one connected client. */
+async function disableSetup(onAllSessionsRevoked?: (event: AllSessionsRevokedEvent) => void) {
+  const { store, broken } = brokenRevocationStores();
+  const t = setup({
+    store,
+    oauth: baseOAuthOptions,
+    ...(onAllSessionsRevoked ? { onAllSessionsRevoked } : {}),
+  });
+  const user = await t.signIn(`disable-${Math.random().toString(36).slice(2)}@example.org`);
+  const client = await createOAuthTestClient(t.ik.oauth);
+  const tokens = await client.connect(user.account.id);
+  return { t, store, broken, accountId: user.account.id, tokens };
+}
+
+describe("accounts.disable with a failing OAuth grant store", () => {
+  it("rule: hook error wins - it carries the grant store error, and the message names the retry", async () => {
+    const { t, broken, accountId } = await disableSetup(() => {
+      throw hookDown;
+    });
+    broken.tokens = false;
+    const error = await caught(t.ik.accounts.disable(accountId));
+    expect(error).toBeInstanceOf(AllSessionsRevokedHookError);
+    const hookError = error as AllSessionsRevokedHookError;
+    expect(hookError.cause).toEqual(hookDown);
+    expect(hookError.tokenRevocationError).toBeUndefined();
+    expect(hookError.grantRevocationError).toEqual(
+      new Error("no such table: identkit_oauth_grants"),
+    );
+    expect(hookError.message).toBe(
+      "onAllSessionsRevoked failed after the revocation, and the end of the OAuth grants failed " +
+        "(no such table: identkit_oauth_grants); call accounts.disable again",
+    );
+    expect(t.audit.ofType("account.disabled")).toHaveLength(1);
+    expect(t.audit.ofType("session.revoked")).toHaveLength(1);
+  });
+
+  it("rule: hook error wins - with both store errors it carries both and names both", async () => {
+    const { t, accountId } = await disableSetup(() => {
+      throw hookDown;
+    });
+    failSinkOnce(t.audit, "account.disabled");
+    const error = await caught(t.ik.accounts.disable(accountId));
+    expect(error).toBeInstanceOf(AllSessionsRevokedHookError);
+    const hookError = error as AllSessionsRevokedHookError;
+    expect(hookError.auditError).toEqual(sinkDown);
+    expect(hookError.tokenRevocationError).toEqual(new Error("no such table: identkit_api_tokens"));
+    expect(hookError.grantRevocationError).toEqual(
+      new Error("no such table: identkit_oauth_grants"),
+    );
+    expect(hookError.message).toBe(
+      "onAllSessionsRevoked failed after the revocation, and the revocation of the API tokens " +
+        "failed (no such table: identkit_api_tokens) and the end of the OAuth grants failed " +
+        "(no such table: identkit_oauth_grants); call accounts.disable again",
+    );
+  });
+
+  it("rule: sink error before store errors - the sink error goes up unchanged; the retry shows and fixes the grant error", async () => {
+    const { t, broken, accountId, tokens } = await disableSetup();
+    broken.tokens = false;
+    failSinkOnce(t.audit, "account.disabled");
+    const error = await caught(t.ik.accounts.disable(accountId));
+    expect(error).toEqual(sinkDown);
+    expect(Object.getOwnPropertyNames(error)).not.toContain("grantRevocationError");
+    await expect(t.ik.accounts.disable(accountId)).rejects.toThrow(
+      "no such table: identkit_oauth_grants",
+    );
+    broken.grants = false;
+    await t.ik.accounts.disable(accountId);
+    expect(t.audit.ofType("oauth.grant_ended").map((e) => e.reason)).toEqual(["account_disabled"]);
+    expect(await t.ik.oauth.validateAccessToken(tokens.accessToken)).toMatchObject({
+      reason: "unknown",
+    });
+  });
+
+  it("rule: token store error before grant store error - without hook and sink errors the token error goes up", async () => {
+    const { t, broken, accountId, tokens } = await disableSetup();
+    await expect(t.ik.accounts.disable(accountId)).rejects.toThrow(
+      "no such table: identkit_api_tokens",
+    );
+    broken.tokens = false;
+    await expect(t.ik.accounts.disable(accountId)).rejects.toThrow(
+      "no such table: identkit_oauth_grants",
+    );
+    // The grant still stands, but the disabled account's token is refused.
+    expect(await t.ik.oauth.validateAccessToken(tokens.accessToken)).toMatchObject({
+      reason: "account_disabled",
+    });
+    broken.grants = false;
+    await t.ik.accounts.disable(accountId);
+    expect(await t.ik.oauth.listGrants(accountId)).toEqual([]);
+  });
+
+  it("rule: event not lost - a failed session revocation still records the ended grants", async () => {
+    const { store, broken } = brokenRevocationStores();
+    broken.tokens = false;
+    broken.grants = false;
+    const failing: IdentkitStore = {
+      ...store,
+      sessions: {
+        ...store.sessions,
+        revokeAllForAccount: () => Promise.reject(new Error("store unavailable")),
+      },
+    };
+    const t = setup({ store: failing, oauth: baseOAuthOptions });
+    const user = await t.signIn("revoke-fails@example.org");
+    const client = await createOAuthTestClient(t.ik.oauth);
+    await client.connect(user.account.id);
+    await expect(t.ik.accounts.disable(user.account.id)).rejects.toThrow("store unavailable");
+    expect(t.audit.ofType("oauth.grant_ended").map((e) => e.reason)).toEqual(["account_disabled"]);
   });
 });

@@ -10,6 +10,7 @@ import {
   type IdentkitStore,
   type SecretSealer,
 } from "../src/index.js";
+import { createOAuthTestClient } from "../src/testing/index.js";
 import { base32Decode } from "../src/totp-core.js";
 import {
   emailFirstPolicy,
@@ -19,6 +20,7 @@ import {
   STEP,
   testConfig,
 } from "./helpers.js";
+import { baseOAuthOptions } from "./oauth-helpers.js";
 
 type T = ReturnType<typeof setup>;
 
@@ -407,15 +409,27 @@ describe("TOTP enrolment", () => {
   });
 
   it("rule: a cleanup that disables the account also revokes its API tokens", async () => {
-    for (const tokenStoreFails of [false, true]) {
-      const label = tokenStoreFails ? "token store fails" : "token store works";
+    for (const label of ["token store works", "token store fails", "grant store fails once"]) {
+      const tokenStoreFails = label === "token store fails";
       const hooked = hookedTotpStore();
       const { inner, hooks } = hooked;
       const tokens = inner.apiTokens;
-      if (!tokens) throw new Error("memory store has apiTokens");
+      const grants = inner.oauth;
+      if (!tokens || !grants) throw new Error("memory store has apiTokens and oauth");
       let tokenFailures = 0;
+      let grantFailures = 0;
       const store: IdentkitStore = {
         ...hooked.store,
+        oauth: {
+          ...grants,
+          deleteGrantsForAccount: async (...args) => {
+            if (grantFailures > 0) {
+              grantFailures -= 1;
+              throw new Error("no such table: identkit_oauth_grants");
+            }
+            return grants.deleteGrantsForAccount(...args);
+          },
+        },
         apiTokens: {
           ...tokens,
           revokeAllForAccount: async (...args) => {
@@ -427,7 +441,11 @@ describe("TOTP enrolment", () => {
           },
         },
       };
-      const t = setup({ store, apiTokens: { prefix: "pat_", allowedScopes: ["read:items"] } });
+      const t = setup({
+        store,
+        apiTokens: { prefix: "pat_", allowedScopes: ["read:items"] },
+        oauth: baseOAuthOptions,
+      });
       const user = await t.signIn("person@example.org");
       const apiToken = await t.ik.apiTokens.create({
         accountId: user.account.id,
@@ -436,6 +454,8 @@ describe("TOTP enrolment", () => {
         expiresInDays: 30,
       });
       if (apiToken.status !== "created") throw new Error(apiToken.status);
+      const oauthClient = await createOAuthTestClient(t.ik.oauth);
+      const connected = await oauthClient.connect(user.account.id);
       const start = await t.ik.totp.startEnrolment(user.token);
       if (start.status !== "ok") throw new Error("denied");
       hooks.beforeActivate = async () => {
@@ -443,6 +463,7 @@ describe("TOTP enrolment", () => {
       };
       hooks.failTotpDelete = 3;
       tokenFailures = tokenStoreFails ? 2 : 0;
+      grantFailures = label === "grant store fails once" ? 1 : 0;
       await expect(
         t.ik.totp.confirmEnrolment(user.token, {
           factorId: start.factorId,
@@ -458,19 +479,31 @@ describe("TOTP enrolment", () => {
         expect(reasons, label).toContain("cleanup_failed_disable_failed");
         expect(t.audit.ofType("account.disabled"), label).toHaveLength(0);
         expect(t.audit.ofType("api_token.revoked"), label).toHaveLength(0);
+        expect(t.audit.ofType("oauth.grant_ended"), label).toHaveLength(0);
         // The operator step from the README: call accounts.disable before the re-enable.
         await t.ik.accounts.disable(user.account.id);
       } else {
         expect(reasons, label).toContain("cleanup_failed_account_disabled");
       }
-      // Review r3: the cleanup disabled the account with a bare status write, so enabling it
+      // The cleanup disabled the account with a bare status write, so enabling it
       // again in the store brought its API tokens back.
       await inner.accounts.setStatus(user.account.id, "active");
       expect(await t.ik.apiTokens.verify(apiToken.token), label).toEqual({
         status: "refused",
         reason: "revoked",
       });
+      // The cleanup ends the OAuth grants as well, so the re-enable brings no grant back.
+      expect(await t.ik.oauth.validateAccessToken(connected.accessToken), label).toEqual({
+        status: "refused",
+        reason: "unknown",
+      });
+      expect(
+        t.audit.ofType("oauth.grant_ended").map((e) => `${e.clientId} ${e.reason}`),
+        label,
+      ).toEqual([`${oauthClient.clientId} account_disabled`]);
       if (!tokenStoreFails) {
+        // Also after a grant store error, the retry finds the tokens revoked
+        // already; their event comes from the first attempt.
         expect(
           t.audit.ofType("api_token.revoked").map((e) => `${e.tokenId} ${e.reason}`),
           label,

@@ -2,6 +2,7 @@
  * Races between a ceremony and a concurrent change (revocation, registration, store error).
  * A wrapped store runs the concurrent change at the exact point where it would hurt.
  */
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   createMemoryStore,
@@ -10,7 +11,9 @@ import {
   PasskeyCleanupError,
 } from "../src/index.js";
 import type { IdentkitStore, SessionRecord } from "../src/storage/types.js";
+import { createOAuthTestClient } from "../src/testing/index.js";
 import { emailFirstPolicy, setup, testConfig } from "./helpers.js";
+import { baseOAuthOptions, oauthSetup } from "./oauth-helpers.js";
 
 interface Hooks {
   /** Runs once, right after the signature counter of an assertion was written. */
@@ -402,15 +405,26 @@ describe("passkey registration races", () => {
   });
 
   it("a cleanup that disables the account also revokes its API tokens", async () => {
-    for (const tokenStoreFails of [false, true]) {
-      const label = tokenStoreFails ? "token store fails" : "token store works";
+    for (const label of ["token store works", "token store fails", "grant store fails once"]) {
+      const tokenStoreFails = label === "token store fails";
       const inner = createMemoryStore();
       const tokens = inner.apiTokens;
-      if (!tokens) throw new Error("memory store has apiTokens");
-      const fail = { delete: 0, tokens: 0 };
+      const grants = inner.oauth;
+      if (!tokens || !grants) throw new Error("memory store has apiTokens and oauth");
+      const fail = { delete: 0, tokens: 0, grants: 0 };
       let afterActivate: (() => Promise<void>) | null = null;
       const store: IdentkitStore = {
         ...inner,
+        oauth: {
+          ...grants,
+          deleteGrantsForAccount: async (...args) => {
+            if (fail.grants > 0) {
+              fail.grants -= 1;
+              throw new Error("no such table: identkit_oauth_grants");
+            }
+            return grants.deleteGrantsForAccount(...args);
+          },
+        },
         apiTokens: {
           ...tokens,
           revokeAllForAccount: async (...args) => {
@@ -443,6 +457,7 @@ describe("passkey registration races", () => {
         store,
         policy: { ...emailFirstPolicy, createAccountOnFirstSignIn: false },
         apiTokens: { prefix: "pat_", allowedScopes: ["read:items"] },
+        oauth: baseOAuthOptions,
       });
       const created = await t.ik.accounts.create({ email: "staff@example.org" });
       if (created.status !== "created") throw new Error("not created");
@@ -454,6 +469,8 @@ describe("passkey registration races", () => {
         expiresInDays: 30,
       });
       if (apiToken.status !== "created") throw new Error(apiToken.status);
+      const oauthClient = await createOAuthTestClient(t.ik.oauth);
+      const connected = await oauthClient.connect(accountId);
       const { token } = await t.ik.passkeys.issueEnrollmentToken(accountId);
       const start = await t.ik.passkeys.startRegistration({ enrollmentToken: token });
       if (start.status !== "ok") throw new Error("denied");
@@ -461,6 +478,7 @@ describe("passkey registration races", () => {
         await t.ik.passkeys.revokeEnrollmentTokens(accountId);
         fail.delete = 2;
         fail.tokens = tokenStoreFails ? 2 : 0;
+        fail.grants = label === "grant store fails once" ? 1 : 0;
       };
       const error: unknown = await t.ik.passkeys
         .finishRegistration({ enrollmentToken: token }, t.authenticator.register(start.options))
@@ -476,20 +494,32 @@ describe("passkey registration races", () => {
         expect(error, label).toBeInstanceOf(PasskeyCleanupError);
         expect(reasons, label).toContain("cleanup_failed_disable_failed");
         expect(t.audit.ofType("api_token.revoked"), label).toHaveLength(0);
+        expect(t.audit.ofType("oauth.grant_ended"), label).toHaveLength(0);
         // The operator step from the README: call accounts.disable before the re-enable.
         await t.ik.accounts.disable(accountId);
       } else {
         expect(error, label).toEqual(new Error("connection reset"));
         expect(reasons, label).toContain("cleanup_failed_account_disabled");
       }
-      // Review r3: the cleanup disabled the account with a bare status write, so enabling it
+      // The cleanup disabled the account with a bare status write, so enabling it
       // again in the store brought its API tokens back.
       await inner.accounts.setStatus(accountId, "active");
       expect(await t.ik.apiTokens.verify(apiToken.token), label).toEqual({
         status: "refused",
         reason: "revoked",
       });
+      // The cleanup ends the OAuth grants as well, so the re-enable brings no grant back.
+      expect(await t.ik.oauth.validateAccessToken(connected.accessToken), label).toEqual({
+        status: "refused",
+        reason: "unknown",
+      });
+      expect(
+        t.audit.ofType("oauth.grant_ended").map((e) => `${e.clientId} ${e.reason}`),
+        label,
+      ).toEqual([`${oauthClient.clientId} account_disabled`]);
       if (!tokenStoreFails) {
+        // Also after a grant store error, the retry finds the tokens revoked
+        // already; their event comes from the first attempt.
         expect(
           t.audit.ofType("api_token.revoked").map((e) => `${e.tokenId} ${e.reason}`),
           label,
@@ -787,5 +817,286 @@ describe("identity verification links before it reports success", () => {
     expect((await t.ik.identityVerification.get(verificationId))?.status).toBe("pending");
     expect((await t.ik.identityVerification.refresh(verificationId))?.status).toBe("verified");
     expect((await t.ik.accounts.get(user.account.id))?.identityVerified).toBe(true);
+  });
+});
+
+/** A memory store whose OAuth writes can run a concurrent call at the point it would hurt. */
+function hookedOAuthStore() {
+  const inner = createMemoryStore();
+  const oauth = inner.oauth;
+  if (!oauth) throw new Error("memory store has no oauth");
+  const hooks: {
+    beforeConsume: (() => Promise<void>) | null;
+    beforeRotate: (() => Promise<void>) | null;
+    beforeInsertGrant: (() => Promise<void>) | null;
+    afterInsertGrant: (() => Promise<void>) | null;
+    beforeUpgradeSecret: (() => Promise<void>) | null;
+    beforeImportGrant: (() => Promise<void>) | null;
+    beforeInsertClient: (() => Promise<void>) | null;
+  } = {
+    beforeConsume: null,
+    beforeRotate: null,
+    beforeInsertGrant: null,
+    afterInsertGrant: null,
+    beforeUpgradeSecret: null,
+    beforeImportGrant: null,
+    beforeInsertClient: null,
+  };
+  const once = async (name: keyof typeof hooks) => {
+    const hook = hooks[name];
+    hooks[name] = null;
+    if (hook) await hook();
+  };
+  const store: IdentkitStore = {
+    ...inner,
+    oauth: {
+      ...oauth,
+      consumeCode: async (digest) => {
+        await once("beforeConsume");
+        return oauth.consumeCode(digest);
+      },
+      rotateGrant: async (...args) => {
+        await once("beforeRotate");
+        return oauth.rotateGrant(...args);
+      },
+      insertGrant: async (...args) => {
+        await once("beforeInsertGrant");
+        const result = await oauth.insertGrant(...args);
+        await once("afterInsertGrant");
+        return result;
+      },
+      upgradeClientSecret: async (...args) => {
+        await once("beforeUpgradeSecret");
+        return oauth.upgradeClientSecret(...args);
+      },
+      importGrant: async (...args) => {
+        await once("beforeImportGrant");
+        return oauth.importGrant(...args);
+      },
+      insertClient: async (...args) => {
+        await once("beforeInsertClient");
+        return oauth.insertClient(...args);
+      },
+    },
+  };
+  return { store, hooks };
+}
+
+describe("oauth races", () => {
+  it("a code exchanged by a concurrent call first is gone for this one, and its grant ends", async () => {
+    const { store, hooks } = hookedOAuthStore();
+    const { ik, account } = oauthSetup({ store });
+    const client = await createOAuthTestClient(ik.oauth);
+    const accountId = await account();
+    const { code, verifier } = await client.authorize(accountId);
+    let concurrent: Awaited<ReturnType<typeof client.exchange>> | null = null;
+    hooks.beforeConsume = async () => {
+      concurrent = await client.exchange(code, verifier);
+    };
+    const late = await client.exchange(code, verifier);
+    expect(concurrent).toMatchObject({ httpStatus: 200 });
+    expect(late.body?.["error"]).toBe("invalid_grant");
+    // The late call saw the code again: the grant of the first exchange ended (code reuse).
+    expect(await ik.oauth.listGrants(accountId)).toEqual([]);
+  });
+
+  it("a rotation that loses to a concurrent one issues nothing and keeps the grant", async () => {
+    const { store, hooks } = hookedOAuthStore();
+    const { ik, account } = oauthSetup({ store });
+    const client = await createOAuthTestClient(ik.oauth);
+    const accountId = await account();
+    const tokens = await client.connect(accountId);
+    const refreshToken = tokens.refreshToken ?? "";
+    let concurrent: Awaited<ReturnType<typeof client.refresh>> | null = null;
+    hooks.beforeRotate = async () => {
+      concurrent = await client.refresh(refreshToken);
+    };
+    const late = await client.refresh(refreshToken);
+    expect(concurrent).toMatchObject({ httpStatus: 200 });
+    expect(late.body?.["error"]).toBe("invalid_grant");
+    expect(late.body).not.toHaveProperty("access_token");
+    expect(await ik.oauth.listGrants(accountId)).toHaveLength(1);
+  });
+
+  it("a grant insert after a concurrent one filled the cap is refused", async () => {
+    const { store, hooks } = hookedOAuthStore();
+    const { ik, account } = oauthSetup({ store, oauth: { maxGrantsPerAccount: 1 } });
+    const accountId = await account();
+    const first = await createOAuthTestClient(ik.oauth);
+    const second = await createOAuthTestClient(ik.oauth);
+    const firstCode = await first.authorize(accountId);
+    const secondCode = await second.authorize(accountId);
+    let concurrent: Awaited<ReturnType<typeof first.exchange>> | null = null;
+    hooks.beforeInsertGrant = async () => {
+      concurrent = await second.exchange(secondCode.code, secondCode.verifier);
+    };
+    const late = await first.exchange(firstCode.code, firstCode.verifier);
+    expect(concurrent).toMatchObject({ httpStatus: 200 });
+    expect(late.body?.["error"]).toBe("invalid_grant");
+    expect((await ik.oauth.listGrants(accountId)).map((g) => g.clientId)).toEqual([
+      second.clientId,
+    ]);
+  });
+
+  it("parallel registrations at the limit never pass it", async () => {
+    const { ik } = oauthSetup({
+      oauth: { registration: { maxPerAddressPerDay: 5, maxPerDay: 8 } },
+    });
+    const body = JSON.stringify({
+      redirect_uris: ["http://127.0.0.1/cb"],
+      token_endpoint_auth_method: "none",
+    });
+    const sameAddress = await Promise.all(
+      Array.from({ length: 20 }, () => ik.oauth.register({ body, addressKey: "192.0.2.1" })),
+    );
+    expect(sameAddress.filter((r) => r.httpStatus === 201)).toHaveLength(5);
+    const spread = await Promise.all(
+      Array.from({ length: 20 }, (_, i) =>
+        ik.oauth.register({ body, addressKey: `192.0.2.${i + 10}` }),
+      ),
+    );
+    expect(spread.filter((r) => r.httpStatus === 201)).toHaveLength(3);
+  });
+
+  it("a disable between the code and the grant insert leaves no grant", async () => {
+    const { store, hooks } = hookedOAuthStore();
+    const { ik, account } = oauthSetup({ store });
+    const client = await createOAuthTestClient(ik.oauth);
+    const accountId = await account();
+    const { code, verifier } = await client.authorize(accountId);
+    hooks.beforeInsertGrant = () => ik.accounts.disable(accountId);
+    expect((await client.exchange(code, verifier)).body?.["error"]).toBe("invalid_grant");
+    expect(await store.oauth?.listGrants(accountId, new Date(0))).toEqual([]);
+  });
+
+  it("a disable right after the grant insert ends the new grant; its tokens never work", async () => {
+    const { store, hooks } = hookedOAuthStore();
+    const { ik, account, audit } = oauthSetup({ store });
+    const client = await createOAuthTestClient(ik.oauth);
+    const accountId = await account();
+    const { code, verifier } = await client.authorize(accountId);
+    hooks.afterInsertGrant = () => ik.accounts.disable(accountId);
+    const result = await client.exchange(code, verifier);
+    // The exchange had won already, so it answers with tokens; the disable ended their grant.
+    expect(result.httpStatus).toBe(200);
+    const accessToken = String(result.body?.["access_token"]);
+    await store.accounts.setStatus(accountId, "active");
+    expect(await ik.oauth.validateAccessToken(accessToken)).toMatchObject({ reason: "unknown" });
+    expect(await ik.oauth.listGrants(accountId)).toEqual([]);
+    expect(audit.ofType("oauth.grant_ended").map((e) => e.reason)).toEqual(["account_disabled"]);
+  });
+
+  it("a client deleted mid-exchange: no grant survives, its tokens never work", async () => {
+    const { store, hooks } = hookedOAuthStore();
+    const { ik, account, audit } = oauthSetup({ store });
+    const client = await createOAuthTestClient(ik.oauth);
+    const accountId = await account();
+    const { code, verifier } = await client.authorize(accountId);
+    hooks.afterInsertGrant = async () => {
+      await ik.oauth.deleteClient(client.clientId);
+    };
+    const result = await client.exchange(code, verifier);
+    expect(result.httpStatus).toBe(200);
+    expect(await ik.oauth.validateAccessToken(String(result.body?.["access_token"]))).toMatchObject(
+      { reason: "unknown" },
+    );
+    expect(await ik.oauth.listGrants(accountId)).toEqual([]);
+    // The audit order is inverted: the end of the grant is recorded before its creation. Both
+    // records exist; the README names this order.
+    expect(
+      audit.events
+        .filter((e) => e.type === "oauth.grant_ended" || e.type === "oauth.grant_created")
+        .map((e) => e.type),
+    ).toEqual(["oauth.grant_ended", "oauth.grant_created"]);
+  });
+
+  it("a legacy secret upgrade that loses to a concurrent one still authenticates", async () => {
+    const { store, hooks } = hookedOAuthStore();
+    const { ik } = oauthSetup({ store, oauth: { acceptLegacyClientSecrets: true } });
+    const secretSha256 = createHash("sha256").update("old secret").digest("hex");
+    await ik.oauth.importClient({
+      id: "legacy-client",
+      redirectUris: ["http://127.0.0.1/callback"],
+      grantTypes: ["authorization_code"],
+      authMethod: "client_secret_post",
+      secretSha256,
+    });
+    const call = () =>
+      ik.oauth.token({
+        form: new URLSearchParams({
+          grant_type: "refresh_token",
+          refresh_token: "x",
+          client_id: "legacy-client",
+          client_secret: "old secret",
+        }),
+        authorization: null,
+      });
+    let concurrent: Awaited<ReturnType<typeof call>> | null = null;
+    hooks.beforeUpgradeSecret = async () => {
+      concurrent = await call();
+    };
+    const late = await call();
+    // Both authenticated (an unauthenticated call would answer 401, not invalid_grant).
+    expect(concurrent).toMatchObject({ httpStatus: 400 });
+    expect(late).toMatchObject({ httpStatus: 400 });
+    const stored = await store.oauth?.findClient("legacy-client");
+    expect(stored?.secretDigestAlgorithm).toBe("hmac-sha256");
+  });
+
+  it("a grant import that loses to a concurrent import of the same grant answers already_imported", async () => {
+    const { store, hooks } = hookedOAuthStore();
+    const { ik, account, clock, audit } = oauthSetup({ store });
+    const accountId = await account();
+    await ik.oauth.importClient({
+      id: "legacy-client",
+      redirectUris: ["http://127.0.0.1/callback"],
+      grantTypes: ["authorization_code", "refresh_token"],
+      authMethod: "none",
+    });
+    const now = clock.now().getTime();
+    const input = {
+      id: "legacy-grant",
+      accountId,
+      clientId: "legacy-client",
+      scopes: ["mcp:read"],
+      resource: "https://example.com/mcp",
+      createdAt: new Date(now - 1000),
+      expiresAt: new Date(now + 86_400_000),
+      generation: 1,
+      refreshExpiresAt: new Date(now + 86_400_000),
+      refreshSha256: "a".repeat(64),
+    };
+    let concurrent: Awaited<ReturnType<typeof ik.oauth.importGrant>> | null = null;
+    hooks.beforeImportGrant = async () => {
+      concurrent = await ik.oauth.importGrant(input);
+    };
+    const late = await ik.oauth.importGrant(input);
+    expect(concurrent).toEqual({ status: "imported" });
+    expect(late).toEqual({ status: "already_imported" });
+    expect(audit.ofType("oauth.grant_imported")).toHaveLength(1);
+  });
+
+  it("a client import that loses to a concurrent import of the same client answers already_imported", async () => {
+    const { store, hooks } = hookedOAuthStore();
+    const { ik, audit } = oauthSetup({ store });
+    const input = {
+      id: "legacy-client",
+      redirectUris: ["http://127.0.0.1/callback"],
+      grantTypes: ["authorization_code"],
+      authMethod: "none" as const,
+    };
+    let concurrent: Awaited<ReturnType<typeof ik.oauth.importClient>> | null = null;
+    hooks.beforeInsertClient = async () => {
+      concurrent = await ik.oauth.importClient(input);
+    };
+    const late = await ik.oauth.importClient(input);
+    expect(concurrent).toMatchObject({ status: "imported" });
+    expect(late).toMatchObject({ status: "already_imported" });
+    const other = await ik.oauth.importClient({
+      ...input,
+      grantTypes: ["authorization_code", "refresh_token"],
+    });
+    expect(other).toEqual({ status: "id_taken" });
+    expect(audit.ofType("oauth.client_imported")).toHaveLength(1);
   });
 });

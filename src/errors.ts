@@ -19,6 +19,29 @@ function messageOf(error: unknown): string {
   }
 }
 
+/** The message of `AllSessionsRevokedHookError`: names each store error of `accounts.disable`. */
+function hookErrorMessage(options?: {
+  tokenRevocationError?: unknown;
+  grantRevocationError?: unknown;
+}): string {
+  const failed: string[] = [];
+  if (options?.tokenRevocationError !== undefined) {
+    failed.push(
+      `the revocation of the API tokens failed (${messageOf(options.tokenRevocationError)})`,
+    );
+  }
+  if (options?.grantRevocationError !== undefined) {
+    failed.push(`the end of the OAuth grants failed (${messageOf(options.grantRevocationError)})`);
+  }
+  if (failed.length === 0) {
+    return "onAllSessionsRevoked failed after the revocation; call sessions.revokeAll again";
+  }
+  return (
+    `onAllSessionsRevoked failed after the revocation, and ${failed.join(" and ")}; ` +
+    "call accounts.disable again"
+  );
+}
+
 /**
  * The operator policy does not allow this method for this call. The decision depends only
  * on the policy, never on the account or the address.
@@ -97,24 +120,29 @@ export class AllSessionsRevokedHookError extends IdentkitError {
    * serializes to `{}` in JSON.
    */
   readonly tokenRevocationError: unknown;
+  /**
+   * Set only by `accounts.disable`: the store's error on the end of the account's OAuth grants
+   * and codes, else undefined. Same rule as `tokenRevocationError`: the hook error wins, a
+   * disabled account's grants are refused (`validateAccessToken` and refresh check the account
+   * status), and `accounts.disable` again ends them. The message names this error too.
+   */
+  readonly grantRevocationError: unknown;
 
   constructor(
     readonly accountId: string,
     /** The session that stayed live, or null. */
     readonly exceptSessionId: string | null,
-    options?: ErrorOptions & { auditError?: unknown; tokenRevocationError?: unknown },
+    options?: ErrorOptions & {
+      auditError?: unknown;
+      tokenRevocationError?: unknown;
+      grantRevocationError?: unknown;
+    },
   ) {
-    super(
-      "all_sessions_revoked_hook_failed",
-      options?.tokenRevocationError === undefined
-        ? "onAllSessionsRevoked failed after the revocation; call sessions.revokeAll again"
-        : "onAllSessionsRevoked failed after the revocation, and the revocation of the API " +
-            `tokens failed (${messageOf(options.tokenRevocationError)}); call accounts.disable again`,
-      options,
-    );
+    super("all_sessions_revoked_hook_failed", hookErrorMessage(options), options);
     this.revokeAllOptions = exceptSessionId === null ? {} : { exceptSessionId };
     this.auditError = options?.auditError;
     this.tokenRevocationError = options?.tokenRevocationError;
+    this.grantRevocationError = options?.grantRevocationError;
   }
 }
 
@@ -129,8 +157,18 @@ export class AllSessionsRevokedHookError extends IdentkitError {
  *
  * `apiTokens.create` and `apiTokens.import` throw it when the audit sink refused the event of the
  * new token: identkit deleted the token again, and `cause` holds the sink's error. They revoke
- * no session, so `hookFailed` is false. If the delete fails, the store's error goes up instead
+ * no session, so `hookFailed` is false. `oauth.importGrant` does the same for
+ * `oauth.grant_imported` and the imported grant. If the delete fails, the store's error goes up instead
  * and the token stands (a created token is unusable then: its plaintext was never returned).
+ *
+ * `oauth.token` throws it for a code exchange when the audit sink refused `oauth.grant_created`,
+ * or `oauth.grant_ended` of the grant that the exchange replaced: identkit deleted the new grant
+ * again, and `cause` holds the sink's error. One exception to the rule below: an exchange
+ * replaces the account's earlier grant of the same client, and that grant stays ended. It is not
+ * restored, so its client must connect again. Its `oauth.grant_ended` event (reason `replaced`)
+ * goes to the sink before `oauth.grant_created`; if the sink refused that event, the grant ended
+ * without its record. If the delete fails, the store's error goes up instead and the new grant
+ * stands, unusable (its tokens were never returned).
  *
  * If you catch this error, the operation did not take effect. Any other error means that
  * identkit did not roll back: what it wrote before the error stands. After any other error from
@@ -156,6 +194,28 @@ export class OperationRolledBackError extends IdentkitError {
       cause: options.cause,
     });
     this.hookFailed = options.hookFailed;
+  }
+}
+
+/**
+ * identkit rolled a client operation back: it did not take effect. `oauth.register` throws it
+ * when the audit sink refused `oauth.client_registered`, and `oauth.importClient` when it
+ * refused `oauth.client_imported`: identkit deleted the new client again,
+ * and `cause` holds the sink's error. `clientId` names the deleted client; it was never
+ * returned to the caller. A client belongs to no account, so this is not an
+ * `OperationRolledBackError`, and no session was revoked. If the delete fails, the store's error
+ * goes up instead and the client stands without its record; nobody holds its id or secret.
+ */
+export class OAuthClientRolledBackError extends IdentkitError {
+  constructor(
+    readonly clientId: string,
+    options: { cause: unknown },
+  ) {
+    super(
+      "oauth_client_rolled_back",
+      "the client operation was rolled back and did not take effect",
+      options,
+    );
   }
 }
 

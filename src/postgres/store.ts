@@ -1,4 +1,10 @@
-import { sql, type Kysely, type Selectable } from "kysely";
+import {
+  sql,
+  type ExpressionBuilder,
+  type Kysely,
+  type Selectable,
+  type Transaction,
+} from "kysely";
 import { addSeconds } from "../clock.js";
 import { knownAuthMethods } from "../storage/auth-methods.js";
 import { applyThrottle } from "../storage/throttle-logic.js";
@@ -9,6 +15,11 @@ import type {
   CredentialRecord,
   EnrollmentTokenRecord,
   IdentkitStore,
+  OAuthAccessTokenRecord,
+  OAuthClientRecord,
+  OAuthCodeRecord,
+  OAuthGrantRecord,
+  OAuthImportTombstoneKind,
   OidcLinkRecord,
   OtpFlowRecord,
   SessionRecord,
@@ -20,6 +31,8 @@ import type { IdentkitDatabase } from "./schema.js";
 type Row<T extends keyof IdentkitDatabase> = Selectable<IdentkitDatabase[T]>;
 
 const UNIQUE_VIOLATION = "23505";
+/** Ids per statement in `oauth.purge` and in a tombstone insert. */
+const PURGE_CHUNK = 1000;
 /** serialization_failure and deadlock_detected. */
 const LOST_RACE = new Set(["40001", "40P01"]);
 
@@ -36,6 +49,105 @@ function isUniqueViolation(error: unknown): boolean {
 function isLostRace(error: unknown): boolean {
   const code = sqlState(error);
   return typeof code === "string" && LOST_RACE.has(code);
+}
+
+/**
+ * Locks the client row FOR KEY SHARE inside a grant insert or import, right after the account
+ * lock and before any grant row is touched. The foreign key check of the grant insert takes the
+ * same lock, but only at the insert: by then a replacing insert holds the row lock of the grant it
+ * deleted, and `deleteClient` (client FOR UPDATE, then the client's grants) could wait on it in
+ * a cycle. Throws, as the foreign key would, if the client does not exist.
+ */
+async function lockClientForGrant(
+  trx: Transaction<IdentkitDatabase>,
+  clientId: string,
+): Promise<void> {
+  const client = await trx
+    .selectFrom("identkit_oauth_clients")
+    .select("id")
+    .where("id", "=", clientId)
+    .forKeyShare()
+    .executeTakeFirst();
+  if (!client) throw new Error("oauth grant references a missing client");
+}
+
+/** An expression builder over `identkit_oauth_clients as c`. */
+type ClientsAsC = ExpressionBuilder<
+  IdentkitDatabase & { c: IdentkitDatabase["identkit_oauth_clients"] },
+  "c"
+>;
+
+/**
+ * The purge rule for a client: past its date rule (never used and created before
+ * `unusedBefore`, or last used before `idleBefore`), and holding no live grant and no live code.
+ */
+function purgeable(eb: ClientsAsC, b: { at: Date; unusedBefore: Date; idleBefore: Date }) {
+  return eb.and([
+    eb.or([
+      eb.and([eb("c.last_used_at", "is", null), eb("c.created_at", "<", b.unusedBefore)]),
+      eb.and([eb("c.last_used_at", "is not", null), eb("c.last_used_at", "<", b.idleBefore)]),
+    ]),
+    eb.not(
+      eb.exists(
+        eb
+          .selectFrom("identkit_oauth_grants as g")
+          .select("g.id")
+          .whereRef("g.client_id", "=", "c.id")
+          .where("g.expires_at", ">", b.at),
+      ),
+    ),
+    eb.not(
+      eb.exists(
+        eb
+          .selectFrom("identkit_oauth_codes as o")
+          .select("o.digest")
+          .whereRef("o.client_id", "=", "c.id")
+          .where("o.expires_at", ">", b.at),
+      ),
+    ),
+  ]);
+}
+
+/** Thrown inside a transaction to roll back an insert that a tombstone refuses. */
+class RefusedByTombstone extends Error {}
+
+/**
+ * Writes the import tombstones of the deleted rows whose source is `import`, in the transaction
+ * of their delete.
+ */
+async function writeTombstones(
+  trx: Transaction<IdentkitDatabase>,
+  kind: OAuthImportTombstoneKind,
+  deleted: readonly { id: string; source: string }[],
+  at: Date,
+): Promise<void> {
+  const ids = deleted.filter((row) => row.source === "import").map((row) => row.id);
+  for (let i = 0; i < ids.length; i += PURGE_CHUNK) {
+    await trx
+      .insertInto("identkit_oauth_import_tombstones")
+      .values(ids.slice(i, i + PURGE_CHUNK).map((id) => ({ kind, id, ended_at: at })))
+      .onConflict((oc) => oc.columns(["kind", "id"]).doNothing())
+      .execute();
+  }
+}
+
+/**
+ * True if a tombstone names the id. Called after the insert of the id, in its READ COMMITTED
+ * transaction: a new statement, so it sees a tombstone that a concurrent delete of the same id
+ * committed while the insert waited on that row.
+ */
+async function hasTombstone(
+  trx: Transaction<IdentkitDatabase>,
+  kind: OAuthImportTombstoneKind,
+  id: string,
+): Promise<boolean> {
+  const row = await trx
+    .selectFrom("identkit_oauth_import_tombstones")
+    .select("id")
+    .where("kind", "=", kind)
+    .where("id", "=", id)
+    .executeTakeFirst();
+  return row !== undefined;
 }
 
 /** Checks a value read from the database against the allowed set. */
@@ -58,6 +170,11 @@ const OIDC_LINK_SOURCES = ["sign_in", "import"] as const;
 const STEP_UP_METHODS = ["email_otp", "passkey", "totp"] as const;
 const API_TOKEN_ALGORITHMS = ["hmac-sha256", "sha256"] as const;
 const API_TOKEN_SOURCES = ["created", "import"] as const;
+const OAUTH_ALGORITHMS = ["hmac-sha256", "sha256"] as const;
+const OAUTH_AUTH_METHODS = ["none", "client_secret_basic", "client_secret_post"] as const;
+const OAUTH_CLIENT_SOURCES = ["dynamic", "import"] as const;
+const OAUTH_GRANT_SOURCES = ["created", "import"] as const;
+const ACCOUNT_STATUSES = ["active", "disabled"] as const;
 
 const toAccount = (r: Row<"identkit_accounts">): AccountRecord => ({
   id: r.id,
@@ -202,6 +319,119 @@ const toApiToken = (r: Row<"identkit_api_tokens">): ApiTokenRecord => ({
   revokedAt: r.revoked_at,
   revokeReason: r.revoke_reason,
 });
+
+const toOAuthClient = (r: Row<"identkit_oauth_clients">): OAuthClientRecord => ({
+  id: r.id,
+  secretDigest: r.secret_digest,
+  secretDigestAlgorithm: oneOfOrNull(r.secret_digest_algorithm, OAUTH_ALGORITHMS),
+  authMethod: oneOf(r.auth_method, OAUTH_AUTH_METHODS),
+  grantTypes: [...r.grant_types],
+  redirectUris: [...r.redirect_uris],
+  name: r.name,
+  source: oneOf(r.source, OAUTH_CLIENT_SOURCES),
+  createdAt: r.created_at,
+  lastUsedAt: r.last_used_at,
+});
+
+const toOAuthGrant = (r: Row<"identkit_oauth_grants">): OAuthGrantRecord => ({
+  id: r.id,
+  accountId: r.account_id,
+  clientId: r.client_id,
+  scopes: [...r.scopes],
+  resource: r.resource,
+  createdAt: r.created_at,
+  expiresAt: r.expires_at,
+  generation: r.generation,
+  refreshRefDigest: r.refresh_ref_digest,
+  refreshDigest: r.refresh_digest,
+  refreshDigestAlgorithm: oneOfOrNull(r.refresh_digest_algorithm, OAUTH_ALGORITHMS),
+  previousRefreshDigest: r.previous_refresh_digest,
+  refreshedAt: r.refreshed_at,
+  refreshExpiresAt: r.refresh_expires_at,
+  codeDigest: r.code_digest,
+  source: oneOf(r.source, OAUTH_GRANT_SOURCES),
+});
+
+const toOAuthCode = (r: Row<"identkit_oauth_codes">): OAuthCodeRecord => ({
+  digest: r.digest,
+  clientId: r.client_id,
+  accountId: r.account_id,
+  redirectUri: r.redirect_uri,
+  redirectUriExplicit: r.redirect_uri_explicit,
+  codeChallenge: r.code_challenge,
+  resource: r.resource,
+  scopes: [...r.scopes],
+  createdAt: r.created_at,
+  expiresAt: r.expires_at,
+});
+
+const oauthGrantRow = (g: OAuthGrantRecord) => ({
+  id: g.id,
+  account_id: g.accountId,
+  client_id: g.clientId,
+  scopes: g.scopes,
+  resource: g.resource,
+  created_at: g.createdAt,
+  expires_at: g.expiresAt,
+  generation: g.generation,
+  refresh_ref_digest: g.refreshRefDigest,
+  refresh_digest: g.refreshDigest,
+  refresh_digest_algorithm: g.refreshDigestAlgorithm,
+  previous_refresh_digest: g.previousRefreshDigest,
+  refreshed_at: g.refreshedAt,
+  refresh_expires_at: g.refreshExpiresAt,
+  code_digest: g.codeDigest,
+  source: g.source,
+});
+
+const oauthAccessTokenRow = (t: OAuthAccessTokenRecord) => ({
+  digest: t.digest,
+  grant_id: t.grantId,
+  generation: t.generation,
+  scopes: t.scopes,
+  created_at: t.createdAt,
+  expires_at: t.expiresAt,
+});
+
+/**
+ * Deletes the client with its grants and codes, and returns the grants, or null. Imported grants
+ * get their tombstones. The client gets one too, unless this rolls back its import (`rollBack`):
+ * then it matches only an imported client and writes no tombstone for it.
+ */
+async function endClient(
+  db: Kysely<IdentkitDatabase>,
+  id: string,
+  at: Date,
+  rollBack: boolean,
+): Promise<OAuthGrantRecord[] | null> {
+  return db
+    .transaction()
+    .setIsolationLevel("read committed")
+    .execute(async (trx) => {
+      // The row lock first: a concurrent grant insert or import takes a key share lock on the
+      // client before it touches any grant row, so it waits here, then fails on the deleted
+      // client. Without this lock, the client delete could cascade a grant committed after the
+      // grant delete below. Both sides lock the client before any grant row, so they never wait
+      // on each other in a cycle (a replacing insert holds the row lock of the grant it deletes).
+      let lock = trx
+        .selectFrom("identkit_oauth_clients")
+        .select(["id", "source"])
+        .where("id", "=", id);
+      if (rollBack) lock = lock.where("source", "=", "import");
+      const client = await lock.forUpdate().executeTakeFirst();
+      if (!client) return null;
+      const grants = await trx
+        .deleteFrom("identkit_oauth_grants")
+        .where("client_id", "=", id)
+        .returningAll()
+        .execute();
+      // The foreign keys remove the grants' access tokens and the client's codes.
+      await trx.deleteFrom("identkit_oauth_clients").where("id", "=", id).execute();
+      await writeTombstones(trx, "grant", grants, at);
+      if (!rollBack) await writeTombstones(trx, "client", [client], at);
+      return grants.map(toOAuthGrant);
+    });
+}
 
 /**
  * PostgreSQL store. Pass a Kysely instance with a PostgreSQL dialect; apply the migrations
@@ -1077,6 +1307,481 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           .returning("id")
           .executeTakeFirst();
         return row !== undefined;
+      },
+    },
+    oauth: {
+      async insertClient(c) {
+        try {
+          // The primary key makes a second insert of an id a no-op. Then the tombstone, in the
+          // same transaction (see `hasTombstone`): a refused insert is rolled back.
+          return await db
+            .transaction()
+            .setIsolationLevel("read committed")
+            .execute(async (trx) => {
+              const row = await trx
+                .insertInto("identkit_oauth_clients")
+                .values({
+                  id: c.id,
+                  secret_digest: c.secretDigest,
+                  secret_digest_algorithm: c.secretDigestAlgorithm,
+                  auth_method: c.authMethod,
+                  grant_types: c.grantTypes,
+                  redirect_uris: c.redirectUris,
+                  name: c.name,
+                  source: c.source,
+                  created_at: c.createdAt,
+                  last_used_at: c.lastUsedAt,
+                })
+                .onConflict((oc) => oc.column("id").doNothing())
+                .returning("id")
+                .executeTakeFirst();
+              if (!row) return "id_taken" as const;
+              if (await hasTombstone(trx, "client", c.id)) throw new RefusedByTombstone();
+              return "inserted" as const;
+            });
+        } catch (error) {
+          if (error instanceof RefusedByTombstone) return "revoked";
+          throw error;
+        }
+      },
+      async findClient(id) {
+        const r = await db
+          .selectFrom("identkit_oauth_clients")
+          .selectAll()
+          .where("id", "=", id)
+          .executeTakeFirst();
+        return r ? toOAuthClient(r) : null;
+      },
+      async markClientUsed(id, at, notAfter) {
+        try {
+          // Atomic: one UPDATE that matches only while the last use is old enough.
+          const row = await db
+            .updateTable("identkit_oauth_clients")
+            .set({ last_used_at: at })
+            .where("id", "=", id)
+            .where((eb) =>
+              eb.or([eb("last_used_at", "is", null), eb("last_used_at", "<=", notAfter)]),
+            )
+            .returning("id")
+            .executeTakeFirst();
+          return row !== undefined;
+        } catch (error) {
+          // A concurrent write under REPEATABLE READ: that call wrote, so this one need not.
+          if (isLostRace(error)) return false;
+          throw error;
+        }
+      },
+      async upgradeClientSecret(id, oldDigest, newDigest) {
+        // Atomic: compare-and-set in one UPDATE on the expected digest.
+        const row = await db
+          .updateTable("identkit_oauth_clients")
+          .set({ secret_digest: newDigest, secret_digest_algorithm: "hmac-sha256" })
+          .where("id", "=", id)
+          .where("secret_digest", "=", oldDigest)
+          .returning("id")
+          .executeTakeFirst();
+        return row !== undefined;
+      },
+      async deleteClient(id, at) {
+        return endClient(db, id, at, false);
+      },
+      async reserveRegistration({ keys, windowStart }) {
+        // One upsert per key, in order. Each is atomic: the row lock of ON CONFLICT DO UPDATE
+        // makes the WHERE see the count of the call before, so the count never passes max.
+        for (const { key, max } of keys) {
+          const { rows } = await sql<{ count: number }>`
+            INSERT INTO identkit_oauth_registration_counts AS c (key, window_start, count)
+            VALUES (${key}, ${windowStart}, 1)
+            ON CONFLICT (key, window_start)
+            DO UPDATE SET count = c.count + 1 WHERE c.count < ${max}
+            RETURNING c.count`.execute(db);
+          if (rows.length === 0) return { limitReached: key };
+        }
+        return "reserved";
+      },
+      async insertCode(code) {
+        await db
+          .insertInto("identkit_oauth_codes")
+          .values({
+            digest: code.digest,
+            client_id: code.clientId,
+            account_id: code.accountId,
+            redirect_uri: code.redirectUri,
+            redirect_uri_explicit: code.redirectUriExplicit,
+            code_challenge: code.codeChallenge,
+            resource: code.resource,
+            scopes: code.scopes,
+            created_at: code.createdAt,
+            expires_at: code.expiresAt,
+          })
+          .execute();
+      },
+      async consumeCode(digest) {
+        // Atomic: one DELETE ... RETURNING. Only the call that deletes the row gets it.
+        const r = await db
+          .deleteFrom("identkit_oauth_codes")
+          .where("digest", "=", digest)
+          .returningAll()
+          .executeTakeFirst();
+        return r ? toOAuthCode(r) : null;
+      },
+      async endGrantByCode(codeDigest, at) {
+        // Atomic: one DELETE ... RETURNING, and the tombstone in the same transaction.
+        return db
+          .transaction()
+          .setIsolationLevel("read committed")
+          .execute(async (trx) => {
+            const r = await trx
+              .deleteFrom("identkit_oauth_grants")
+              .where("code_digest", "=", codeDigest)
+              .returningAll()
+              .executeTakeFirst();
+            if (!r) return null;
+            await writeTombstones(trx, "grant", [r], at);
+            return toOAuthGrant(r);
+          });
+      },
+      async insertGrant(grant, firstAccessToken, limit) {
+        // READ COMMITTED whatever the database default, for the reason given at `oidcLinks`.
+        return db
+          .transaction()
+          .setIsolationLevel("read committed")
+          .execute(async (trx) => {
+            // The account row lock serializes grant inserts and imports for one account, so
+            // the count and the insert cannot interleave with another one's. FOR NO KEY UPDATE,
+            // as at `apiTokens.insert`, so foreign key checks of other rows do not wait. Then
+            // the client row, before any grant row (see `lockClientForGrant`).
+            const account = await trx
+              .selectFrom("identkit_accounts")
+              .select("status")
+              .where("id", "=", grant.accountId)
+              .forNoKeyUpdate()
+              .executeTakeFirst();
+            if (!account || account.status !== "active") {
+              return { status: "account_inactive" } as const;
+            }
+            await lockClientForGrant(trx, grant.clientId);
+            const { live } = await trx
+              .selectFrom("identkit_oauth_grants")
+              .select((eb) => eb.fn.countAll<string>().as("live"))
+              .where("account_id", "=", grant.accountId)
+              .where("client_id", "<>", grant.clientId)
+              .where("expires_at", ">", limit.at)
+              .executeTakeFirstOrThrow();
+            if (Number(live) >= limit.maxOtherGrants) return { status: "limit_reached" } as const;
+            const replaced = await trx
+              .deleteFrom("identkit_oauth_grants")
+              .where("account_id", "=", grant.accountId)
+              .where("client_id", "=", grant.clientId)
+              .returningAll()
+              .executeTakeFirst();
+            if (replaced) await writeTombstones(trx, "grant", [replaced], limit.at);
+            await trx.insertInto("identkit_oauth_grants").values(oauthGrantRow(grant)).execute();
+            await trx
+              .insertInto("identkit_oauth_access_tokens")
+              .values(oauthAccessTokenRow(firstAccessToken))
+              .execute();
+            return {
+              status: "inserted",
+              replaced: replaced ? toOAuthGrant(replaced) : null,
+            } as const;
+          });
+      },
+      async importGrant(grant, limit) {
+        try {
+          return await db
+            .transaction()
+            .setIsolationLevel("read committed")
+            .execute(async (trx) => {
+              // The same account and client row locks as `insertGrant`.
+              const account = await trx
+                .selectFrom("identkit_accounts")
+                .select("status")
+                .where("id", "=", grant.accountId)
+                .forNoKeyUpdate()
+                .executeTakeFirst();
+              if (account) await lockClientForGrant(trx, grant.clientId);
+              const sameId = await trx
+                .selectFrom("identkit_oauth_grants")
+                .select("id")
+                .where("id", "=", grant.id)
+                .executeTakeFirst();
+              if (sameId) return "id_taken";
+              if (!account || account.status !== "active") return "account_inactive";
+              const taken = await trx
+                .selectFrom("identkit_oauth_grants")
+                .select("id")
+                .where("account_id", "=", grant.accountId)
+                .where("client_id", "=", grant.clientId)
+                .executeTakeFirst();
+              if (taken) return "account_client_taken";
+              const { live } = await trx
+                .selectFrom("identkit_oauth_grants")
+                .select((eb) => eb.fn.countAll<string>().as("live"))
+                .where("account_id", "=", grant.accountId)
+                .where("client_id", "<>", grant.clientId)
+                .where("expires_at", ">", limit.at)
+                .executeTakeFirstOrThrow();
+              if (Number(live) >= limit.maxOtherGrants) return "limit_reached";
+              const row = await trx
+                .insertInto("identkit_oauth_grants")
+                .values(oauthGrantRow(grant))
+                .onConflict((oc) => oc.column("id").doNothing())
+                .returning("id")
+                .executeTakeFirst();
+              if (!row) return "id_taken";
+              // After the insert, in the same transaction (see `hasTombstone`).
+              if (await hasTombstone(trx, "grant", grant.id)) throw new RefusedByTombstone();
+              return "inserted";
+            });
+        } catch (error) {
+          if (error instanceof RefusedByTombstone) return "revoked";
+          throw error;
+        }
+      },
+      async findGrantByRefreshRef(refDigest) {
+        // One query: the grant and the status of its account.
+        const r = await db
+          .selectFrom("identkit_oauth_grants as g")
+          .innerJoin("identkit_accounts as a", "a.id", "g.account_id")
+          .selectAll("g")
+          .select("a.status as account_status")
+          .where("g.refresh_ref_digest", "=", refDigest)
+          .executeTakeFirst();
+        return r
+          ? { grant: toOAuthGrant(r), accountStatus: oneOf(r.account_status, ACCOUNT_STATUSES) }
+          : null;
+      },
+      async findGrant(id) {
+        const r = await db
+          .selectFrom("identkit_oauth_grants as g")
+          .innerJoin("identkit_accounts as a", "a.id", "g.account_id")
+          .selectAll("g")
+          .select("a.status as account_status")
+          .where("g.id", "=", id)
+          .executeTakeFirst();
+        return r
+          ? { grant: toOAuthGrant(r), accountStatus: oneOf(r.account_status, ACCOUNT_STATUSES) }
+          : null;
+      },
+      async rotateGrant(id, expectedGeneration, u, accessToken, pruneBefore) {
+        try {
+          return await db
+            .transaction()
+            .setIsolationLevel("read committed")
+            .execute(async (trx) => {
+              // Compare-and-set on the generation. Under READ COMMITTED a concurrent rotation
+              // that committed first makes this UPDATE match no row after its wait.
+              const row = await trx
+                .updateTable("identkit_oauth_grants")
+                .set({
+                  generation: u.generation,
+                  refresh_ref_digest: u.refreshRefDigest,
+                  refresh_digest: u.refreshDigest,
+                  refresh_digest_algorithm: u.refreshDigestAlgorithm,
+                  previous_refresh_digest: u.previousRefreshDigest,
+                  refreshed_at: u.refreshedAt,
+                  refresh_expires_at: u.refreshExpiresAt,
+                })
+                .where("id", "=", id)
+                .where("generation", "=", expectedGeneration)
+                .returning("id")
+                .executeTakeFirst();
+              if (!row) return false;
+              await trx
+                .insertInto("identkit_oauth_access_tokens")
+                .values(oauthAccessTokenRow(accessToken))
+                .execute();
+              await trx
+                .deleteFrom("identkit_oauth_access_tokens")
+                .where("grant_id", "=", id)
+                .where("expires_at", "<=", pruneBefore)
+                .execute();
+              return true;
+            });
+        } catch (error) {
+          // A serialization failure means a concurrent rotation won.
+          if (isLostRace(error)) return false;
+          throw error;
+        }
+      },
+      async findAccessToken(digest) {
+        // One query: the token, its grant and the status of the grant's account.
+        const r = await db
+          .selectFrom("identkit_oauth_access_tokens as t")
+          .innerJoin("identkit_oauth_grants as g", "g.id", "t.grant_id")
+          .innerJoin("identkit_accounts as a", "a.id", "g.account_id")
+          .selectAll("g")
+          .select([
+            "t.digest as token_digest",
+            "t.generation as token_generation",
+            "t.scopes as token_scopes",
+            "t.created_at as token_created_at",
+            "t.expires_at as token_expires_at",
+            "a.status as account_status",
+          ])
+          .where("t.digest", "=", digest)
+          .executeTakeFirst();
+        if (!r) return null;
+        return {
+          token: {
+            digest: r.token_digest,
+            grantId: r.id,
+            generation: r.token_generation,
+            scopes: [...r.token_scopes],
+            createdAt: r.token_created_at,
+            expiresAt: r.token_expires_at,
+          },
+          grant: toOAuthGrant(r),
+          accountStatus: oneOf(r.account_status, ACCOUNT_STATUSES),
+        };
+      },
+      async deleteGrant(id, match, at) {
+        // Atomic: one DELETE ... RETURNING, scoped to the client or the account, and the
+        // tombstone in the same transaction.
+        return db
+          .transaction()
+          .setIsolationLevel("read committed")
+          .execute(async (trx) => {
+            let query = trx.deleteFrom("identkit_oauth_grants").where("id", "=", id);
+            query =
+              "clientId" in match
+                ? query.where("client_id", "=", match.clientId)
+                : query.where("account_id", "=", match.accountId);
+            const r = await query.returningAll().executeTakeFirst();
+            if (!r) return null;
+            await writeTombstones(trx, "grant", [r], at);
+            return toOAuthGrant(r);
+          });
+      },
+      async deleteGrantsForAccount(accountId, at) {
+        // One transaction: if the code delete failed after a committed grant delete, the ended
+        // grants would never be returned, and a retry would find none to record.
+        return db
+          .transaction()
+          .setIsolationLevel("read committed")
+          .execute(async (trx) => {
+            const rows = await trx
+              .deleteFrom("identkit_oauth_grants")
+              .where("account_id", "=", accountId)
+              .returningAll()
+              .execute();
+            await trx
+              .deleteFrom("identkit_oauth_codes")
+              .where("account_id", "=", accountId)
+              .execute();
+            await writeTombstones(trx, "grant", rows, at);
+            return rows.map(toOAuthGrant);
+          });
+      },
+      async listGrants(accountId, at) {
+        const rows = await db
+          .selectFrom("identkit_oauth_grants")
+          .selectAll()
+          .where("account_id", "=", accountId)
+          .where("expires_at", ">", at)
+          .orderBy("created_at")
+          .orderBy("id")
+          .execute();
+        return rows.map(toOAuthGrant);
+      },
+      async purge({ at, unusedBefore, idleBefore, windowBefore }) {
+        // The expired grants with their tombstones in one transaction. The other expired rows
+        // each on their own: they need no shared invariant, and each statement is idempotent.
+        const grants = await db
+          .transaction()
+          .setIsolationLevel("read committed")
+          .execute(async (trx) => {
+            const rows = await trx
+              .deleteFrom("identkit_oauth_grants")
+              .where("expires_at", "<=", at)
+              .returningAll()
+              .execute();
+            await writeTombstones(trx, "grant", rows, at);
+            return rows;
+          });
+        const codes = await db
+          .deleteFrom("identkit_oauth_codes")
+          .where("expires_at", "<=", at)
+          .executeTakeFirst();
+        const tokens = await db
+          .deleteFrom("identkit_oauth_access_tokens")
+          .where("expires_at", "<=", at)
+          .executeTakeFirst();
+        // The clients in one READ COMMITTED transaction. First the candidates FOR UPDATE: only
+        // clients past their date rule (never used and old, or used long ago) that hold no live
+        // grant and no live code, in id order. So a busy client is never locked, and two
+        // overlapping purges lock in the same order and never wait on each other in a cycle.
+        // A grant insert or import holds a key share lock on its client until it commits, so
+        // this waits for it, and one that starts later waits here and then fails on the deleted
+        // client. The delete is a second statement, so its snapshot sees every grant committed
+        // during the wait, and its NOT EXISTS keeps that client. A single DELETE would not: after
+        // its wait it re-checks only the client row, which the grant insert did not change. A
+        // grant that the client delete cascades is past its expiry (no live grant is left), so
+        // it gets no tombstone; its import answers `expired` anyway.
+        const deleted = await db
+          .transaction()
+          .setIsolationLevel("read committed")
+          .execute(async (trx) => {
+            const candidates = await trx
+              .selectFrom("identkit_oauth_clients as c")
+              .select("c.id")
+              .where((eb) => purgeable(eb, { at, unusedBefore, idleBefore }))
+              .orderBy("c.id")
+              .forUpdate()
+              .execute();
+            const removed: { id: string; reason: "unused" | "idle" }[] = [];
+            // In chunks, to stay far below the parameter limit of one statement.
+            for (let i = 0; i < candidates.length; i += PURGE_CHUNK) {
+              const rows = await trx
+                .deleteFrom("identkit_oauth_clients as c")
+                .where(
+                  "c.id",
+                  "in",
+                  candidates.slice(i, i + PURGE_CHUNK).map((r) => r.id),
+                )
+                .where((eb) => purgeable(eb, { at, unusedBefore, idleBefore }))
+                .returning(["c.id", "c.source", "c.last_used_at"])
+                .execute();
+              await writeTombstones(trx, "client", rows, at);
+              for (const row of rows) {
+                removed.push({ id: row.id, reason: row.last_used_at === null ? "unused" : "idle" });
+              }
+            }
+            return removed;
+          });
+        const windows = await db
+          .deleteFrom("identkit_oauth_registration_counts")
+          .where("window_start", "<", windowBefore)
+          .executeTakeFirst();
+        return {
+          clients: deleted,
+          grants: grants.map(toOAuthGrant),
+          codes: Number(codes.numDeletedRows),
+          accessTokens: Number(tokens.numDeletedRows),
+          registrationWindows: Number(windows.numDeletedRows),
+        };
+      },
+      async findImportTombstone(kind, id) {
+        const row = await db
+          .selectFrom("identkit_oauth_import_tombstones")
+          .select("ended_at")
+          .where("kind", "=", kind)
+          .where("id", "=", id)
+          .executeTakeFirst();
+        return row ? row.ended_at : null;
+      },
+      async rollBackImport(kind, id, at) {
+        // A client goes as in `deleteClient`, with the same lock order, and only its grants
+        // get tombstones. A grant goes in one DELETE, without a tombstone.
+        if (kind === "client") return endClient(db, id, at, true);
+        const row = await db
+          .deleteFrom("identkit_oauth_grants")
+          .where("id", "=", id)
+          .where("source", "=", "import")
+          .returning("id")
+          .executeTakeFirst();
+        return row === undefined ? null : [];
       },
     },
   };

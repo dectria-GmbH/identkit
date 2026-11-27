@@ -63,3 +63,10 @@ export const basePolicy = {
 
 /** API token options of the smoke test and its timing runs. */
 export const API_TOKENS = { prefix: "pat_", allowedScopes: ["read", "write"] };
+
+export const OAUTH = {
+  issuer: ORIGIN,
+  resources: [`${ORIGIN}/mcp`],
+  defaultScopes: ["mcp:read"],
+  optInScopes: ["mcp:events"],
+};

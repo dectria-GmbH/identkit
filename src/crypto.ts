@@ -23,7 +23,13 @@ export type HashPurpose =
   | "person-key"
   | "approval-id"
   | "approval-evidence"
-  | "api-token";
+  | "api-token"
+  | "oauth-client-secret"
+  | "oauth-code"
+  | "oauth-access-token"
+  | "oauth-refresh-ref"
+  | "oauth-refresh-token"
+  | "oauth-registration-address";
 
 /**
  * Computes keyed one-way hashes of secrets and identifiers. identkit stores only these

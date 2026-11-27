@@ -6,8 +6,9 @@ import { normalizeEmail } from "./email.js";
 import { AllSessionsRevokedHookError } from "./errors.js";
 import { throttleKey as otpThrottleKey } from "./email-otp.js";
 import { totpEnrolmentThrottleKey, totpThrottleKey } from "./throttle-keys.js";
+import { emitOAuthGrantsEnded, endAllOAuthGrants } from "./oauth/grant-end.js";
 import { finishThenRunHook, type Revocation } from "./sessions.js";
-import type { AccountRecord } from "./storage/types.js";
+import type { AccountRecord, OAuthGrantRecord } from "./storage/types.js";
 
 export interface AccountView {
   id: string;
@@ -35,9 +36,9 @@ export interface Accounts {
   get(accountId: string): Promise<AccountView | null>;
   findByEmail(email: string): Promise<AccountView | null>;
   /**
-   * Disables the account and revokes all its sessions and personal API tokens. Records
-   * `account.disabled` only if the account was not disabled yet, so a retry after an error does
-   * not record it twice.
+   * Disables the account, revokes all its sessions and personal API tokens, and ends all its
+   * OAuth grants and codes. Records `account.disabled` only if the account was not disabled
+   * yet, so a retry after an error does not record it twice.
    */
   disable(accountId: string): Promise<void>;
   /**
@@ -157,27 +158,40 @@ export function createAccounts(
       } catch (error) {
         tokenFailure = { error };
       }
+      // OAuth grants next, with the same rule: a store error goes up at the end, and
+      // `validateAccessToken` and a refresh refuse a disabled account anyway.
+      let grants: OAuthGrantRecord[] = [];
+      let grantFailure: { error: unknown } | null = null;
+      try {
+        grants = await endAllOAuthGrants(ctx, accountId);
+      } catch (error) {
+        grantFailure = { error };
+      }
       let revoked: Revocation;
       try {
         revoked = await revokeAll(accountId);
       } catch (error) {
-        // A retry finds the account disabled and these tokens revoked, and records neither:
-        // record them now.
+        // A retry finds the account disabled and these tokens and grants gone, and records
+        // none of them: record them now.
         if (changed) await ctx.emit(event).catch(() => undefined);
         await emitApiTokensRevoked(ctx, accountId, tokenIds, "account_disabled").catch(
+          () => undefined,
+        );
+        await emitOAuthGrantsEnded(ctx, accountId, grants, "account_disabled").catch(
           () => undefined,
         );
         throw error;
       }
       // Hook last: a throwing hook must not skip the audit events, nor a throwing sink the hook.
-      // Which error goes up: the hook's, then the sink's, then the token store's. Only a failed
-      // hook leaves something live, and a refused event is lost for good: a retry of `disable`
-      // repeats the token revocation, its `api_token.revoked` events and the hook, but records
-      // neither `account.disabled` (the account is disabled already) nor `session.revoked` (the
-      // sessions are revoked already). The tokens stay unusable while the account is disabled,
-      // but a retry is the only call that revokes them. The hook's error carries the token
-      // store's error as `tokenRevocationError`; the sink's error is not changed, so after it
-      // the token store's error shows only on the retry.
+      // Which error goes up: the hook's, then the sink's, then the token store's, then the grant
+      // store's. Only a failed hook leaves something live, and a refused event is lost for good:
+      // a retry of `disable` repeats the token revocation and the end of the grants, their
+      // events and the hook, but records neither `account.disabled` (the account is disabled
+      // already) nor `session.revoked` (the sessions are revoked already). The tokens and grants
+      // stay unusable while the account is disabled, but a retry is the only call that removes
+      // them. The hook's error carries the store errors as `tokenRevocationError` and
+      // `grantRevocationError`; the sink's error is not changed, so after it the store errors
+      // show only on the retry. With both store errors and no other, the token store's goes up.
       const finished = finishThenRunHook(revoked, async () => {
         let failure: { error: unknown } | null = null;
         try {
@@ -190,9 +204,15 @@ export function createAccounts(
         } catch (error) {
           failure ??= { error };
         }
+        try {
+          await emitOAuthGrantsEnded(ctx, accountId, grants, "account_disabled");
+        } catch (error) {
+          failure ??= { error };
+        }
         if (failure) throw failure.error;
       });
-      if (!tokenFailure) return finished;
+      const storeFailure = tokenFailure ?? grantFailure;
+      if (!storeFailure) return finished;
       try {
         await finished;
       } catch (error) {
@@ -200,10 +220,11 @@ export function createAccounts(
         throw new AllSessionsRevokedHookError(error.accountId, error.exceptSessionId, {
           cause: error.cause,
           auditError: error.auditError,
-          tokenRevocationError: tokenFailure.error,
+          ...(tokenFailure ? { tokenRevocationError: tokenFailure.error } : {}),
+          ...(grantFailure ? { grantRevocationError: grantFailure.error } : {}),
         });
       }
-      throw tokenFailure.error;
+      throw storeFailure.error;
     },
   };
 }

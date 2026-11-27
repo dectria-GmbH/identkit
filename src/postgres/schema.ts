@@ -133,6 +133,66 @@ export interface IdentkitDatabase {
     revoked_at: Date | null;
     revoke_reason: string | null;
   };
+  identkit_oauth_clients: {
+    id: string;
+    secret_digest: string | null;
+    secret_digest_algorithm: string | null;
+    auth_method: string;
+    grant_types: string[];
+    redirect_uris: string[];
+    name: string | null;
+    source: string;
+    created_at: Date;
+    last_used_at: Date | null;
+  };
+  identkit_oauth_grants: {
+    id: string;
+    account_id: string;
+    client_id: string;
+    scopes: string[];
+    resource: string;
+    created_at: Date;
+    expires_at: Date;
+    generation: number;
+    refresh_ref_digest: string | null;
+    refresh_digest: string | null;
+    refresh_digest_algorithm: string | null;
+    previous_refresh_digest: string | null;
+    refreshed_at: Date | null;
+    refresh_expires_at: Date | null;
+    code_digest: string | null;
+    source: string;
+  };
+  identkit_oauth_access_tokens: {
+    digest: string;
+    grant_id: string;
+    generation: number;
+    scopes: string[];
+    created_at: Date;
+    expires_at: Date;
+  };
+  identkit_oauth_codes: {
+    digest: string;
+    client_id: string;
+    account_id: string;
+    redirect_uri: string;
+    redirect_uri_explicit: boolean;
+    code_challenge: string;
+    resource: string;
+    scopes: string[];
+    created_at: Date;
+    expires_at: Date;
+  };
+  identkit_oauth_registration_counts: {
+    key: string;
+    window_start: Date;
+    count: number;
+  };
+  identkit_oauth_import_tombstones: {
+    kind: string;
+    id: string;
+    ended_at: Date;
+  };
   identkit_migrations: {
     name: string;
     applied_at: Date;
