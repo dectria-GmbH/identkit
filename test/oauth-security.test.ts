@@ -2,8 +2,8 @@
  * The security review list of the OAuth server: one `it` per row, named by its number. Each test
  * fails when the defence of its row is turned off at its call site.
  */
-import { randomBytes } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { createHash, randomBytes } from "node:crypto";
+import { describe, expect, it, vi } from "vitest";
 import {
   createHmacHasher,
   createMemoryStore,
@@ -12,6 +12,7 @@ import {
   type IdentkitStore,
 } from "../src/index.js";
 import {
+  createFakeClock,
   createOAuthTestClient,
   createPkcePair,
   type OAuthTestClient,
@@ -690,6 +691,93 @@ describe("oauth security review list", () => {
     expect(errorOf(await ik.oauth.token({ form, authorization: null }))).toBe("invalid_request");
     // The code was not touched: the request failed before.
     expect((await client.exchange(code, verifier)).httpStatus).toBe(200);
+  });
+
+  it("row 24: legacy verifiers see only foreign tokens before until, and a legacy grant only for its client", async () => {
+    const verifyAccessToken = vi.fn(async (token: string) =>
+      token === "legacy-access"
+        ? { grantId: "g-legacy", audience: RESOURCE, expiresAt: new Date(Date.UTC(2100, 0)) }
+        : null,
+    );
+    const verifyRefreshToken = vi.fn(async (token: string) =>
+      token === "legacy-refresh"
+        ? { grantId: "g-legacy", generation: 1, expiresAt: new Date(Date.UTC(2100, 0)) }
+        : null,
+    );
+    // The fake clock's start plus one hour; options are read once, at createIdentkit.
+    const until = new Date(createFakeClock().now().getTime() + 3_600_000);
+    const legacy = { verifyAccessToken, verifyRefreshToken, until };
+    const { ik, client, accountId, clock, store } = await connected({ oauth: { legacy } });
+    const owner = await ik.oauth.importClient({
+      id: "legacy-owner",
+      redirectUris: ["http://127.0.0.1/callback"],
+      grantTypes: ["authorization_code", "refresh_token"],
+      authMethod: "none",
+    });
+    if (owner.status !== "imported") throw new Error(owner.status);
+    const now = clock.now().getTime();
+    const imported = await ik.oauth.importGrant({
+      id: "g-legacy",
+      accountId,
+      clientId: "legacy-owner",
+      scopes: ["mcp:read"],
+      resource: RESOURCE,
+      createdAt: new Date(now - 1000),
+      expiresAt: new Date(now + 86_400_000),
+      generation: 1,
+      refreshExpiresAt: new Date(now + 86_400_000),
+      refreshSha256: createHash("sha256").update("legacy-refresh").digest("hex"),
+    });
+    expect(imported.status).toBe("imported");
+
+    // Another client presents the legacy refresh token: refused, and the grant lives.
+    const stolen = await client.refresh("legacy-refresh");
+    expect(errorOf(stolen)).toBe("invalid_grant");
+    expect((await store.oauth?.findGrant("g-legacy"))?.grant.generation).toBe(1);
+    expect((await ik.oauth.validateAccessToken("legacy-access")).status).toBe("valid");
+
+    // identkit's own prefixes never reach a verifier, also malformed ones.
+    verifyAccessToken.mockClear();
+    verifyRefreshToken.mockClear();
+    for (const token of ["ikat_short", `ikrt_${"a".repeat(10)}`, "ikac_x", "ikc_x", "ikcs_x"]) {
+      expect(await ik.oauth.validateAccessToken(token)).toMatchObject({ reason: "malformed" });
+      await client.refresh(token);
+    }
+    expect(verifyAccessToken).not.toHaveBeenCalled();
+    expect(verifyRefreshToken).not.toHaveBeenCalled();
+
+    // A verifier error fails the call; it never counts as a refusal or a pass.
+    verifyAccessToken.mockRejectedValueOnce(new Error("verifier down"));
+    await expect(ik.oauth.validateAccessToken("legacy-access")).rejects.toThrow("verifier down");
+    verifyAccessToken.mockResolvedValueOnce({ grantId: "g-legacy" } as never);
+    await expect(ik.oauth.validateAccessToken("legacy-access")).rejects.toThrow(
+      new TypeError(
+        "oauth.legacy.verifyAccessToken must return { grantId, audience, expiresAt } or null",
+      ),
+    );
+
+    // From until on, no verifier is called.
+    clock.advanceSeconds(3600);
+    verifyAccessToken.mockClear();
+    verifyRefreshToken.mockClear();
+    expect(await ik.oauth.validateAccessToken("legacy-access")).toEqual({
+      status: "refused",
+      reason: "malformed",
+    });
+    expect(
+      errorOf(
+        await ik.oauth.token({
+          form: new URLSearchParams({
+            grant_type: "refresh_token",
+            refresh_token: "legacy-refresh",
+            client_id: "legacy-owner",
+          }),
+          authorization: null,
+        }),
+      ),
+    ).toBe("invalid_grant");
+    expect(verifyAccessToken).not.toHaveBeenCalled();
+    expect(verifyRefreshToken).not.toHaveBeenCalled();
   });
 
   it("row 25: scopes grow only through approve, never at refresh", async () => {

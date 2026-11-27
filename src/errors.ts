@@ -157,7 +157,8 @@ export class AllSessionsRevokedHookError extends IdentkitError {
  *
  * `apiTokens.create` and `apiTokens.import` throw it when the audit sink refused the event of the
  * new token: identkit deleted the token again, and `cause` holds the sink's error. They revoke
- * no session, so `hookFailed` is false. If the delete fails, the store's error goes up instead
+ * no session, so `hookFailed` is false. `oauth.importGrant` does the same for
+ * `oauth.grant_imported` and the imported grant. If the delete fails, the store's error goes up instead
  * and the token stands (a created token is unusable then: its plaintext was never returned).
  *
  * `oauth.token` throws it for a code exchange when the audit sink refused `oauth.grant_created`,
@@ -198,7 +199,8 @@ export class OperationRolledBackError extends IdentkitError {
 
 /**
  * identkit rolled a client operation back: it did not take effect. `oauth.register` throws it
- * when the audit sink refused `oauth.client_registered`: identkit deleted the new client again,
+ * when the audit sink refused `oauth.client_registered`, and `oauth.importClient` when it
+ * refused `oauth.client_imported`: identkit deleted the new client again,
  * and `cause` holds the sink's error. `clientId` names the deleted client; it was never
  * returned to the caller. A client belongs to no account, so this is not an
  * `OperationRolledBackError`, and no session was revoked. If the delete fails, the store's error

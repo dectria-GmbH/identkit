@@ -206,6 +206,46 @@ export const oauthOptionsSchema = z
       })
       .optional(),
     /**
+     * Checks tokens of an earlier system for grants imported with `oauth.importGrant`, so that
+     * connected clients keep working after a move to identkit. identkit calls a verifier only
+     * for a token that starts with none of its own prefixes, and only before `until`. The
+     * verifier checks its own signature and expiry and returns what the token names, or null
+     * to refuse; identkit then checks the grant, the account, the audience and the client as
+     * for its own tokens. A verifier that throws fails the call; a result of another shape
+     * throws `TypeError`.
+     */
+    legacy: z
+      .object({
+        verifyAccessToken: z
+          .custom<OAuthLegacyAccessTokenVerifier>((value) => typeof value === "function", {
+            message: "legacy.verifyAccessToken must be a function",
+          })
+          .optional(),
+        verifyRefreshToken: z
+          .custom<OAuthLegacyRefreshTokenVerifier>((value) => typeof value === "function", {
+            message: "legacy.verifyRefreshToken must be a function",
+          })
+          .optional(),
+        /**
+         * From this time on, identkit calls no verifier. Set it to the latest expiry of a legacy
+         * refresh token: after it, no legacy token can be valid.
+         */
+        until: z
+          .date()
+          .refine((d) => !Number.isNaN(d.getTime()), {
+            message: "legacy.until must be a valid date",
+          })
+          .optional(),
+      })
+      .strict()
+      .optional(),
+    /**
+     * Accept imported client secrets stored as unkeyed SHA-256 (`importClient` with
+     * `secretSha256`). On the first successful use identkit replaces such a digest with the
+     * keyed one. Default false: a client with such a digest cannot authenticate.
+     */
+    acceptLegacyClientSecrets: z.boolean().default(false),
+    /**
      * Receives the error when the audit sink refuses `oauth.token_refreshed`, with the event.
      * The refresh still succeeds: that event is best effort. Without this option the error is
      * dropped. identkit awaits the call and drops what it throws; keep it quick.
@@ -216,12 +256,13 @@ export const oauthOptionsSchema = z
       })
       .optional(),
     /**
-     * Receives the error when a best-effort store write fails, with the write. Today the only
-     * one is the client's last-used time, which identkit writes at most once a day after a code
-     * exchange or a refresh took effect. The call still returns its tokens: they are issued
-     * already, and an error would make the client retry with a code or a refresh token that is
-     * used up. Without this option the error is dropped. identkit awaits the call and drops what
-     * it throws; keep it quick.
+     * Receives the error when a best-effort store write fails, with the write: the client's
+     * last-used time, which identkit writes at most once a day after a code exchange or a
+     * refresh took effect, and the upgrade of an imported SHA-256 client secret after it
+     * matched. The call still returns its tokens: they are issued already, and an error would
+     * make the client retry with a code or a refresh token that is used up. A failed upgrade is
+     * tried again at the next use. Without this option the error is dropped. identkit awaits
+     * the call and drops what it throws; keep it quick.
      */
     onStoreError: z
       .custom<OAuthStoreErrorHandler>((value) => typeof value === "function", {
@@ -276,13 +317,32 @@ export interface OAuthAdmitRequest {
 
 export type OAuthAdmitHook = (request: OAuthAdmitRequest) => boolean | Promise<boolean>;
 
+/**
+ * See the option `legacy`. `audience` is the resource the token is for; it must be one of the
+ * option `resources`.
+ */
+export type OAuthLegacyAccessTokenVerifier = (
+  token: string,
+) => Promise<{ grantId: string; audience: string; expiresAt: Date } | null>;
+
+/**
+ * See the option `legacy`. `generation` is the grant generation that issued the token: equal to
+ * the imported grant's generation for its current token.
+ */
+export type OAuthLegacyRefreshTokenVerifier = (
+  token: string,
+) => Promise<{ grantId: string; generation: number; expiresAt: Date } | null>;
+
 /** See the option `onAuditError`. */
 export type OAuthAuditErrorHandler = (error: unknown, event: AuditEvent) => void | Promise<void>;
 
-/** See the option `onStoreError`. `client_last_used`: the client's `lastUsedAt`. */
+/**
+ * See the option `onStoreError`. `client_last_used`: the client's `lastUsedAt`.
+ * `client_secret_upgrade`: the keyed digest that replaces an imported SHA-256 client secret.
+ */
 export type OAuthStoreErrorHandler = (
   error: unknown,
-  write: { kind: "client_last_used"; clientId: string },
+  write: { kind: "client_last_used" | "client_secret_upgrade"; clientId: string },
 ) => void | Promise<void>;
 
 export type OAuthOptions = z.input<typeof oauthOptionsSchema>;

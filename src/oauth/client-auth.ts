@@ -1,10 +1,11 @@
+import { sha256, toHex, utf8 } from "../bytes.js";
 import { digestsEqual } from "../crypto.js";
 import { InvalidArgumentError } from "../errors.js";
 import type { OAuthClientRecord } from "../storage/types.js";
 import { CLIENT_ID, errorResult, type OAuthEndpointResult, type OAuthInternals } from "./common.js";
 
 /** A secret longer than this is no secret identkit issued or imported; it gets no digest. */
-const MAX_SECRET_LENGTH = 512;
+export const MAX_SECRET_LENGTH = 512;
 const BASIC = /^Basic +([A-Za-z0-9+/]+={0,2})$/i;
 
 /** `application/x-www-form-urlencoded` decoding of one value (RFC 6749 section 2.3.1). */
@@ -91,7 +92,15 @@ export async function authenticateClient(
   if (clientId === undefined) return unauthorized();
   if (secret !== null && secret.length > MAX_SECRET_LENGTH) return unauthorized();
 
-  const presented = secret === null ? null : await ctx.hasher.digest("oauth-client-secret", secret);
+  // Both digests for every presented secret, before the lookup: the work does not depend on
+  // whether the client exists or how its secret is stored.
+  const presented =
+    secret === null
+      ? null
+      : {
+          keyed: await ctx.hasher.digest("oauth-client-secret", secret),
+          legacy: toHex(await sha256(utf8(secret))),
+        };
   const client = CLIENT_ID.test(clientId) ? await store.findClient(clientId) : null;
   if (!client) return unauthorized();
   if (client.authMethod === "none") {
@@ -99,18 +108,52 @@ export async function authenticateClient(
     return secret === null ? { client } : unauthorized();
   }
   // A confidential client may use either secret method, never none.
-  if (presented === null || !secretMatches(client, presented)) return unauthorized();
+  if (presented === null) return unauthorized();
+  const matched = secretMatches(client, presented, settings.acceptLegacyClientSecrets);
+  if (matched === null) return unauthorized();
+  if (matched === "legacy" && client.secretDigest !== null) {
+    await upgradeSecret(internals, client.id, client.secretDigest, presented.keyed);
+  }
   return { client };
 }
 
 /**
- * True if the keyed digest of the presented secret equals the client's. A client whose stored
- * digest is not keyed (`sha256`, imported) does not match here.
+ * How the presented secret matched the client's stored digest, or null. A digest stored as
+ * unkeyed SHA-256 (an import) counts only with `acceptLegacyClientSecrets`.
  */
-function secretMatches(client: OAuthClientRecord, presentedDigest: string): boolean {
-  return (
-    client.secretDigest !== null &&
-    client.secretDigestAlgorithm === "hmac-sha256" &&
-    digestsEqual(client.secretDigest, presentedDigest)
-  );
+function secretMatches(
+  client: OAuthClientRecord,
+  presented: { keyed: string; legacy: string },
+  acceptLegacy: boolean,
+): "keyed" | "legacy" | null {
+  if (client.secretDigest === null) return null;
+  if (client.secretDigestAlgorithm === "hmac-sha256") {
+    return digestsEqual(client.secretDigest, presented.keyed) ? "keyed" : null;
+  }
+  if (client.secretDigestAlgorithm === "sha256" && acceptLegacy) {
+    return digestsEqual(client.secretDigest, presented.legacy) ? "legacy" : null;
+  }
+  return null;
+}
+
+/**
+ * Replaces an imported SHA-256 digest with the keyed one, compare-and-set, best effort: the
+ * client is authenticated already. A lost race means another call upgraded it. A store error
+ * goes to `onStoreError`, and the next use tries again.
+ */
+async function upgradeSecret(
+  internals: OAuthInternals,
+  clientId: string,
+  oldDigest: string,
+  keyed: string,
+): Promise<void> {
+  try {
+    await internals.store.upgradeClientSecret(clientId, oldDigest, keyed);
+  } catch (error) {
+    try {
+      await internals.settings.onStoreError?.(error, { kind: "client_secret_upgrade", clientId });
+    } catch {
+      // Dropped: the handler is a report channel, not a gate.
+    }
+  }
 }

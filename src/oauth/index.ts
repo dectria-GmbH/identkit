@@ -19,6 +19,13 @@ import {
   type OAuthClientView,
   type OAuthOptions,
 } from "./options.js";
+import {
+  createImport,
+  type ImportOAuthClientInput,
+  type ImportOAuthClientResult,
+  type ImportOAuthGrantInput,
+  type ImportOAuthGrantResult,
+} from "./import.js";
 import { createRegister } from "./register.js";
 import { createAuthorize, type OAuthAuthorize } from "./authorize.js";
 import {
@@ -37,6 +44,12 @@ export type {
   OAuthAuthorize,
 } from "./authorize.js";
 export type { OAuthEndpointResult, OAuthParams } from "./common.js";
+export type {
+  ImportOAuthClientInput,
+  ImportOAuthClientResult,
+  ImportOAuthGrantInput,
+  ImportOAuthGrantResult,
+} from "./import.js";
 export {
   emitOAuthGrantsEnded,
   endAllOAuthGrants,
@@ -80,6 +93,8 @@ export {
   type OAuthAdmitRequest,
   type OAuthAuditErrorHandler,
   type OAuthClientView,
+  type OAuthLegacyAccessTokenVerifier,
+  type OAuthLegacyRefreshTokenVerifier,
   type OAuthOptions,
   type OAuthStoreErrorHandler,
 } from "./options.js";
@@ -136,6 +151,19 @@ export interface OAuth {
    * stands, every other event is still sent, and the first error goes up.
    */
   deleteClient(clientId: string): Promise<boolean>;
+  /**
+   * Administrative: records a client of an earlier system. Idempotent: the same input again
+   * answers `already_imported`. Records `oauth.client_imported`; if the sink refuses it, the
+   * client is deleted again and the call throws `OAuthClientRolledBackError`.
+   */
+  importClient(input: ImportOAuthClientInput): Promise<ImportOAuthClientResult>;
+  /**
+   * Administrative: records a grant of an earlier system, so that its legacy tokens keep
+   * working through the option `legacy`. Never replaces a grant. Idempotent. Records
+   * `oauth.grant_imported`; if the sink refuses it, the grant is deleted again and the call
+   * throws `OperationRolledBackError`.
+   */
+  importGrant(input: ImportOAuthGrantInput): Promise<ImportOAuthGrantResult>;
 }
 
 const fail = (): never => {
@@ -163,6 +191,8 @@ export function unconfiguredOAuth(): OAuth {
     revokeAll: reject,
     getClient: reject,
     deleteClient: reject,
+    importClient: reject,
+    importGrant: reject,
   };
 }
 
@@ -193,6 +223,7 @@ export function createOAuth(
     register: createRegister(internals),
     authorize: createAuthorize(internals),
     ...createTokenEndpoint(internals),
+    ...createImport(internals),
 
     async listGrants(accountId) {
       requireId(accountId, "accountId");

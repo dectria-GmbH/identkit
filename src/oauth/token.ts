@@ -1,6 +1,6 @@
 import { toAccountView } from "../accounts.js";
 import type { AuditEvent } from "../audit.js";
-import { bytesEqual, sha256, toBase64Url, utf8 } from "../bytes.js";
+import { bytesEqual, sha256, toBase64Url, toHex, utf8 } from "../bytes.js";
 import { addSeconds } from "../clock.js";
 import { digestsEqual, randomId, randomToken } from "../crypto.js";
 import { InvalidArgumentError, OperationRolledBackError } from "../errors.js";
@@ -34,6 +34,8 @@ const TOKEN_BODY = /^[A-Za-z0-9_-]{43}$/;
 const REFRESH_BODY = /^([A-Za-z0-9_-]{22})\.([A-Za-z0-9_-]{43})$/;
 /** RFC 7636 section 4.1: 43 to 128 unreserved characters. */
 const CODE_VERIFIER = /^[A-Za-z0-9._~-]{43,128}$/;
+/** A legacy token longer than this goes to no verifier. */
+const MAX_LEGACY_TOKEN_LENGTH = 4096;
 
 /** Why `oauth.token_failed` was recorded. */
 export type OAuthTokenFailure =
@@ -100,6 +102,60 @@ export function refreshRef(value: unknown, prefix: string): string | null {
 
 const earlier = (a: Date, b: Date) => (a.getTime() <= b.getTime() ? a : b);
 
+const validDate = (value: unknown): value is Date =>
+  value instanceof Date && !Number.isNaN(value.getTime());
+
+/** The result of `legacy.verifyAccessToken`, checked. Another shape throws `TypeError`. */
+function legacyAccessResult(
+  value: unknown,
+): { grantId: string; audience: string; expiresAt: Date } | null {
+  if (value === null) return null;
+  if (
+    !isRecord(value) ||
+    typeof value["grantId"] !== "string" ||
+    value["grantId"] === "" ||
+    typeof value["audience"] !== "string" ||
+    !validDate(value["expiresAt"])
+  ) {
+    throw new TypeError(
+      "oauth.legacy.verifyAccessToken must return { grantId, audience, expiresAt } or null",
+    );
+  }
+  return { grantId: value["grantId"], audience: value["audience"], expiresAt: value["expiresAt"] };
+}
+
+/** The result of `legacy.verifyRefreshToken`, checked. Another shape throws `TypeError`. */
+function legacyRefreshResult(
+  value: unknown,
+): { grantId: string; generation: number; expiresAt: Date } | null {
+  if (value === null) return null;
+  const grantId: unknown = isRecord(value) ? value["grantId"] : undefined;
+  const generation: unknown = isRecord(value) ? value["generation"] : undefined;
+  const expiresAt: unknown = isRecord(value) ? value["expiresAt"] : undefined;
+  if (
+    typeof grantId !== "string" ||
+    grantId === "" ||
+    typeof generation !== "number" ||
+    !Number.isSafeInteger(generation) ||
+    generation < 1 ||
+    !validDate(expiresAt)
+  ) {
+    throw new TypeError(
+      "oauth.legacy.verifyRefreshToken must return { grantId, generation, expiresAt } or null",
+    );
+  }
+  return { grantId, generation, expiresAt };
+}
+
+/**
+ * A presented refresh token. `identkit`: `ref` is its fixed part, which the new token keeps,
+ * and `digest` the keyed digest of the whole token. `legacy`: what `legacy.verifyRefreshToken`
+ * returned, and the unkeyed SHA-256 of the whole token, as `importGrant` stores it.
+ */
+type PresentedRefresh =
+  | { kind: "identkit"; ref: string; digest: string }
+  | { kind: "legacy"; generation: number; sha256: string; expiresAt: Date };
+
 function tokenResponse(
   accessToken: string,
   record: OAuthAccessTokenRecord,
@@ -124,6 +180,31 @@ export function createTokenEndpoint(internals: OAuthInternals) {
   const { ctx, settings, store } = internals;
   const { hasher, clock } = ctx;
   const knownScopes = new Set(settings.knownScopes);
+  const ownPrefixes = Object.values(settings.prefixes);
+
+  /**
+   * True if a verifier of the option `legacy` may see the token: a string of a sane length that
+   * starts with no identkit prefix, before `legacy.until`.
+   */
+  function legacyCandidate(token: unknown): token is string {
+    const until = settings.legacy?.until;
+    return (
+      typeof token === "string" &&
+      token.length > 0 &&
+      token.length <= MAX_LEGACY_TOKEN_LENGTH &&
+      !ownPrefixes.some((p) => token.startsWith(p)) &&
+      (until === undefined || clock.now().getTime() < until.getTime())
+    );
+  }
+
+  /**
+   * The grant that a legacy token names. Only an imported grant: a legacy token never reaches
+   * a grant that identkit created.
+   */
+  async function importedGrant(grantId: string): Promise<OAuthGrantLookup | null> {
+    const lookup = await store.findGrant(grantId);
+    return lookup && lookup.grant.source === "import" ? lookup : null;
+  }
 
   const failed = async (client: OAuthClientRecord, reason: OAuthTokenFailure) => {
     await ctx.emit({ type: "oauth.token_failed", clientId: client.id, reason });
@@ -338,18 +419,16 @@ export function createTokenEndpoint(internals: OAuthInternals) {
   }
 
   /**
-   * Rotates the grant for a presented refresh token: `presented.ref` is its fixed part, which
-   * the new token keeps, and `presented.digest` the digest of the whole token. `lookup` is the
-   * grant that the ref names. `requestedResource` is the request's `resource`, if sent.
+   * Rotates the grant for a presented refresh token. `lookup` is the grant that the token names.
+   * `requestedResource` is the request's `resource`, if sent.
    */
   async function refreshGrant(
     client: OAuthClientRecord,
     lookup: OAuthGrantLookup,
-    presented: { ref: string; digest: string },
+    presented: PresentedRefresh,
     requestedScopes: string[] | null,
     requestedResource?: string,
   ): Promise<OAuthEndpointResult> {
-    const presentedDigest = presented.digest;
     const { grant } = lookup;
     // A token of another client ends nothing: that client cannot prove it holds the grant.
     if (grant.clientId !== client.id) {
@@ -357,14 +436,33 @@ export function createTokenEndpoint(internals: OAuthInternals) {
       return invalidGrant("The refresh token is invalid.");
     }
     const now = clock.now();
-    const current =
-      grant.refreshDigest !== null &&
-      grant.refreshDigestAlgorithm === "hmac-sha256" &&
-      digestsEqual(grant.refreshDigest, presentedDigest);
-    if (!current) {
-      const previous =
+    let current: boolean;
+    let previous: boolean;
+    if (presented.kind === "identkit") {
+      current =
+        grant.refreshDigest !== null &&
+        grant.refreshDigestAlgorithm === "hmac-sha256" &&
+        digestsEqual(grant.refreshDigest, presented.digest);
+      previous =
         grant.previousRefreshDigest !== null &&
-        digestsEqual(grant.previousRefreshDigest, presentedDigest);
+        digestsEqual(grant.previousRefreshDigest, presented.digest);
+    } else {
+      // Keyed on the generation the verifier returned, and on the stored digest: the current
+      // legacy token has the grant's generation and its SHA-256. The one before has the
+      // generation below; after an identkit rotation its SHA-256 is the previous digest, and
+      // before one, the import stored no previous digest.
+      current =
+        grant.refreshDigest !== null &&
+        grant.refreshDigestAlgorithm === "sha256" &&
+        presented.generation === grant.generation &&
+        digestsEqual(grant.refreshDigest, presented.sha256);
+      previous =
+        presented.generation === grant.generation - 1 &&
+        (grant.previousRefreshDigest === null
+          ? grant.refreshDigestAlgorithm === "sha256"
+          : digestsEqual(grant.previousRefreshDigest, presented.sha256));
+    }
+    if (!current) {
       const graceEnd =
         grant.refreshedAt === null
           ? null
@@ -383,7 +481,8 @@ export function createTokenEndpoint(internals: OAuthInternals) {
     }
     if (
       now.getTime() >= grant.expiresAt.getTime() ||
-      (grant.refreshExpiresAt !== null && now.getTime() >= grant.refreshExpiresAt.getTime())
+      (grant.refreshExpiresAt !== null && now.getTime() >= grant.refreshExpiresAt.getTime()) ||
+      (presented.kind === "legacy" && now.getTime() >= presented.expiresAt.getTime())
     ) {
       const ended = await store.deleteGrant(grant.id, { clientId: client.id });
       if (ended) await grantEnded(ended, "expired");
@@ -407,9 +506,19 @@ export function createTokenEndpoint(internals: OAuthInternals) {
       await failed(client, refusal);
       return invalidGrant("The grant is not allowed.");
     }
-    const refDigest = grant.refreshRefDigest;
-    if (refDigest === null) return invalidGrant("The refresh token is invalid.");
-    const refresh = await newRefreshToken(presented.ref);
+    // An identkit token keeps the grant's ref. A legacy token's grant gets its first ref now:
+    // from here on its client holds an identkit token.
+    let ref: string;
+    let refDigest: string;
+    if (presented.kind === "identkit") {
+      if (grant.refreshRefDigest === null) return invalidGrant("The refresh token is invalid.");
+      ref = presented.ref;
+      refDigest = grant.refreshRefDigest;
+    } else {
+      ref = randomId();
+      refDigest = await hasher.digest("oauth-refresh-ref", ref);
+    }
+    const refresh = await newRefreshToken(ref);
     const generation = grant.generation + 1;
     const scopes = requestedScopes ?? grant.scopes;
     const access = await newAccessToken(grant, generation, [...scopes], now);
@@ -463,6 +572,25 @@ export function createTokenEndpoint(internals: OAuthInternals) {
     }
     const ref = refreshRef(token, settings.prefixes.refreshToken);
     if (ref === null) {
+      const verify = settings.legacy?.verifyRefreshToken;
+      if (verify && legacyCandidate(token)) {
+        const verified = legacyRefreshResult(await verify(token));
+        const lookup = verified ? await importedGrant(verified.grantId) : null;
+        if (verified && lookup) {
+          return refreshGrant(
+            client,
+            lookup,
+            {
+              kind: "legacy",
+              generation: verified.generation,
+              sha256: toHex(await sha256(utf8(token))),
+              expiresAt: verified.expiresAt,
+            },
+            requestedScopes,
+            params.get("resource"),
+          );
+        }
+      }
       await failed(client, "refresh_unknown");
       return invalidGrant("The refresh token is invalid.");
     }
@@ -474,10 +602,56 @@ export function createTokenEndpoint(internals: OAuthInternals) {
     return refreshGrant(
       client,
       lookup,
-      { ref, digest: await hasher.digest("oauth-refresh-token", token) },
+      { kind: "identkit", ref, digest: await hasher.digest("oauth-refresh-token", token) },
       requestedScopes,
       params.get("resource"),
     );
+  }
+
+  /**
+   * The imported grant that a legacy token names, for a revocation: the refresh verifier, then
+   * the access verifier. A verifier that throws fails the call.
+   */
+  async function legacyGrantId(token: string): Promise<string | null> {
+    const { verifyRefreshToken, verifyAccessToken } = settings.legacy ?? {};
+    const verified =
+      (verifyRefreshToken ? legacyRefreshResult(await verifyRefreshToken(token)) : null) ??
+      (verifyAccessToken ? legacyAccessResult(await verifyAccessToken(token)) : null);
+    if (!verified) return null;
+    return (await importedGrant(verified.grantId))?.grant.id ?? null;
+  }
+
+  /** The rest of `validateAccessToken` for a token that a legacy verifier returned. */
+  async function validateLegacy(
+    verified: { grantId: string; audience: string; expiresAt: Date } | null,
+    wanted: string | undefined,
+  ): Promise<ValidateAccessTokenResult> {
+    if (!verified) return { status: "refused", reason: "unknown" };
+    const now = clock.now().getTime();
+    if (now >= verified.expiresAt.getTime()) return { status: "refused", reason: "expired" };
+    const lookup = await importedGrant(verified.grantId);
+    if (!lookup) return { status: "refused", reason: "unknown" };
+    const { grant, accountStatus } = lookup;
+    if (now >= grant.expiresAt.getTime()) return { status: "refused", reason: "grant_expired" };
+    if (accountStatus !== "active") return { status: "refused", reason: "account_disabled" };
+    if (
+      !settings.resources.includes(verified.audience) ||
+      (wanted !== undefined && verified.audience !== wanted)
+    ) {
+      return { status: "refused", reason: "wrong_resource" };
+    }
+    // A legacy token has no scopes of its own here: the grant's, as the import stored them.
+    const scopes = grant.scopes.filter((s) => knownScopes.has(s));
+    if (scopes.length === 0) return { status: "refused", reason: "no_allowed_scope" };
+    return {
+      status: "valid",
+      accountId: grant.accountId,
+      clientId: grant.clientId,
+      grantId: grant.id,
+      scopes,
+      resource: verified.audience,
+      expiresAt: earlier(verified.expiresAt, grant.expiresAt),
+    };
   }
 
   return {
@@ -527,6 +701,8 @@ export function createTokenEndpoint(internals: OAuthInternals) {
             await hasher.digest("oauth-refresh-ref", ref),
           );
           if (found) grantId = found.grant.id;
+        } else if (legacyCandidate(token)) {
+          grantId = await legacyGrantId(token);
         }
       }
       // Scoped to the authenticated client: a token of another client ends nothing. The answer
@@ -547,6 +723,10 @@ export function createTokenEndpoint(internals: OAuthInternals) {
         throw new InvalidArgumentError("resource must be one of the configured resources");
       }
       if (!shapedAs(token, settings.prefixes.accessToken)) {
+        const verify = settings.legacy?.verifyAccessToken;
+        if (verify && legacyCandidate(token)) {
+          return validateLegacy(legacyAccessResult(await verify(token)), wanted);
+        }
         return { status: "refused", reason: "malformed" };
       }
       const digest = await hasher.digest("oauth-access-token", token);
