@@ -5,6 +5,7 @@ import {
   createMemoryStore,
   type AllSessionsRevokedHook,
   type ApiTokenOptions,
+  type OAuthOptions,
   type OidcOptions,
   type SignInPolicy,
 } from "../src/index.js";
@@ -90,6 +91,7 @@ export interface SetupOptions {
   onAllSessionsRevoked?: AllSessionsRevokedHook;
   oidc?: OidcOptions;
   apiTokens?: ApiTokenOptions;
+  oauth?: OAuthOptions;
 }
 
 export function setup(options: SetupOptions = {}) {
@@ -117,6 +119,7 @@ export function setup(options: SetupOptions = {}) {
     ...(options.onAllSessionsRevoked ? { onAllSessionsRevoked: options.onAllSessionsRevoked } : {}),
     ...(options.oidc ? { oidc: options.oidc } : {}),
     ...(options.apiTokens ? { apiTokens: options.apiTokens } : {}),
+    ...(options.oauth ? { oauth: options.oauth } : {}),
   });
   const authenticator = createSoftwareAuthenticator({
     origin: ORIGIN,

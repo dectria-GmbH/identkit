@@ -7,6 +7,7 @@ import { PasskeyCleanupError } from "./errors.js";
 import type { PasskeyCore } from "./passkey-core.js";
 import { toAccountView, type AccountView } from "./accounts.js";
 import { emitApiTokensRevoked, revokeAllApiTokens } from "./api-tokens.js";
+import { emitOAuthGrantsEnded, endAllOAuthGrants } from "./oauth/grant-end.js";
 import {
   finishRollback,
   finishThenRunHook,
@@ -350,12 +351,14 @@ export function createPasskeys(
       // Async, so a store that throws synchronously still gets the retry below.
       const remove = async () =>
         store.credentials.delete(verified.credentialId, account.id, verified.publicKey);
-      // As `accounts.disable`: the status, then the account's API tokens, whose ids it returns.
-      // A token store error counts as a failed disable: an operator who enables the account
-      // again must know that its tokens may still be live.
+      // As `accounts.disable`: the status, then the account's API tokens and its OAuth grants,
+      // which it returns. A token or grant store error counts as a failed disable: an operator
+      // who enables the account again must know that its tokens or grants may still be live.
       const disable = async () => {
         await store.accounts.setStatus(account.id, "disabled");
-        return revokeAllApiTokens(ctx, account.id, "account_disabled");
+        const tokenIds = await revokeAllApiTokens(ctx, account.id, "account_disabled");
+        const grants = await endAllOAuthGrants(ctx, account.id);
+        return { tokenIds, grants };
       };
       // Removes the passkey and revokes every session of the account. Returns the revocation, or
       // null and the store's error if the revocation failed, for `finishRollback`. If the passkey
@@ -370,10 +373,10 @@ export function createPasskeys(
         } catch (error) {
           // The passkey may still be active without a valid grant: fail closed and disable the
           // account until an operator looks at it, as the TOTP enrolment does.
-          const tokenIds = await disable()
+          const ended = await disable()
             .catch(disable)
             .catch(() => null);
-          const disabled = tokenIds !== null;
+          const disabled = ended !== null;
           await ctx
             .emit({
               type: "passkey.registration_failed",
@@ -387,7 +390,10 @@ export function createPasskeys(
             await ctx
               .emit({ type: "account.disabled", accountId: account.id, reason: "passkey_cleanup" })
               .catch(() => undefined);
-            await emitApiTokensRevoked(ctx, account.id, tokenIds, "account_disabled").catch(
+            await emitApiTokensRevoked(ctx, account.id, ended.tokenIds, "account_disabled").catch(
+              () => undefined,
+            );
+            await emitOAuthGrantsEnded(ctx, account.id, ended.grants, "account_disabled").catch(
               () => undefined,
             );
           }

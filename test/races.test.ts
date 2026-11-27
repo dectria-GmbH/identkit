@@ -12,7 +12,7 @@ import {
 import type { IdentkitStore, SessionRecord } from "../src/storage/types.js";
 import { createOAuthTestClient } from "../src/testing/index.js";
 import { emailFirstPolicy, setup, testConfig } from "./helpers.js";
-import { oauthSetup } from "./oauth-helpers.js";
+import { baseOAuthOptions, oauthSetup } from "./oauth-helpers.js";
 
 interface Hooks {
   /** Runs once, right after the signature counter of an assertion was written. */
@@ -445,6 +445,7 @@ describe("passkey registration races", () => {
         store,
         policy: { ...emailFirstPolicy, createAccountOnFirstSignIn: false },
         apiTokens: { prefix: "pat_", allowedScopes: ["read:items"] },
+        oauth: baseOAuthOptions,
       });
       const created = await t.ik.accounts.create({ email: "staff@example.org" });
       if (created.status !== "created") throw new Error("not created");
@@ -456,6 +457,8 @@ describe("passkey registration races", () => {
         expiresInDays: 30,
       });
       if (apiToken.status !== "created") throw new Error(apiToken.status);
+      const oauthClient = await createOAuthTestClient(t.ik.oauth);
+      const connected = await oauthClient.connect(accountId);
       const { token } = await t.ik.passkeys.issueEnrollmentToken(accountId);
       const start = await t.ik.passkeys.startRegistration({ enrollmentToken: token });
       if (start.status !== "ok") throw new Error("denied");
@@ -478,6 +481,7 @@ describe("passkey registration races", () => {
         expect(error, label).toBeInstanceOf(PasskeyCleanupError);
         expect(reasons, label).toContain("cleanup_failed_disable_failed");
         expect(t.audit.ofType("api_token.revoked"), label).toHaveLength(0);
+        expect(t.audit.ofType("oauth.grant_ended"), label).toHaveLength(0);
         // The operator step from the README: call accounts.disable before the re-enable.
         await t.ik.accounts.disable(accountId);
       } else {
@@ -491,6 +495,15 @@ describe("passkey registration races", () => {
         status: "refused",
         reason: "revoked",
       });
+      // The cleanup ends the OAuth grants as well, so the re-enable brings no grant back.
+      expect(await t.ik.oauth.validateAccessToken(connected.accessToken), label).toEqual({
+        status: "refused",
+        reason: "unknown",
+      });
+      expect(
+        t.audit.ofType("oauth.grant_ended").map((e) => `${e.clientId} ${e.reason}`),
+        label,
+      ).toEqual([`${oauthClient.clientId} account_disabled`]);
       if (!tokenStoreFails) {
         expect(
           t.audit.ofType("api_token.revoked").map((e) => `${e.tokenId} ${e.reason}`),

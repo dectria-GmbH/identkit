@@ -216,7 +216,7 @@ describe("oauth token endpoint: code exchange", () => {
 
   it("refuses an expired code, a disabled account and a policy refusal, each with token_failed", async () => {
     let verdict = true;
-    const { ik, client, accountId, clock, audit } = await connected({
+    const { ik, client, accountId, clock, audit, store } = await connected({
       oauth: { admit: () => verdict },
     });
     const late = await client.authorize(accountId);
@@ -228,15 +228,24 @@ describe("oauth token endpoint: code exchange", () => {
       (await client.exchange(refusedByPolicy.code, refusedByPolicy.verifier)).body?.["error"],
     ).toBe("invalid_grant");
     verdict = true;
+    // A status change that lands between the approval and the exchange (accounts.disable
+    // deletes the account's codes as well, so it answers code_unknown).
     const disabled = await client.authorize(accountId);
-    await ik.accounts.disable(accountId);
+    await store.accounts.setStatus(accountId, "disabled");
     expect((await client.exchange(disabled.code, disabled.verifier)).body?.["error"]).toBe(
+      "invalid_grant",
+    );
+    await store.accounts.setStatus(accountId, "active");
+    const afterDisable = await client.authorize(accountId);
+    await ik.accounts.disable(accountId);
+    expect((await client.exchange(afterDisable.code, afterDisable.verifier)).body?.["error"]).toBe(
       "invalid_grant",
     );
     expect(audit.ofType("oauth.token_failed").map((e) => e.reason)).toEqual([
       "code_expired",
       "refused_by_policy",
       "account_disabled",
+      "code_unknown",
     ]);
     expect(audit.ofType("oauth.token_failed").every((e) => e.clientId === client.clientId)).toBe(
       true,

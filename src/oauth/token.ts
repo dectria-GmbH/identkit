@@ -2,7 +2,6 @@ import { toAccountView } from "../accounts.js";
 import type { AuditEvent } from "../audit.js";
 import { bytesEqual, sha256, toBase64Url, utf8 } from "../bytes.js";
 import { addSeconds } from "../clock.js";
-import type { Context } from "../context.js";
 import { digestsEqual, randomId, randomToken } from "../crypto.js";
 import { InvalidArgumentError, OperationRolledBackError } from "../errors.js";
 import { isRecord } from "../oidc-jwt.js";
@@ -13,6 +12,7 @@ import type {
   OAuthGrantRecord,
 } from "../storage/types.js";
 import { authenticateClient } from "./client-auth.js";
+import { emitOAuthGrantsEnded, type OAuthGrantEndReason } from "./grant-end.js";
 import {
   admits,
   endpointResult,
@@ -24,6 +24,8 @@ import {
   type OAuthParams,
 } from "./common.js";
 import { SCOPE } from "./options.js";
+
+export { emitOAuthGrantsEnded, endAllOAuthGrants, type OAuthGrantEndReason } from "./grant-end.js";
 
 const DAY_SECONDS = 86_400;
 /** Characters after the prefix: base64url of 32 random bytes. */
@@ -46,18 +48,6 @@ export type OAuthTokenFailure =
   | "refused_by_policy"
   | "account_disabled"
   | "grant_limit";
-
-/** Why a grant ended, in `oauth.grant_ended`. */
-export type OAuthGrantEndReason =
-  | "revoked_by_client"
-  | "revoked"
-  | "revoked_all"
-  | "client_deleted"
-  | "account_disabled"
-  | "replaced"
-  | "code_reuse"
-  | "refresh_reuse"
-  | "expired";
 
 /**
  * `malformed`: not a string of the access token format; no read was made. `unknown`: no live
@@ -109,47 +99,6 @@ export function refreshRef(value: unknown, prefix: string): string | null {
 }
 
 const earlier = (a: Date, b: Date) => (a.getTime() <= b.getTime() ? a : b);
-
-/**
- * Ends every OAuth grant of the account, and its codes, if the store has OAuth, also when the
- * `oauth` option is not set (grants from an earlier configuration must end too). Returns the
- * ended grants.
- */
-export async function endAllOAuthGrants(
-  ctx: Context,
-  accountId: string,
-): Promise<OAuthGrantRecord[]> {
-  const store = ctx.store.oauth;
-  if (!store) return [];
-  return store.deleteGrantsForAccount(accountId);
-}
-
-/**
- * Records `oauth.grant_ended` for each grant. A throwing sink does not skip the other events;
- * the first error goes up after all of them.
- */
-export async function emitOAuthGrantsEnded(
-  ctx: Context,
-  accountId: string,
-  grants: readonly OAuthGrantRecord[],
-  reason: OAuthGrantEndReason,
-): Promise<void> {
-  let failure: { error: unknown } | null = null;
-  for (const grant of grants) {
-    try {
-      await ctx.emit({
-        type: "oauth.grant_ended",
-        accountId,
-        clientId: grant.clientId,
-        grantId: grant.id,
-        reason,
-      });
-    } catch (error) {
-      failure ??= { error };
-    }
-  }
-  if (failure) throw failure.error;
-}
 
 function tokenResponse(
   accessToken: string,

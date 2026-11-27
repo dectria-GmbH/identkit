@@ -21,9 +21,12 @@ type Answer = (query: CompiledQuery) => QueryResult<unknown> | Error;
 
 function scriptedStore(answer: Answer) {
   const sqls: string[] = [];
+  /** The transaction steps the driver saw, in order, among the statements in `sqls`. */
+  const steps: string[] = [];
   const connection: DatabaseConnection = {
     executeQuery<R>(query: CompiledQuery): Promise<QueryResult<R>> {
       sqls.push(query.sql);
+      steps.push(query.sql);
       const result = answer(query);
       return result instanceof Error
         ? Promise.reject(result)
@@ -37,9 +40,9 @@ function scriptedStore(answer: Answer) {
   const driver: Driver = {
     init: async () => undefined,
     acquireConnection: async () => connection,
-    beginTransaction: async () => undefined,
-    commitTransaction: async () => undefined,
-    rollbackTransaction: async () => undefined,
+    beginTransaction: async () => void steps.push("BEGIN"),
+    commitTransaction: async () => void steps.push("COMMIT"),
+    rollbackTransaction: async () => void steps.push("ROLLBACK"),
     releaseConnection: async () => undefined,
     destroy: async () => undefined,
   };
@@ -51,9 +54,11 @@ function scriptedStore(answer: Answer) {
       createIntrospector: (k) => new PostgresIntrospector(k),
     },
   });
-  const tokens = createPostgresStore(db).apiTokens;
-  if (!tokens) throw new Error("the PostgreSQL store has apiTokens");
-  return { tokens, sqls };
+  const store = createPostgresStore(db);
+  const tokens = store.apiTokens;
+  const oauth = store.oauth;
+  if (!tokens || !oauth) throw new Error("the PostgreSQL store has apiTokens and oauth");
+  return { tokens, oauth, sqls, steps };
 }
 
 const sqlError = (code: string) => Object.assign(new Error(`sqlstate ${code}`), { code });
@@ -98,5 +103,39 @@ describe("postgresql store without a database", () => {
     expect(sqls[lock]).toMatch(/ for no key update$/);
     expect(lock).toBeGreaterThanOrEqual(0);
     expect(lock).toBeLessThan(count);
+  });
+
+  it("rule: deleteGrantsForAccount deletes grants and codes in one transaction", async () => {
+    const grantRow = {
+      id: "g1",
+      account_id: "a1",
+      client_id: "c1",
+      scopes: ["mcp:read"],
+      resource: "https://example.com/mcp",
+      created_at: new Date(0),
+      expires_at: new Date(1),
+      generation: 1,
+      refresh_ref_digest: null,
+      refresh_digest: null,
+      refresh_digest_algorithm: null,
+      previous_refresh_digest: null,
+      refreshed_at: null,
+      refresh_expires_at: null,
+      code_digest: null,
+      source: "created",
+    };
+    const { oauth, steps } = scriptedStore((query) => {
+      if (query.sql.includes('delete from "identkit_oauth_codes"')) return sqlError("57P01");
+      return { rows: [grantRow] };
+    });
+    // Review a2 r1 L5: the grant delete committed on its own, so a failed code delete lost the
+    // ended grants for good.
+    await expect(oauth.deleteGrantsForAccount("a1")).rejects.toThrow("sqlstate 57P01");
+    expect(steps.map((s) => (s.startsWith("delete from") ? s.split(" ")[2] : s))).toEqual([
+      "BEGIN",
+      '"identkit_oauth_grants"',
+      '"identkit_oauth_codes"',
+      "ROLLBACK",
+    ]);
   });
 });

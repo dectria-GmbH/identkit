@@ -19,6 +19,29 @@ function messageOf(error: unknown): string {
   }
 }
 
+/** The message of `AllSessionsRevokedHookError`: names each store error of `accounts.disable`. */
+function hookErrorMessage(options?: {
+  tokenRevocationError?: unknown;
+  grantRevocationError?: unknown;
+}): string {
+  const failed: string[] = [];
+  if (options?.tokenRevocationError !== undefined) {
+    failed.push(
+      `the revocation of the API tokens failed (${messageOf(options.tokenRevocationError)})`,
+    );
+  }
+  if (options?.grantRevocationError !== undefined) {
+    failed.push(`the end of the OAuth grants failed (${messageOf(options.grantRevocationError)})`);
+  }
+  if (failed.length === 0) {
+    return "onAllSessionsRevoked failed after the revocation; call sessions.revokeAll again";
+  }
+  return (
+    `onAllSessionsRevoked failed after the revocation, and ${failed.join(" and ")}; ` +
+    "call accounts.disable again"
+  );
+}
+
 /**
  * The operator policy does not allow this method for this call. The decision depends only
  * on the policy, never on the account or the address.
@@ -97,24 +120,29 @@ export class AllSessionsRevokedHookError extends IdentkitError {
    * serializes to `{}` in JSON.
    */
   readonly tokenRevocationError: unknown;
+  /**
+   * Set only by `accounts.disable`: the store's error on the end of the account's OAuth grants
+   * and codes, else undefined. Same rule as `tokenRevocationError`: the hook error wins, a
+   * disabled account's grants are refused (`validateAccessToken` and refresh check the account
+   * status), and `accounts.disable` again ends them. The message names this error too.
+   */
+  readonly grantRevocationError: unknown;
 
   constructor(
     readonly accountId: string,
     /** The session that stayed live, or null. */
     readonly exceptSessionId: string | null,
-    options?: ErrorOptions & { auditError?: unknown; tokenRevocationError?: unknown },
+    options?: ErrorOptions & {
+      auditError?: unknown;
+      tokenRevocationError?: unknown;
+      grantRevocationError?: unknown;
+    },
   ) {
-    super(
-      "all_sessions_revoked_hook_failed",
-      options?.tokenRevocationError === undefined
-        ? "onAllSessionsRevoked failed after the revocation; call sessions.revokeAll again"
-        : "onAllSessionsRevoked failed after the revocation, and the revocation of the API " +
-            `tokens failed (${messageOf(options.tokenRevocationError)}); call accounts.disable again`,
-      options,
-    );
+    super("all_sessions_revoked_hook_failed", hookErrorMessage(options), options);
     this.revokeAllOptions = exceptSessionId === null ? {} : { exceptSessionId };
     this.auditError = options?.auditError;
     this.tokenRevocationError = options?.tokenRevocationError;
+    this.grantRevocationError = options?.grantRevocationError;
   }
 }
 

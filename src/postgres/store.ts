@@ -1489,14 +1489,23 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
         return r ? toOAuthGrant(r) : null;
       },
       async deleteGrantsForAccount(accountId) {
-        // Two statements, each idempotent; they share no invariant.
-        const rows = await db
-          .deleteFrom("identkit_oauth_grants")
-          .where("account_id", "=", accountId)
-          .returningAll()
-          .execute();
-        await db.deleteFrom("identkit_oauth_codes").where("account_id", "=", accountId).execute();
-        return rows.map(toOAuthGrant);
+        // One transaction: if the code delete failed after a committed grant delete, the ended
+        // grants would never be returned, and a retry would find none to record.
+        return db
+          .transaction()
+          .setIsolationLevel("read committed")
+          .execute(async (trx) => {
+            const rows = await trx
+              .deleteFrom("identkit_oauth_grants")
+              .where("account_id", "=", accountId)
+              .returningAll()
+              .execute();
+            await trx
+              .deleteFrom("identkit_oauth_codes")
+              .where("account_id", "=", accountId)
+              .execute();
+            return rows.map(toOAuthGrant);
+          });
       },
       async listGrants(accountId, at) {
         const rows = await db

@@ -4,7 +4,13 @@
  */
 import { randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { createHmacHasher, InvalidArgumentError, type HashPurpose } from "../src/index.js";
+import {
+  createHmacHasher,
+  createMemoryStore,
+  InvalidArgumentError,
+  type HashPurpose,
+  type IdentkitStore,
+} from "../src/index.js";
 import {
   createOAuthTestClient,
   createPkcePair,
@@ -573,7 +579,32 @@ describe("oauth security review list", () => {
   });
 
   it("row 20: a disabled account gets no grant, and its tokens stop", async () => {
-    const { ik, client, accountId, account } = await connected();
+    const inner = createMemoryStore();
+    const innerOAuth = inner.oauth;
+    if (!innerOAuth) throw new Error("the memory store has oauth");
+    // A disable that lands after the exchange read the account: only the guard inside
+    // insertGrant stops it.
+    let disableBeforeInsert: string | null = null;
+    const store: IdentkitStore = {
+      ...inner,
+      oauth: {
+        ...innerOAuth,
+        insertGrant: async (...args) => {
+          if (disableBeforeInsert !== null) {
+            await inner.accounts.setStatus(disableBeforeInsert, "disabled");
+          }
+          return innerOAuth.insertGrant(...args);
+        },
+      },
+    };
+    const { ik, client, accountId, account } = await connected({ store });
+    const raced = await client.authorize(accountId);
+    disableBeforeInsert = accountId;
+    expect(errorOf(await client.exchange(raced.code, raced.verifier))).toBe("invalid_grant");
+    disableBeforeInsert = null;
+    expect(await ik.oauth.listGrants(accountId)).toEqual([]);
+    await inner.accounts.setStatus(accountId, "active");
+    // accounts.disable between the code and the exchange: the code is gone with the grants.
     const { code, verifier } = await client.authorize(accountId);
     await ik.accounts.disable(accountId);
     expect(errorOf(await client.exchange(code, verifier))).toBe("invalid_grant");

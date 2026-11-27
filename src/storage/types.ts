@@ -710,7 +710,10 @@ export interface IdentkitStore {
       id: string,
       match: { clientId: string } | { accountId: string },
     ): Promise<OAuthGrantRecord | null>;
-    /** Deletes every grant and code of the account and returns the grants. Idempotent. */
+    /**
+     * Deletes every grant and code of the account and returns the grants, atomically: a failure
+     * deletes nothing, so a retry still returns every grant. Idempotent.
+     */
     deleteGrantsForAccount(accountId: string): Promise<OAuthGrantRecord[]>;
     /** The grants of the account with `expiresAt` after `at`, oldest first. */
     listGrants(accountId: string, at: Date): Promise<OAuthGrantRecord[]>;
