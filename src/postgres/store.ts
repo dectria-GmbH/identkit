@@ -1221,13 +1221,29 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
         return row !== undefined;
       },
       async deleteClient(id) {
-        // The foreign keys remove the client's grants, their access tokens and its codes.
-        const row = await db
-          .deleteFrom("identkit_oauth_clients")
-          .where("id", "=", id)
-          .returning("id")
-          .executeTakeFirst();
-        return row !== undefined;
+        return db
+          .transaction()
+          .setIsolationLevel("read committed")
+          .execute(async (trx) => {
+            // The row lock first: a concurrent grant insert takes a key share lock on the client
+            // for its foreign key and waits, then fails on the deleted client. Without it, the
+            // client delete could cascade a grant committed after the grant delete below.
+            const client = await trx
+              .selectFrom("identkit_oauth_clients")
+              .select("id")
+              .where("id", "=", id)
+              .forUpdate()
+              .executeTakeFirst();
+            if (!client) return null;
+            const grants = await trx
+              .deleteFrom("identkit_oauth_grants")
+              .where("client_id", "=", id)
+              .returningAll()
+              .execute();
+            // The foreign keys remove the grants' access tokens and the client's codes.
+            await trx.deleteFrom("identkit_oauth_clients").where("id", "=", id).execute();
+            return grants.map(toOAuthGrant);
+          });
       },
       async reserveRegistration({ keys, windowStart }) {
         // One upsert per key, in order. Each is atomic: the row lock of ON CONFLICT DO UPDATE

@@ -6,6 +6,8 @@ import { ISSUER, oauthSetup, RESOURCE } from "./oauth-helpers.js";
 const ACCESS = /^ikat_[A-Za-z0-9_-]{43}$/;
 const REFRESH = /^ikrt_[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}$/;
 
+const compareText = (a: string | undefined, b: string | undefined) =>
+  (a ?? "").localeCompare(b ?? "");
 const encode = (value: string) => encodeURIComponent(value).replace(/%20/g, "+");
 const clientCredentialsForm = () => new URLSearchParams({ grant_type: "client_credentials" });
 
@@ -317,6 +319,47 @@ describe("oauth token endpoint: code exchange", () => {
 });
 
 describe("oauth revocation and administration", () => {
+  it("an admin client delete records grant_ended for each grant it ended", async () => {
+    const { ik, client, accountId, audit, account } = await connected();
+    const otherAccount = await account();
+    const a = await client.connect(accountId);
+    const b = await client.connect(otherAccount);
+    const grantIds = [
+      ...(await ik.oauth.listGrants(accountId)),
+      ...(await ik.oauth.listGrants(otherAccount)),
+    ].map((g) => g.id);
+    const emit = audit.emit.bind(audit);
+    let refused = false;
+    audit.emit = (event) => {
+      if (event.type === "oauth.grant_ended" && !refused) {
+        refused = true;
+        throw new Error("sink down");
+      }
+      return emit(event);
+    };
+    await expect(ik.oauth.deleteClient(client.clientId)).rejects.toThrow("sink down");
+    expect(await ik.oauth.getClient(client.clientId)).toBeNull();
+    for (const tokens of [a, b]) {
+      expect((await ik.oauth.validateAccessToken(tokens.accessToken)).status).toBe("refused");
+    }
+    expect(audit.ofType("oauth.client_deleted")).toHaveLength(1);
+    // The first grant_ended was refused; the second was still sent.
+    expect(audit.ofType("oauth.grant_ended")).toEqual([
+      expect.objectContaining({ clientId: client.clientId, reason: "client_deleted" }),
+    ]);
+    expect(grantIds).toContain(audit.ofType("oauth.grant_ended")[0]?.grantId);
+    audit.emit = emit;
+    const fresh = await createOAuthTestClient(ik.oauth);
+    await fresh.connect(accountId);
+    await fresh.connect(otherAccount);
+    expect(await ik.oauth.deleteClient(fresh.clientId)).toBe(true);
+    const ended = audit.ofType("oauth.grant_ended").slice(1);
+    expect(ended.map((e) => e.accountId).toSorted(compareText)).toEqual(
+      [accountId, otherAccount].toSorted(compareText),
+    );
+    expect(ended.every((e) => e.reason === "client_deleted")).toBe(true);
+  });
+
   it("the client revokes by access or refresh token; the grant ends", async () => {
     const { ik, client, accountId, audit } = await connected();
     for (const pick of ["accessToken", "refreshToken"] as const) {

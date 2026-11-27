@@ -52,6 +52,7 @@ export type OAuthGrantEndReason =
   | "revoked_by_client"
   | "revoked"
   | "revoked_all"
+  | "client_deleted"
   | "account_disabled"
   | "replaced"
   | "code_reuse"

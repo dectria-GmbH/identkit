@@ -593,14 +593,17 @@ export function createMemoryStore(): IdentkitStore {
         return Promise.resolve(true);
       },
       deleteClient(id) {
-        if (!oauthClients.delete(id)) return Promise.resolve(false);
+        if (!oauthClients.delete(id)) return Promise.resolve(null);
+        const ended: OAuthGrantRecord[] = [];
         for (const grant of oauthGrants.values()) {
-          if (grant.clientId === id) dropGrant(grant.id);
+          if (grant.clientId !== id) continue;
+          const dropped = dropGrant(grant.id);
+          if (dropped) ended.push(dropped);
         }
         for (const [digest, code] of oauthCodes) {
           if (code.clientId === id) oauthCodes.delete(digest);
         }
-        return Promise.resolve(true);
+        return Promise.resolve(ended);
       },
       reserveRegistration({ keys, windowStart }) {
         for (const { key, max } of keys) {

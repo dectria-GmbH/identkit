@@ -1323,9 +1323,18 @@ export function createD1Store(db: D1DatabaseLike, options: D1StoreOptions = {}):
         return row !== null;
       },
       async deleteClient(id) {
-        // The foreign keys remove the client's grants, their access tokens and its codes.
-        const row = await one("DELETE FROM identkit_oauth_clients WHERE id = ?1 RETURNING id", id);
-        return row !== null;
+        // One batch, so no grant can come between the two deletes. The foreign keys remove the
+        // grants' access tokens and the client's codes.
+        const [grants, client] = await db.batch([
+          db
+            .prepare(
+              `DELETE FROM identkit_oauth_grants WHERE client_id = ?1
+               RETURNING ${OAUTH_GRANT_COLUMNS}`,
+            )
+            .bind(id),
+          db.prepare("DELETE FROM identkit_oauth_clients WHERE id = ?1 RETURNING id").bind(id),
+        ]);
+        return batchRows(client).length === 1 ? batchRows(grants).map(toOAuthGrant) : null;
       },
       async reserveRegistration({ keys, windowStart }) {
         // One upsert per key, in order, and no further key after a refusal. Each upsert is one

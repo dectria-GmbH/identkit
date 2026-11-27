@@ -643,8 +643,12 @@ export interface IdentkitStore {
      * `newDigest` (algorithm `hmac-sha256`). Returns false if the stored digest is not `oldDigest`.
      */
     upgradeClientSecret(id: string, oldDigest: string, newDigest: string): Promise<boolean>;
-    /** Deletes the client, its grants and its codes. Returns true if this call deleted it. */
-    deleteClient(id: string): Promise<boolean>;
+    /**
+     * Atomically deletes the client, its grants and its codes. Returns the deleted grants, or
+     * null if the client does not exist. A grant inserted concurrently is either returned or
+     * refused (its client is gone); it is never deleted unreturned.
+     */
+    deleteClient(id: string): Promise<OAuthGrantRecord[] | null>;
     /**
      * Counts one registration for each key in order, in the window that starts at
      * `windowStart`. Stops at the first key whose count is at `max` already and returns it;

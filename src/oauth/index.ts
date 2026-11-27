@@ -131,7 +131,9 @@ export interface OAuth {
   getClient(clientId: string): Promise<OAuthClientView | null>;
   /**
    * Administrative: deletes the client with its grants and codes; every token of it stops.
-   * Returns true if this call deleted it.
+   * Records `oauth.client_deleted`, then `oauth.grant_ended` (reason `client_deleted`) for each
+   * ended grant. Returns true if this call deleted it. If the sink refuses an event, the deletion
+   * stands, every other event is still sent, and the first error goes up.
    */
   deleteClient(clientId: string): Promise<boolean>;
 }
@@ -223,12 +225,27 @@ export function createOAuth(
 
     async deleteClient(clientId) {
       requireId(clientId, "clientId");
-      const deleted = await store.deleteClient(clientId);
-      // The event after the delete: a refused event undoes no deletion.
-      if (deleted) {
-        await ctx.emit({ type: "oauth.client_deleted", clientId, reason: "administrative" });
+      const ended = await store.deleteClient(clientId);
+      if (ended === null) return false;
+      // The events after the delete: a refused event undoes no deletion. A throwing sink does
+      // not skip the other events; the first error goes up after all of them.
+      const failures: { error: unknown }[] = [];
+      const record = async (emit: () => Promise<void>) => {
+        try {
+          await emit();
+        } catch (error) {
+          failures.push({ error });
+        }
+      };
+      await record(() =>
+        ctx.emit({ type: "oauth.client_deleted", clientId, reason: "administrative" }),
+      );
+      for (const grant of ended) {
+        await record(() => emitOAuthGrantsEnded(ctx, grant.accountId, [grant], "client_deleted"));
       }
-      return deleted;
+      const [first] = failures;
+      if (first) throw first.error;
+      return true;
     },
   };
 }

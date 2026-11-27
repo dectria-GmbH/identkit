@@ -1319,19 +1319,33 @@ export function runStoreContract(
       expect(await oauth.findAccessToken(t1.digest)).toBeNull();
     });
 
-    it("oauth clients: a client delete takes its grants, their tokens and its codes", async () => {
-      const { oauth, accountId, client } = await oauthFixture();
+    it("oauth clients: a client delete takes and returns its grants, their tokens and its codes", async () => {
+      const { store, oauth, accountId, client } = await oauthFixture();
+      const limit = { maxOtherGrants: 10, at: T0 };
+      const other = account();
+      await store.accounts.insert(other);
+      const stranger = oauthClient();
+      await oauth.insertClient(stranger);
       const grant = oauthGrant(accountId, client.id);
       const token = oauthAccessToken(grant.id);
-      await oauth.insertGrant(grant, token, { maxOtherGrants: 10, at: T0 });
+      await oauth.insertGrant(grant, token, limit);
+      const second = oauthGrant(other.id, client.id);
+      await oauth.insertGrant(second, oauthAccessToken(second.id), limit);
+      const kept = oauthGrant(accountId, stranger.id);
+      await oauth.insertGrant(kept, oauthAccessToken(kept.id), limit);
       const code = oauthCode(client.id, accountId);
       await oauth.insertCode(code);
-      expect(await oauth.deleteClient(client.id)).toBe(true);
-      expect(await oauth.deleteClient(client.id)).toBe(false);
+      const ended = await oauth.deleteClient(client.id);
+      expect(ended?.toSorted(byId)).toEqual([grant, second].toSorted(byId));
+      expect(await oauth.deleteClient(client.id)).toBeNull();
       expect(await oauth.findClient(client.id)).toBeNull();
       expect(await oauth.findGrant(grant.id)).toBeNull();
       expect(await oauth.findAccessToken(token.digest)).toBeNull();
       expect(await oauth.consumeCode(code.digest)).toBeNull();
+      expect((await oauth.findGrant(kept.id))?.grant).toEqual(kept);
+      const empty = oauthClient();
+      await oauth.insertClient(empty);
+      expect(await oauth.deleteClient(empty.id)).toEqual([]);
     });
 
     it("oauth grants: an import never replaces and names why it did not insert", async () => {
