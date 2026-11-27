@@ -172,9 +172,11 @@ export interface OAuth {
    * `registration.allowedAuthMethods`: an administrative import may bring a public client also
    * where registration allows only confidential ones. Records `oauth.client_imported`; if the
    * sink refuses it, the client is deleted again (without a tombstone, so a retry imports) and
-   * the call throws `OAuthClientRolledBackError`. A concurrent identical import may answer
+   * the call throws `OAuthClientRolledBackError`. A grant that a concurrent call attached to the
+   * client in the meantime ends with it: it keeps its tombstone and gets `oauth.grant_ended`
+   * (reason `client_deleted`, best effort). A concurrent identical import may answer
    * `already_imported` for a client that the other call then rolls back; run imports one at a
-   * time.
+   * time, and the grant imports after the client imports.
    */
   importClient(input: ImportOAuthClientInput): Promise<ImportOAuthClientResult>;
   /**
@@ -182,7 +184,9 @@ export interface OAuth {
    * working through the option `legacy`. Never replaces a grant. Idempotent, and an imported
    * grant that ended since answers `revoked`: it never comes back. Records
    * `oauth.grant_imported`; if the sink refuses it, the grant is deleted again (without a
-   * tombstone, so a retry imports) and the call throws `OperationRolledBackError`.
+   * tombstone, so a retry imports) and the call throws `OperationRolledBackError`. A concurrent
+   * identical import may answer `already_imported` for a grant that the other call then rolls
+   * back; run imports one at a time.
    */
   importGrant(input: ImportOAuthGrantInput): Promise<ImportOAuthGrantResult>;
   /**

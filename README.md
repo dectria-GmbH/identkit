@@ -491,8 +491,8 @@ TOTP:
   `oauth.grant_ended` event per grant) or, if the disable failed too,
   `cleanup_failed_disable_failed`: the account may still be active, or its API tokens or OAuth
   grants may not be ended. On the error paths no enrolment grant may have been lost; the account
-  is disabled all the same. An operator removes the factor with `totp.revoke(accountId)` and enables the account
-  again in the store; identkit has no call to enable an account. After
+  is disabled all the same. An operator removes the factor with `totp.revoke(accountId)` and
+  enables the account again in the store; identkit has no call to enable an account. After
   `cleanup_failed_disable_failed`, the operator first calls `accounts.disable(accountId)` until
   it succeeds; otherwise the account's API tokens and OAuth grants can come back into use.
 - A code is accepted within `driftSteps` time steps on either side of the current one. All
@@ -1305,16 +1305,19 @@ refreshedAt?, refreshExpiresAt, refreshSha256 })` keeps the grant id, because th
   transaction as the delete. A later import of that id answers `revoked`, so an ended grant
   never comes back with the earlier system's refresh token, which a thief may hold. A delete of
   rows directly in the database writes no tombstone. A rolled-back import (a refused audit event)
-  writes none either, so the retry imports. identkit never deletes tombstones in this release;
-  the rows are small.
+  writes none either, so the retry imports. A grant that a concurrent call imported for a client
+  whose own import then rolls back did happen: it ends with the client, keeps its tombstone and
+  gets `oauth.grant_ended` (reason `client_deleted`). Import the clients first, then the grants,
+  one call at a time. identkit never deletes tombstones in this release; the rows are small.
 - Run the import before the switch. A re-run is safe: it answers `already_imported` for what
   stands, `revoked` for what ended since, and imports only what is new.
 - `legacy.verifyAccessToken(token)` and `legacy.verifyRefreshToken(token)` check the earlier
-  system's own tokens: its signature and expiry. They return `{ grantId, audience, expiresAt,
-scopes? }` or `{ grantId, generation, expiresAt }`, or null to refuse. identkit calls them only
-  for a token of at most 4096 characters that starts with none of its prefixes (the OAuth
-  prefixes and `apiTokens.prefix`, so a verifier never sees an API token), and only before
-  `legacy.until`; set `until` to the latest legacy refresh expiry, so the path ends by itself.
+  system's own tokens: its signature and expiry. They return
+  `{ grantId, audience, expiresAt, scopes? }` or `{ grantId, generation, expiresAt }`, or null to
+  refuse. identkit calls them only for a token of at most 4096 characters that starts with none
+  of its prefixes (the OAuth prefixes and `apiTokens.prefix`, so a verifier never sees an API
+  token), and only before `legacy.until`; set `until` to the latest legacy refresh expiry, so the
+  path ends by itself.
   Then identkit checks the rest as for its own tokens: the grant exists, was imported (a legacy
   token never reaches a grant that identkit created), is live, the account is active, the
   audience is the grant's `resource` (and the one asked for), and at refresh the client is the
@@ -1459,7 +1462,11 @@ A custom store needs the member `oauth` to use the OAuth server (the full list i
 states its atomicity in its comment: `consumeCode` returns a code to exactly one of concurrent
 calls, `insertGrant` checks the account and the grant limit and replaces the grant of the same
 client in one atomic step, `rotateGrant` is a compare-and-set on the generation, and
-`reserveRegistration` never lets a count pass its maximum.
+`reserveRegistration` never lets a count pass its maximum. Every method that deletes a grant or a
+client whose `source` is `import` must write its tombstone atomically with the delete (only
+`rollBackImport` leaves out the rolled-back row itself), and `insertClient` and `importGrant` must
+refuse an id that a tombstone names, also against a concurrent delete. TypeScript cannot check
+this: a store that ignores the time `at` still compiles.
 
 A custom store needs the member `apiTokens` (`insert`, `findByDigests`, `listByAccount`,
 `markUsed`, `revoke`, `revokeAllForAccount`, `delete`) to use personal API tokens. It is
