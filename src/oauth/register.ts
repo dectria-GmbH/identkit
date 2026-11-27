@@ -1,6 +1,6 @@
 import { addSeconds, secondsUntil } from "../clock.js";
 import { randomId, randomToken } from "../crypto.js";
-import { InvalidArgumentError, NotConfiguredError, OperationRolledBackError } from "../errors.js";
+import { InvalidArgumentError, NotConfiguredError, OAuthClientRolledBackError } from "../errors.js";
 import { isRecord } from "../oidc-jwt.js";
 import type { OAuthClientAuthMethod, OAuthClientRecord } from "../storage/types.js";
 import {
@@ -183,9 +183,9 @@ export function createRegister(internals: OAuthInternals) {
         method: client.authMethod,
       });
     } catch (error) {
-      // No client stands without its audit record. A client has no account: accountId is "".
+      // No client stands without its audit record.
       await store.deleteClient(client.id);
-      throw new OperationRolledBackError("", { cause: error, hookFailed: false });
+      throw new OAuthClientRolledBackError(client.id, { cause: error });
     }
     return endpointResult(201, {
       client_id: client.id,

@@ -53,6 +53,7 @@ export {
   InvalidArgumentError,
   MethodNotAllowedError,
   NotConfiguredError,
+  OAuthClientRolledBackError,
   OperationRolledBackError,
   PasskeyCleanupError,
   SessionsNotRevokedError,

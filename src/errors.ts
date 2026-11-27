@@ -169,6 +169,27 @@ export class OperationRolledBackError extends IdentkitError {
 }
 
 /**
+ * identkit rolled a client operation back: it did not take effect. `oauth.register` throws it
+ * when the audit sink refused `oauth.client_registered`: identkit deleted the new client again,
+ * and `cause` holds the sink's error. `clientId` names the deleted client; it was never
+ * returned to the caller. A client belongs to no account, so this is not an
+ * `OperationRolledBackError`, and no session was revoked. If the delete fails, the store's error
+ * goes up instead and the client stands without its record; nobody holds its id or secret.
+ */
+export class OAuthClientRolledBackError extends IdentkitError {
+  constructor(
+    readonly clientId: string,
+    options: { cause: unknown },
+  ) {
+    super(
+      "oauth_client_rolled_back",
+      "the client operation was rolled back and did not take effect",
+      options,
+    );
+  }
+}
+
+/**
  * The operation's writes stand, but the store failed to revoke the account's other sessions,
  * and a retry of the operation cannot reach that revocation (for example `totp.remove`, whose
  * factor is gone). Finish it with `sessions.revokeAll(error.accountId, error.revokeAllOptions)`;

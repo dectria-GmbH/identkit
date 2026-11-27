@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { InvalidArgumentError, OperationRolledBackError } from "../src/index.js";
+import {
+  InvalidArgumentError,
+  OAuthClientRolledBackError,
+  OperationRolledBackError,
+} from "../src/index.js";
 import { oauthSetup, registration } from "./oauth-helpers.js";
 
 const CLIENT_ID = /^ikc_[A-Za-z0-9_-]{22}$/;
@@ -161,9 +165,15 @@ describe("oauth dynamic client registration", () => {
       clientId = client.id;
       return insert(client);
     };
-    await expect(ik.oauth.register({ body: registration() })).rejects.toThrow(
-      OperationRolledBackError,
-    );
+    const thrown: unknown = await ik.oauth.register({ body: registration() }).catch((e) => e);
+    expect(thrown).toBeInstanceOf(OAuthClientRolledBackError);
+    expect(thrown).not.toBeInstanceOf(OperationRolledBackError);
+    expect(thrown).toMatchObject({
+      code: "oauth_client_rolled_back",
+      clientId: expect.stringMatching(/^ikc_/),
+      cause: new Error("sink down"),
+    });
+    expect((thrown as OAuthClientRolledBackError).clientId).toBe(clientId);
     expect(clientId).not.toBe("");
     expect(await ik.oauth.getClient(clientId)).toBeNull();
   });
