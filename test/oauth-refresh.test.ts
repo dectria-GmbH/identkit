@@ -105,6 +105,38 @@ describe("oauth refresh", () => {
     expect(reported.map((e) => e.type)).toEqual(["oauth.token_refreshed"]);
   });
 
+  it("a failed last-used write fails neither the exchange nor a won refresh; onStoreError gets it", async () => {
+    const reported: unknown[] = [];
+    const setup = oauthSetup({
+      oauth: {
+        onStoreError: (error, write) => {
+          reported.push([String(error), write]);
+          throw new Error("handler fails too");
+        },
+      },
+    });
+    const oauthStore = setup.store.oauth;
+    if (!oauthStore) throw new Error("no oauth store");
+    oauthStore.markClientUsed = () => Promise.reject(new Error("db blip"));
+    const client = await createOAuthTestClient(setup.ik.oauth);
+    const accountId = await setup.account();
+    const tokens = await client.connect(accountId);
+    if (tokens.refreshToken === null) throw new Error("no refresh token");
+    setup.clock.advanceSeconds(86_401);
+    const result = await client.refresh(tokens.refreshToken);
+    expect(result.httpStatus).toBe(200);
+    const next = tokensOf(result);
+    expect((await setup.ik.oauth.validateAccessToken(next.access)).status).toBe("valid");
+    expect(await setup.ik.oauth.listGrants(accountId)).toHaveLength(1);
+    expect((await client.refresh(next.refresh)).httpStatus).toBe(200);
+    const write = { kind: "client_last_used", clientId: client.clientId };
+    expect(reported).toEqual([
+      ["Error: db blip", write],
+      ["Error: db blip", write],
+      ["Error: db blip", write],
+    ]);
+  });
+
   it("refuses a malformed or unknown refresh token without ending anything", async () => {
     const { ik, client, accountId, audit } = await connected();
     for (const token of ["garbage", `ikrt_${"a".repeat(22)}.${"b".repeat(43)}`]) {

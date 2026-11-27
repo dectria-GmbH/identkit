@@ -81,6 +81,7 @@ export {
   type OAuthAuditErrorHandler,
   type OAuthClientView,
   type OAuthOptions,
+  type OAuthStoreErrorHandler,
 } from "./options.js";
 
 /**

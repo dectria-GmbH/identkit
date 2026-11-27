@@ -215,6 +215,19 @@ export const oauthOptionsSchema = z
         message: "onAuditError must be a function",
       })
       .optional(),
+    /**
+     * Receives the error when a best-effort store write fails, with the write. Today the only
+     * one is the client's last-used time, which identkit writes at most once a day after a code
+     * exchange or a refresh took effect. The call still returns its tokens: they are issued
+     * already, and an error would make the client retry with a code or a refresh token that is
+     * used up. Without this option the error is dropped. identkit awaits the call and drops what
+     * it throws; keep it quick.
+     */
+    onStoreError: z
+      .custom<OAuthStoreErrorHandler>((value) => typeof value === "function", {
+        message: "onStoreError must be a function",
+      })
+      .optional(),
     /** The realm of `WWW-Authenticate: Basic` on `invalid_client`. Default: the issuer's host. */
     basicRealm: z
       .string()
@@ -265,6 +278,12 @@ export type OAuthAdmitHook = (request: OAuthAdmitRequest) => boolean | Promise<b
 
 /** See the option `onAuditError`. */
 export type OAuthAuditErrorHandler = (error: unknown, event: AuditEvent) => void | Promise<void>;
+
+/** See the option `onStoreError`. `client_last_used`: the client's `lastUsedAt`. */
+export type OAuthStoreErrorHandler = (
+  error: unknown,
+  write: { kind: "client_last_used"; clientId: string },
+) => void | Promise<void>;
 
 export type OAuthOptions = z.input<typeof oauthOptionsSchema>;
 type ParsedOptions = z.output<typeof oauthOptionsSchema>;

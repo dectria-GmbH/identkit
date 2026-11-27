@@ -200,11 +200,22 @@ export function createTokenEndpoint(internals: OAuthInternals) {
     }
   }
 
-  /** Writes `lastUsedAt` of the client at most once a day. */
+  /**
+   * Writes `lastUsedAt` of the client at most once a day, best effort: the exchange or rotation
+   * is written already. If a store error failed the call, the client would never get its new
+   * tokens, and its retry with the used code or the previous refresh token would fail.
+   */
   async function markUsed(client: OAuthClientRecord, now: Date): Promise<void> {
     const notAfter = addSeconds(now, -DAY_SECONDS);
-    if (client.lastUsedAt === null || client.lastUsedAt.getTime() <= notAfter.getTime()) {
+    if (client.lastUsedAt !== null && client.lastUsedAt.getTime() > notAfter.getTime()) return;
+    try {
       await store.markClientUsed(client.id, now, notAfter);
+    } catch (error) {
+      try {
+        await settings.onStoreError?.(error, { kind: "client_last_used", clientId: client.id });
+      } catch {
+        // Dropped: the handler is a report channel, not a gate.
+      }
     }
   }
 

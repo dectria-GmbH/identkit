@@ -107,6 +107,7 @@ describe("oauth options", () => {
     ],
     ["an unknown option", { unknown: true } as never, /Unrecognized key/],
     ["a non-function admit", { admit: true }, /admit must be a function/],
+    ["a non-function onStoreError", { onStoreError: "log" }, /onStoreError must be/],
     ["a realm with a quote", { basicRealm: 'a"b' }, /basicRealm/],
   ];
   it.each(invalid)("refuses %s with InvalidArgumentError", (_, change, message) => {
