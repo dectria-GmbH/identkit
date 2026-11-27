@@ -19,7 +19,7 @@ import { parseAst } from "rolldown/parseAst";
 
 const root = resolve(process.argv[2] ?? resolve(dirname(fileURLToPath(import.meta.url)), ".."));
 const dist = resolve(root, "dist") + sep;
-const entries = ["dist/index.js", "dist/testing/index.js"];
+const entries = ["dist/index.js", "dist/testing/index.js", "dist/d1/index.js"];
 const conditionNames = ["workerd", "worker", "browser", "import", "default"];
 const builtins = new Set(builtinModules.flatMap((name) => [name, `node:${name}`]));
 
@@ -212,4 +212,4 @@ if (findings.length > 0) {
   console.error(`Node-only code reachable from a runtime-neutral entry:\n${findings.join("\n")}`);
   process.exit(1);
 }
-console.log("no Node built-in module or global reachable from the root or testing entry");
+console.log("no Node built-in module or global reachable from the root, testing or d1 entry");

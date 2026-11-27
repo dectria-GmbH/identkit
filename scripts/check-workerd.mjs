@@ -1,5 +1,6 @@
 // Runs test/workerd/smoke-worker.js in workerd (through Miniflare) without nodejs_compat, against
-// the built `dist` entries. Run it after `pnpm build`. Exits non-zero if a check fails.
+// the built `dist` entries, `identkit/d1` included (against a local D1 binding). Run it after
+// `pnpm build`. Exits non-zero if a check fails.
 // It also times `sessions.validate` with the memory store, in workerd and on Node.
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -104,6 +105,7 @@ const mf = new Miniflare({
   compatibilityDate: "2026-07-01",
   compatibilityFlags: [],
   serviceBindings: { AUTHENTICATOR: await authenticatorService() },
+  d1Databases: { DB: "identkit-smoke" },
 });
 
 let failed = false;

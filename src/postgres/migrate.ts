@@ -2,7 +2,10 @@ import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { sql, type Kysely } from "kysely";
+import { splitStatements } from "../sql-statements.js";
 import type { IdentkitDatabase } from "./schema.js";
+
+export { splitStatements };
 
 /** Folder with the plain SQL migrations that ship with the package. */
 export const MIGRATIONS_DIR = fileURLToPath(new URL("../../migrations/", import.meta.url));
@@ -53,16 +56,4 @@ export async function migrateIdentkit(
     if (done) applied.push(name);
   }
   return applied;
-}
-
-/** Splits a migration file at semicolons that end a line. Comment lines are dropped. */
-export function splitStatements(text: string): string[] {
-  const withoutComments = text
-    .split("\n")
-    .filter((line) => !line.trimStart().startsWith("--"))
-    .join("\n");
-  return withoutComments
-    .split(/;\s*(?:\n|$)/)
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
 }
