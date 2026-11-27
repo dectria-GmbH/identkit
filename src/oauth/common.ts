@@ -3,7 +3,7 @@ import { InvalidArgumentError } from "../errors.js";
 import { isRecord } from "../oidc-jwt.js";
 import type { SecretSealer } from "../sealer.js";
 import type { IdentkitStore, OAuthClientRecord } from "../storage/types.js";
-import type { OAuthClientView, OAuthSettings } from "./options.js";
+import type { OAuthAdmitRequest, OAuthClientView, OAuthSettings } from "./options.js";
 
 export type OAuthStore = NonNullable<IdentkitStore["oauth"]>;
 
@@ -132,4 +132,24 @@ export const CLIENT_ID = /^[\x21-\x7e]{1,128}$/;
 /** The start of the UTC day of `at`. */
 export function utcDayStart(at: Date): Date {
   return new Date(Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), at.getUTCDate()));
+}
+
+/**
+ * Asks the `admit` policy, if any. It can only refuse: a missing policy admits. A result that is
+ * not a boolean throws `TypeError`, so a policy bug fails the call instead of admitting.
+ */
+export async function admits(
+  internals: OAuthInternals,
+  request: OAuthAdmitRequest,
+): Promise<boolean> {
+  const hook = internals.settings.admit;
+  if (!hook) return true;
+  const allowed: unknown = await hook(request);
+  if (typeof allowed !== "boolean") throw new TypeError("oauth.admit must return a boolean");
+  return allowed;
+}
+
+/** The scopes in the order of the options: defaults, then the chosen opt-in scopes. */
+export function orderedScopes(settings: OAuthSettings, optIn: readonly string[]): string[] {
+  return [...settings.defaultScopes, ...settings.optInScopes.filter((s) => optIn.includes(s))];
 }

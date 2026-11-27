@@ -3,7 +3,30 @@
  * fails when the defence of its row is turned off at its call site.
  */
 import { describe, expect, it } from "vitest";
-import { oauthSetup, registration } from "./oauth-helpers.js";
+import { createOAuthTestClient, createPkcePair } from "../src/testing/index.js";
+import { ISSUER, oauthSetup, registration } from "./oauth-helpers.js";
+
+/** An authorization request of a test client, with changes. */
+async function authorizeParams(clientId: string, overrides: Record<string, string> = {}) {
+  const { challenge } = await createPkcePair();
+  return new URLSearchParams({
+    response_type: "code",
+    client_id: clientId,
+    redirect_uri: "http://127.0.0.1/callback",
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    state: "st",
+    ...overrides,
+  });
+}
+
+/** A setup with a public test client and an account. */
+async function connected(setupOptions: Parameters<typeof oauthSetup>[0] = {}) {
+  const setup = oauthSetup(setupOptions);
+  const client = await createOAuthTestClient(setup.ik.oauth);
+  const accountId = await setup.account();
+  return { ...setup, client, accountId };
+}
 
 /** Registers a client with these redirect URIs and returns the result. */
 async function registerWith(
@@ -18,6 +41,26 @@ async function registerWith(
 }
 
 describe("oauth security review list", () => {
+  it("row 6: authorization errors never redirect", async () => {
+    const { ik, client, accountId } = await connected();
+    const cases = [
+      { client_id: "ikc_unknownunknownunknown" },
+      { redirect_uri: "https://evil.example/cb" },
+      { response_type: "token" },
+      { code_challenge_method: "plain" },
+      { resource: "https://evil.example/mcp" },
+    ];
+    for (const overrides of cases) {
+      const begun = await ik.oauth.authorize.begin({
+        params: await authorizeParams(client.clientId, overrides),
+        accountId,
+      });
+      expect(begun.status).toBe("invalid");
+      expect(begun).not.toHaveProperty("location");
+      expect(JSON.stringify(begun)).not.toContain("evil.example");
+    }
+  });
+
   it("row 7: redirect URI tricks at registration are refused", async () => {
     const { ik } = oauthSetup();
     const refused = [
@@ -92,6 +135,61 @@ describe("oauth security review list", () => {
     expect((await registerWith(open, ["javascript:alert(1)"])).httpStatus).toBe(400);
   });
 
+  it("row 8: a loopback redirect URI ignores only the port; host, scheme, path and query must match", async () => {
+    const { ik, client, accountId } = await connected();
+    // Registered: http://127.0.0.1/callback
+    const status = async (redirectUri: string) =>
+      (
+        await ik.oauth.authorize.begin({
+          params: await authorizeParams(client.clientId, { redirect_uri: redirectUri }),
+          accountId,
+        })
+      ).status;
+    expect(await status("http://127.0.0.1/callback")).toBe("consent");
+    expect(await status("http://127.0.0.1:5000/callback")).toBe("consent");
+    expect(await status("http://127.0.0.1:65535/callback")).toBe("consent");
+    expect(await status("http://localhost:5000/callback")).toBe("invalid");
+    expect(await status("http://localhost/callback")).toBe("invalid");
+    expect(await status("http://127.0.0.1:5000/callback?x=1")).toBe("invalid");
+    expect(await status("http://127.0.0.1:5000/callback/")).toBe("invalid");
+    expect(await status("http://127.0.0.1:5000/Callback")).toBe("invalid");
+    expect(await status("https://127.0.0.1:5000/callback")).toBe("invalid");
+    expect(await status("http://127.0.0.1:5000/callback#x")).toBe("invalid");
+    expect(await status("http://127.0.0.2:5000/callback")).toBe("invalid");
+    // A port written on a non-loopback registration must match exactly.
+    const web = await createOAuthTestClient(ik.oauth, {
+      redirectUri: "https://app.example.com:8443/cb",
+    });
+    const webStatus = async (redirectUri: string) =>
+      (
+        await ik.oauth.authorize.begin({
+          params: await authorizeParams(web.clientId, { redirect_uri: redirectUri }),
+          accountId,
+        })
+      ).status;
+    expect(await webStatus("https://app.example.com:8443/cb")).toBe("consent");
+    expect(await webStatus("https://app.example.com:9443/cb")).toBe("invalid");
+    expect(await webStatus("https://app.example.com/cb")).toBe("invalid");
+  });
+
+  it("row 9: every authorization response carries the static issuer as iss", async () => {
+    const { ik, client, accountId } = await connected();
+    expect(ik.oauth.metadata.authorizationServer()).toMatchObject({
+      issuer: ISSUER,
+      authorization_response_iss_parameter_supported: true,
+    });
+    const approvedFlow = await client.authorize(accountId);
+    expect(approvedFlow.location.searchParams.get("iss")).toBe(ISSUER);
+    const begun = await ik.oauth.authorize.begin({
+      params: await authorizeParams(client.clientId),
+      accountId,
+    });
+    if (begun.status !== "consent") throw new Error(begun.status);
+    const denied = await ik.oauth.authorize.deny({ ticket: begun.ticket, accountId });
+    if (denied.status !== "redirect") throw new Error(denied.status);
+    expect(new URL(denied.location).searchParams.get("iss")).toBe(ISSUER);
+  });
+
   it("row 14: registrations per address and per day are capped, the address first", async () => {
     const { ik, audit } = oauthSetup({
       oauth: { registration: { maxPerAddressPerDay: 3, maxPerDay: 5 } },
@@ -115,6 +213,61 @@ describe("oauth security review list", () => {
     // A keyed digest of the address key, never the key itself.
     expect(refusals[0]?.addressDigest).toMatch(/^[0-9a-f]{64}$/);
     expect(JSON.stringify(audit.events)).not.toContain("198.51.100");
+  });
+
+  it("row 21: a consent ticket works only for its own account and only unchanged", async () => {
+    const { ik, client, accountId, account } = await connected();
+    const begun = await ik.oauth.authorize.begin({
+      params: await authorizeParams(client.clientId),
+      accountId,
+    });
+    if (begun.status !== "consent") throw new Error(begun.status);
+    const attacker = await account();
+    for (const decide of [
+      (input: { ticket: string; accountId: string }) => ik.oauth.authorize.approve(input),
+      (input: { ticket: string; accountId: string }) => ik.oauth.authorize.deny(input),
+    ]) {
+      expect(await decide({ ticket: begun.ticket, accountId: attacker })).toMatchObject({
+        status: "invalid",
+        error: "account_mismatch",
+      });
+    }
+    const parts = begun.ticket.split(".");
+    const body = parts[3] ?? "";
+    const flipped = `${body.slice(0, -2)}${body.at(-2) === "A" ? "B" : "A"}${body.at(-1)}`;
+    const tampered = [...parts.slice(0, 3), flipped, ...parts.slice(4)].join(".");
+    expect(await ik.oauth.authorize.approve({ ticket: tampered, accountId })).toMatchObject({
+      status: "invalid",
+      error: "invalid_ticket",
+    });
+    expect(
+      await ik.oauth.authorize.approve({ ticket: begun.ticket.slice(0, -1), accountId }),
+    ).toMatchObject({ status: "invalid", error: "invalid_ticket" });
+    // The untouched ticket still works for its account.
+    expect((await ik.oauth.authorize.approve({ ticket: begun.ticket, accountId })).status).toBe(
+      "redirect",
+    );
+  });
+
+  it("row 22: a value sealed for another purpose never opens as a consent ticket", async () => {
+    const { ik, client, accountId, sealer } = await connected();
+    const begun = await ik.oauth.authorize.begin({
+      params: await authorizeParams(client.clientId),
+      accountId,
+    });
+    if (begun.status !== "consent") throw new Error(begun.status);
+    // The same content, sealed with the same key for the OIDC transaction context.
+    const content = await sealer.open(begun.ticket, "identkit/oauth/consent/v1");
+    const foreign = await sealer.seal(content, "identkit/oidc/transaction/v1");
+    for (const decide of [
+      (input: { ticket: string; accountId: string }) => ik.oauth.authorize.approve(input),
+      (input: { ticket: string; accountId: string }) => ik.oauth.authorize.deny(input),
+    ]) {
+      expect(await decide({ ticket: foreign, accountId })).toMatchObject({
+        status: "invalid",
+        error: "invalid_ticket",
+      });
+    }
   });
 
   it("row 26: a hostile client_name loses control, bidi and separator characters and is cut at 100", async () => {

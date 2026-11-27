@@ -31,6 +31,14 @@ export {
   type FakeClaims,
 } from "./fake-oidc-provider.js";
 export {
+  createOAuthTestClient,
+  createPkcePair,
+  type OAuthTestAuthorizeOptions,
+  type OAuthTestClient,
+  type OAuthTestClientOptions,
+  type PkcePair,
+} from "./oauth-client.js";
+export {
   createSoftwareAuthenticator,
   type SoftwareAuthenticator,
   type SoftwareAuthenticatorOptions,

@@ -113,7 +113,12 @@ export {
 } from "./api-tokens.js";
 export {
   oauthOptionsSchema,
+  type AuthorizeBeginResult,
+  type AuthorizeDecisionResult,
+  type AuthorizeError,
+  type AuthorizeRefusal,
   type OAuth,
+  type OAuthAuthorize,
   type OAuthAdmitHook,
   type OAuthAdmitRequest,
   type OAuthAuditErrorHandler,

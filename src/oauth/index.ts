@@ -19,7 +19,15 @@ import {
   type OAuthOptions,
 } from "./options.js";
 import { createRegister } from "./register.js";
+import { createAuthorize, type OAuthAuthorize } from "./authorize.js";
 
+export type {
+  AuthorizeBeginResult,
+  AuthorizeDecisionResult,
+  AuthorizeError,
+  AuthorizeRefusal,
+  OAuthAuthorize,
+} from "./authorize.js";
 export type { OAuthEndpointResult, OAuthParams } from "./common.js";
 export type { OAuthMetadata, WwwAuthenticateInput } from "./metadata.js";
 export {
@@ -47,6 +55,8 @@ export interface OAuth {
    * IPv4 address or the IPv6 /64); without it, only the deployment limit applies.
    */
   register(input: { body: string; addressKey?: string }): Promise<OAuthEndpointResult>;
+  /** The authorization endpoint: check the request, then the person's approval or denial. */
+  authorize: OAuthAuthorize;
   /** Administrative: the client, or null. */
   getClient(clientId: string): Promise<OAuthClientView | null>;
   /**
@@ -72,6 +82,7 @@ export function unconfiguredOAuth(): OAuth {
     },
     wwwAuthenticate: fail,
     register: reject,
+    authorize: { begin: reject, approve: reject, deny: reject },
     getClient: reject,
     deleteClient: reject,
   };
@@ -102,6 +113,7 @@ export function createOAuth(
     metadata: createMetadata(settings),
     wwwAuthenticate: (input) => wwwAuthenticate(settings, input),
     register: createRegister(internals),
+    authorize: createAuthorize(internals),
 
     async getClient(clientId) {
       const found = await store.findClient(requireId(clientId, "clientId"));
