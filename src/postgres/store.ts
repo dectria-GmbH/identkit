@@ -7,6 +7,7 @@ import type {
   CredentialRecord,
   EnrollmentTokenRecord,
   IdentkitStore,
+  OidcLinkRecord,
   OtpFlowRecord,
   SessionRecord,
   TotpFactorRecord,
@@ -43,6 +44,8 @@ function oneOfOrNull<const T extends string>(
 
 const LEVELS = ["low", "substantial", "high"] as const;
 const AUTH_METHODS = ["email_otp", "passkey", "totp"] as const;
+const OIDC_PROVIDERS = ["microsoft", "google", "oidc"] as const;
+const OIDC_LINK_SOURCES = ["sign_in", "import"] as const;
 const STEP_UP_METHODS = ["email_otp", "passkey", "totp"] as const;
 
 const toAccount = (r: Row<"identkit_accounts">): AccountRecord => ({
@@ -159,6 +162,18 @@ const toVerification = (r: Row<"identkit_verifications">): VerificationRecord =>
   createdAt: r.created_at,
   expiresAt: r.expires_at,
   completedAt: r.completed_at,
+});
+
+const toOidcLink = (r: Row<"identkit_oidc_links">): OidcLinkRecord => ({
+  id: r.id,
+  accountId: r.account_id,
+  linkKey: r.link_key,
+  provider: oneOf(r.provider, OIDC_PROVIDERS),
+  issuer: r.issuer,
+  subject: r.subject,
+  tenantId: r.tenant_id,
+  source: oneOf(r.source, OIDC_LINK_SOURCES),
+  createdAt: r.created_at,
 });
 
 /**
@@ -819,6 +834,78 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           })
           .where("id", "=", id)
           .where("status", "=", "pending")
+          .returning("id")
+          .executeTakeFirst();
+        return row !== undefined;
+      },
+    },
+    oidcLinks: {
+      async insert(link, options) {
+        return db.transaction().execute(async (trx) => {
+          // The account row lock serializes exclusive inserts for one account, so at most one
+          // link stays. The unique link key refuses a subject that is linked already.
+          await trx
+            .selectFrom("identkit_accounts")
+            .select("id")
+            .where("id", "=", link.accountId)
+            .forUpdate()
+            .executeTakeFirst();
+          const taken = await trx
+            .selectFrom("identkit_oidc_links")
+            .select("id")
+            .where("link_key", "=", link.linkKey)
+            .executeTakeFirst();
+          if (taken) return "link_taken";
+          if (options.exclusive) {
+            const existing = await trx
+              .selectFrom("identkit_oidc_links")
+              .select("id")
+              .where("account_id", "=", link.accountId)
+              .executeTakeFirst();
+            if (existing) return "account_has_link";
+          }
+          const row = await trx
+            .insertInto("identkit_oidc_links")
+            .values({
+              id: link.id,
+              account_id: link.accountId,
+              link_key: link.linkKey,
+              provider: link.provider,
+              issuer: link.issuer,
+              subject: link.subject,
+              tenant_id: link.tenantId,
+              source: link.source,
+              created_at: link.createdAt,
+            })
+            .onConflict((oc) => oc.column("link_key").doNothing())
+            .returning("id")
+            .executeTakeFirst();
+          return row ? "inserted" : "link_taken";
+        });
+      },
+      async findByKey(linkKey) {
+        const r = await db
+          .selectFrom("identkit_oidc_links")
+          .selectAll()
+          .where("link_key", "=", linkKey)
+          .executeTakeFirst();
+        return r ? toOidcLink(r) : null;
+      },
+      async listByAccount(accountId) {
+        const rows = await db
+          .selectFrom("identkit_oidc_links")
+          .selectAll()
+          .where("account_id", "=", accountId)
+          .orderBy("created_at")
+          .orderBy("id")
+          .execute();
+        return rows.map(toOidcLink);
+      },
+      async delete(id, accountId) {
+        const row = await db
+          .deleteFrom("identkit_oidc_links")
+          .where("id", "=", id)
+          .where("account_id", "=", accountId)
           .returning("id")
           .executeTakeFirst();
         return row !== undefined;

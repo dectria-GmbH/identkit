@@ -6,6 +6,7 @@ import type {
   CredentialRecord,
   EnrollmentTokenRecord,
   IdentkitStore,
+  OidcLinkRecord,
   OtpFlowRecord,
   SessionRecord,
   TotpFactorRecord,
@@ -40,6 +41,7 @@ export function createMemoryStore(): IdentkitStore {
   const enrollment = new Map<string, EnrollmentTokenRecord>();
   const totpFactors = new Map<string, TotpFactorRecord>();
   const verifications = new Map<string, VerificationRecord>();
+  const oidcLinks = new Map<string, OidcLinkRecord>();
 
   function revokeEnrollment(accountId: string, at: Date): number {
     let revoked = 0;
@@ -398,6 +400,38 @@ export function createMemoryStore(): IdentkitStore {
         const found = verifications.get(id);
         if (!found || found.status !== "pending") return Promise.resolve(false);
         Object.assign(found, copy(update));
+        return Promise.resolve(true);
+      },
+    },
+    oidcLinks: {
+      insert(link, options) {
+        const links = [...oidcLinks.values()];
+        if (links.some((l) => l.linkKey === link.linkKey)) return Promise.resolve("link_taken");
+        if (options.exclusive && links.some((l) => l.accountId === link.accountId)) {
+          return Promise.resolve("account_has_link");
+        }
+        if (!accounts.has(link.accountId)) throw new Error("account not found");
+        oidcLinks.set(link.id, copy(link));
+        return Promise.resolve("inserted");
+      },
+      findByKey(linkKey) {
+        for (const link of oidcLinks.values()) {
+          if (link.linkKey === linkKey) return Promise.resolve(copy(link));
+        }
+        return Promise.resolve(null);
+      },
+      listByAccount(accountId) {
+        return Promise.resolve(
+          [...oidcLinks.values()]
+            .filter((l) => l.accountId === accountId)
+            .toSorted((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+            .map(copy),
+        );
+      },
+      delete(id, accountId) {
+        const found = oidcLinks.get(id);
+        if (!found || found.accountId !== accountId) return Promise.resolve(false);
+        oidcLinks.delete(id);
         return Promise.resolve(true);
       },
     },

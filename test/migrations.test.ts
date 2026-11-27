@@ -38,4 +38,14 @@ describe("migrations", () => {
       "CREATE INDEX identkit_enrollment_tokens_account_idx",
     ]);
   });
+
+  it("splits the OIDC link migration into its statements, a new table only", () => {
+    const text = readFileSync(join(MIGRATIONS_DIR, "0004_oidc_links.sql"), "utf8");
+    const statements = splitStatements(text);
+    expect(statements.map((s) => s.split(/\s+/).slice(0, 3).join(" "))).toEqual([
+      "CREATE TABLE identkit_oidc_links",
+      "CREATE INDEX identkit_oidc_links_account_idx",
+    ]);
+    expect(text).not.toMatch(/\b(DROP|RENAME|ALTER)\b/i);
+  });
 });

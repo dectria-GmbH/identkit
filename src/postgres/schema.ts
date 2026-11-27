@@ -108,6 +108,17 @@ export interface IdentkitDatabase {
     last_used_step: string | number | null;
     last_used_at: Date | null;
   };
+  identkit_oidc_links: {
+    id: string;
+    account_id: string;
+    link_key: string;
+    provider: string;
+    issuer: string;
+    subject: string;
+    tenant_id: string | null;
+    source: string;
+    created_at: Date;
+  };
   identkit_migrations: {
     name: string;
     applied_at: Date;

@@ -6,6 +6,7 @@ import type {
   CredentialRecord,
   EnrollmentTokenRecord,
   IdentkitStore,
+  OidcLinkRecord,
   OtpFlowRecord,
   SessionRecord,
   TotpFactorRecord,
@@ -124,6 +125,8 @@ function bytesFrom(value: unknown): Uint8Array {
 
 const LEVELS = ["low", "substantial", "high"] as const;
 const AUTH_METHODS = ["email_otp", "passkey", "totp"] as const;
+const OIDC_PROVIDERS = ["microsoft", "google", "oidc"] as const;
+const OIDC_LINK_SOURCES = ["sign_in", "import"] as const;
 const STEP_UP_METHODS = ["email_otp", "passkey", "totp"] as const;
 const CHALLENGE_PURPOSES = [
   "registration",
@@ -141,6 +144,21 @@ const VERIFICATION_STATUSES = [
   "expired",
   "conflict",
 ] as const;
+
+const toOidcLink = (r: Row): OidcLinkRecord => ({
+  id: text(r["id"]),
+  accountId: text(r["account_id"]),
+  linkKey: text(r["link_key"]),
+  provider: oneOf(r["provider"], OIDC_PROVIDERS),
+  issuer: text(r["issuer"]),
+  subject: text(r["subject"]),
+  tenantId: textOrNull(r["tenant_id"]),
+  source: oneOf(r["source"], OIDC_LINK_SOURCES),
+  createdAt: date(r["created_at"]),
+});
+
+const OIDC_LINK_COLUMNS =
+  "id, account_id, link_key, provider, issuer, subject, tenant_id, source, created_at";
 
 const toAccount = (r: Row): AccountRecord => ({
   id: text(r["id"]),
@@ -953,6 +971,62 @@ export function createD1Store(db: D1DatabaseLike, options: D1StoreOptions = {}):
       },
       async complete(id, u) {
         return finish(id, "pending", u);
+      },
+    },
+
+    oidcLinks: {
+      async insert(link, insertOptions) {
+        // Atomic: one INSERT ... SELECT. Its WHERE checks that the account has no link (if
+        // exclusive) in the same statement, and the unique link key makes a second insert of a
+        // subject a no-op. The read after a miss only names the reason.
+        const row = await one(
+          `INSERT INTO identkit_oidc_links (${OIDC_LINK_COLUMNS})
+           SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+           WHERE ?10 = 0 OR NOT EXISTS (
+             SELECT 1 FROM identkit_oidc_links WHERE account_id = ?2
+           )
+           ON CONFLICT (link_key) DO NOTHING
+           RETURNING id`,
+          link.id,
+          link.accountId,
+          link.linkKey,
+          link.provider,
+          link.issuer,
+          link.subject,
+          link.tenantId,
+          link.source,
+          ms(link.createdAt),
+          insertOptions.exclusive ? 1 : 0,
+        );
+        if (row) return "inserted";
+        const taken = await one(
+          "SELECT id FROM identkit_oidc_links WHERE link_key = ?1",
+          link.linkKey,
+        );
+        return taken ? "link_taken" : "account_has_link";
+      },
+      async findByKey(linkKey) {
+        const r = await one(
+          `SELECT ${OIDC_LINK_COLUMNS} FROM identkit_oidc_links WHERE link_key = ?1`,
+          linkKey,
+        );
+        return r ? toOidcLink(r) : null;
+      },
+      async listByAccount(accountId) {
+        const rows = await all(
+          `SELECT ${OIDC_LINK_COLUMNS} FROM identkit_oidc_links
+           WHERE account_id = ?1 ORDER BY created_at, id`,
+          accountId,
+        );
+        return rows.map(toOidcLink);
+      },
+      async delete(id, accountId) {
+        const row = await one(
+          "DELETE FROM identkit_oidc_links WHERE id = ?1 AND account_id = ?2 RETURNING id",
+          id,
+          accountId,
+        );
+        return row !== null;
       },
     },
   };
