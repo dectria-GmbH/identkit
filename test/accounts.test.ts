@@ -135,4 +135,23 @@ describe("accounts.unlock", () => {
     await expect(t.ik.accounts.unlockAddress(account.email)).rejects.toThrow("connection reset");
     expect(t.audit.ofType("lockout.released")).toHaveLength(3);
   });
+
+  it("keeps every lock when the audit sink refuses lockout.released", async () => {
+    const t = setup();
+    const account = await createAccount(t, "person@example.org");
+    const keys = await accountKeys(t, account.id, account.email);
+    for (const key of Object.values(keys)) await lock(t.store, key, t.clock.now());
+
+    const recording = t.audit;
+    const emit = (event: Parameters<typeof recording.emit>[0]) => recording.events.push(event);
+    t.audit.emit = (event) => {
+      if (event.type === "lockout.released") throw new Error("audit sink down");
+      emit(event);
+    };
+    await expect(t.ik.accounts.unlock(account.id)).rejects.toThrow("audit sink down");
+    await expect(t.ik.accounts.unlockAddress(account.email)).rejects.toThrow("audit sink down");
+    for (const [name, key] of Object.entries(keys)) {
+      expect(await t.store.throttle.peek(key, t.clock.now()), name).not.toBeNull();
+    }
+  });
 });
