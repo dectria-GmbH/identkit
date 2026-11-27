@@ -30,6 +30,7 @@
   "files": [
     "dist",
     "migrations",
+    "migrations-d1",
     "LICENSE",
     "README.md"
   ],
@@ -41,6 +42,10 @@
     "./postgres": {
       "types": "./dist/postgres/index.d.ts",
       "default": "./dist/postgres/index.js"
+    },
+    "./d1": {
+      "types": "./dist/d1/index.d.ts",
+      "default": "./dist/d1/index.js"
     },
     "./testing": {
       "types": "./dist/testing/index.d.ts",
@@ -59,8 +64,10 @@
     "format:check": "prettier --check .",
     "test": "vitest run --maxWorkers=2",
     "test:postgres": "vitest run --maxWorkers=2 test/postgres",
+    "test:d1": "vitest run --maxWorkers=2 test/d1",
     "check:runtime": "node scripts/check-runtime-imports.mjs",
     "check:workerd": "node scripts/check-workerd.mjs",
+    "generate:d1-migrations": "node scripts/generate-d1-migrations.mjs",
     "prepublishOnly": "pnpm build",
     "check": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test && pnpm build && pnpm check:runtime && pnpm check:workerd"
   },
@@ -77,6 +84,7 @@
     "zod": "3.25.76"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "5.20260730.1",
     "@types/node": "24.19.2",
     "@types/pg": "8.23.1",
     "kysely": "0.29.9",

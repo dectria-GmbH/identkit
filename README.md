@@ -21,6 +21,8 @@ For the PostgreSQL store, also install Kysely and a PostgreSQL driver such as `p
 pnpm add kysely pg
 ```
 
+The Cloudflare D1 store (`identkit/d1`) needs no further package.
+
 ## Requirements
 
 - ESM only.
@@ -30,6 +32,8 @@ pnpm add kysely pg
   runs the built entries in workerd without `nodejs_compat` with `pnpm check:workerd`.
 - `identkit/postgres`: Node.js 24 or later, PostgreSQL 17 (the version the test suite runs
   against) and [Kysely](https://kysely.dev) 0.29 (optional peer dependency).
+- `identkit/d1`: Cloudflare Workers with a D1 binding, also without `nodejs_compat`. It imports
+  no Node built-in module (checked by `pnpm check:runtime`) and no Cloudflare package.
 
 ### Sync and async pairs
 
@@ -68,7 +72,7 @@ const identkit = createIdentkit({
     createAccountOnFirstSignIn: true,
   },
   isPrivilegedAccount: (account) => adminEmails.has(account.email), // or () => false
-  store: createMemoryStore(), // or createPostgresStore(db) from "identkit/postgres"
+  store: createMemoryStore(), // or createPostgresStore(db) or createD1Store(env.DB)
   hasher: createHmacHasher(secretKeyBytes), // at least 32 random bytes, kept secret
   sealer: createAesGcmSealer({ keys: { k1: sealKeyBytes }, activeKeyId: "k1" }), // for TOTP
   mail: { sendCode: async ({ to, code, expiresInMinutes }) => sendYourMail(to, code) },
@@ -139,6 +143,9 @@ pending approval that `start` stored, never from the verify input; check it befo
 use the evidence.
 
 Subpath `identkit/postgres`: `createPostgresStore(db)`, `migrateIdentkit(db)`, `MIGRATIONS_DIR`.
+
+Subpath `identkit/d1`: `createD1Store(db, options?)`, `migrateIdentkitD1(db)`, `D1_MIGRATIONS`,
+`D1ThrottleContentionError` and the types `D1DatabaseLike`, `D1StoreOptions`, `D1Migration`.
 
 Subpath `identkit/testing`: `createFakeClock`, `createRecordingMailSender`,
 `createRecordingAuditSink`, `createFakeIdentityVerificationAdapter`,
@@ -539,6 +546,68 @@ Migration `0003_lockout_and_enrollment_revocation.sql` adds the consecutive fail
 `identkit_throttles` (existing rows start at 0) and `revoked_at` to
 `identkit_enrollment_tokens`. It does not change the earlier files.
 
+### D1 store
+
+`createD1Store(db, options?)` from `identkit/d1` takes a Cloudflare D1 binding (`env.DB`). The
+parameter type `D1DatabaseLike` is the part of `D1Database` that the store uses, so identkit
+needs no Cloudflare types at runtime.
+
+```ts
+import { createIdentkit } from "identkit";
+import { createD1Store } from "identkit/d1";
+
+// Inside the fetch handler: the binding comes with each request's `env`.
+const identkit = createIdentkit({ ...options, store: createD1Store(env.DB) });
+```
+
+Its schema lives in `migrations-d1/`, separate from the PostgreSQL files. Every table and index
+starts with `identkit_`, so the schema can share one D1 database with the tables of your
+application. Apply it in one of two ways, and do not mix them for one database, because each
+keeps its own record of applied files:
+
+- `await migrateIdentkitD1(env.DB)` from a deployment script or an admin route. It works without
+  a file system (the SQL ships as strings in `D1_MIGRATIONS`), runs each file as one `batch()`
+  (one transaction), records it in `identkit_migrations` and skips applied files. Concurrent
+  runs apply each file once.
+- `wrangler d1 migrations apply`. Declare a second binding to the same database with its own
+  migrations folder and table:
+
+  ```toml
+  [[d1_databases]]
+  binding = "IDENTKIT_DB"
+  database_name = "app"
+  database_id = "<the id of your database>"
+  migrations_dir = "node_modules/identkit/migrations-d1"
+  migrations_table = "identkit_wrangler_migrations"
+  ```
+
+  Then run `wrangler d1 migrations apply IDENTKIT_DB --remote`. You can also copy the files into
+  your own migrations folder, in order.
+
+Storage format: every time is an INTEGER of milliseconds since the Unix epoch, so SQLite
+compares times as numbers. A boolean is INTEGER 0 or 1. A list (session auth methods, passkey
+transports) is a JSON array in TEXT. A public key is a BLOB. Allowed values of enumerations are
+checked when a row is read, not by CHECK constraints, because SQLite cannot change a CHECK
+without rebuilding the table.
+
+Migration rule: every D1 migration after `0001_initial.sql` is additive. It adds tables,
+indexes or columns, and never drops or renames. A new column is nullable or has a default
+(`NOT NULL` only with `DEFAULT`). So the previous Worker version runs on the new schema while a
+deployment rolls out. A test enforces the rule on the files.
+
+Atomicity: D1 has no interactive transactions. D1 runs the statements of a database one after
+another, and each statement and each `batch()` is atomic. Each guarded store call is one
+conditional statement (`UPDATE ... WHERE <expected state> RETURNING`, an upsert, or
+`DELETE ... RETURNING`), or one `batch()` (`enrollment.issue`). `throttle.reserve` reads the
+state, applies `applyThrottle`, and writes with a compare-and-set on every stored field; if a
+concurrent call changed the state first, it reads again. After `throttleRetries` lost rounds
+(default 32) it throws `D1ThrottleContentionError`, and the attempt does not pass. The store
+contract tests, with their concurrency cases, run against a local D1 (miniflare).
+
+The purge rule under "Operator duties" applies to D1 too, with times in milliseconds, for
+example `window_start < ?1 AND (locked_until IS NULL OR locked_until < ?1)` with `?1` set to
+`Date.now() - 30 * 86_400_000`.
+
 ## Operator duties
 
 identkit leaves these to the consumer:
@@ -575,7 +644,8 @@ identkit leaves these to the consumer:
   throttle calls:
   - `throttle.peek(key, at)` returns the stored `lockedUntil` while `at` is before it, else
     null. It writes nothing.
-  - `throttle.reset(key)` removes every field of the key; the PostgreSQL store deletes the row.
+  - `throttle.reset(key)` removes every field of the key; the PostgreSQL and D1 stores delete
+    the row.
     A reset that clears only the attempts keeps the consecutive count and the lock length, so a
     success or an unlock stays incomplete.
 
@@ -605,6 +675,16 @@ DATABASE_URL=postgres://user:password@localhost:5432/scratch pnpm test:postgres
 ```
 
 Without `DATABASE_URL` the PostgreSQL suite is reported as skipped.
+
+The D1 tests run against a local D1 database in memory (miniflare, a dev dependency), with no
+account and no network:
+
+```sh
+pnpm test:d1
+```
+
+After a change in `migrations-d1/`, run `pnpm generate:d1-migrations`. A test fails if
+`src/d1/migrations-sql.ts` and the files differ.
 
 ## Not built
 
