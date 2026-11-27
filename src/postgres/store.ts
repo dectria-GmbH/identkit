@@ -1727,7 +1727,6 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
               .selectFrom("identkit_oauth_clients as c")
               .select("c.id")
               .where((eb) => purgeable(eb, { at, unusedBefore, idleBefore }))
-              .orderBy("c.id")
               .forUpdate()
               .execute();
             const removed: { id: string; reason: "unused" | "idle" }[] = [];
