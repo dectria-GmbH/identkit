@@ -55,7 +55,7 @@ describe("oauth validateAccessToken", () => {
     const [view] = await ik.oauth.listGrants(accountId);
     const lookup = await store.oauth?.findGrant(view?.id ?? "");
     if (!lookup) throw new Error("no grant");
-    await store.oauth?.deleteGrant(lookup.grant.id, { accountId });
+    await store.oauth?.deleteGrant(lookup.grant.id, { accountId }, clock.now());
     const shortened = { ...lookup.grant, expiresAt: new Date(clock.now().getTime() + 60_000) };
     await store.oauth?.insertGrant(
       shortened,

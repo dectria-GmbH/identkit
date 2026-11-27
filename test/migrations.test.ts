@@ -74,6 +74,7 @@ describe("migrations", () => {
       "CREATE INDEX identkit_oauth_codes_client_idx",
       "CREATE INDEX identkit_oauth_codes_expires_idx",
       "CREATE TABLE identkit_oauth_registration_counts",
+      "CREATE TABLE identkit_oauth_import_tombstones",
     ]);
     expect(text).not.toMatch(/\b(DROP|RENAME|ALTER)\b/i);
     // Every unique index is on a table that this migration creates.

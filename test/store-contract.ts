@@ -1126,7 +1126,7 @@ export function runStoreContract(
         replaced: null,
       });
       const ended = await Promise.all(
-        Array.from({ length: 4 }, () => oauth.endGrantByCode(code.digest)),
+        Array.from({ length: 4 }, () => oauth.endGrantByCode(code.digest, T0)),
       );
       expect(ended.filter((g) => g !== null)).toEqual([grant]);
       expect(await oauth.findGrant(grant.id)).toBeNull();
@@ -1300,15 +1300,15 @@ export function runStoreContract(
       await oauth.insertGrant(grant, token, limit);
       const stranger = oauthClient();
       await oauth.insertClient(stranger);
-      expect(await oauth.deleteGrant(grant.id, { clientId: stranger.id })).toBeNull();
-      expect(await oauth.deleteGrant(grant.id, { accountId: uid("acc") })).toBeNull();
-      expect(await oauth.deleteGrant(grant.id, { clientId: client.id })).toEqual(grant);
-      expect(await oauth.deleteGrant(grant.id, { clientId: client.id })).toBeNull();
+      expect(await oauth.deleteGrant(grant.id, { clientId: stranger.id }, T0)).toBeNull();
+      expect(await oauth.deleteGrant(grant.id, { accountId: uid("acc") }, T0)).toBeNull();
+      expect(await oauth.deleteGrant(grant.id, { clientId: client.id }, T0)).toEqual(grant);
+      expect(await oauth.deleteGrant(grant.id, { clientId: client.id }, T0)).toBeNull();
       expect(await oauth.findAccessToken(token.digest)).toBeNull();
 
       const again = oauthGrant(accountId, client.id);
       await oauth.insertGrant(again, oauthAccessToken(again.id), limit);
-      expect(await oauth.deleteGrant(again.id, { accountId })).toEqual(again);
+      expect(await oauth.deleteGrant(again.id, { accountId }, T0)).toEqual(again);
 
       const g1 = oauthGrant(accountId, client.id);
       const g2 = oauthGrant(accountId, stranger.id);
@@ -1317,9 +1317,9 @@ export function runStoreContract(
       await oauth.insertGrant(g2, oauthAccessToken(g2.id), limit);
       const code = oauthCode(client.id, accountId);
       await oauth.insertCode(code);
-      const ended = await oauth.deleteGrantsForAccount(accountId);
+      const ended = await oauth.deleteGrantsForAccount(accountId, T0);
       expect(ended.map((g) => g.id).toSorted()).toEqual([g1.id, g2.id].toSorted());
-      expect(await oauth.deleteGrantsForAccount(accountId)).toEqual([]);
+      expect(await oauth.deleteGrantsForAccount(accountId, T0)).toEqual([]);
       expect(await oauth.consumeCode(code.digest)).toBeNull();
       expect(await oauth.findAccessToken(t1.digest)).toBeNull();
     });
@@ -1340,9 +1340,9 @@ export function runStoreContract(
       await oauth.insertGrant(kept, oauthAccessToken(kept.id), limit);
       const code = oauthCode(client.id, accountId);
       await oauth.insertCode(code);
-      const ended = await oauth.deleteClient(client.id);
+      const ended = await oauth.deleteClient(client.id, T0);
       expect(ended?.toSorted(byId)).toEqual([grant, second].toSorted(byId));
-      expect(await oauth.deleteClient(client.id)).toBeNull();
+      expect(await oauth.deleteClient(client.id, T0)).toBeNull();
       expect(await oauth.findClient(client.id)).toBeNull();
       expect(await oauth.findGrant(grant.id)).toBeNull();
       expect(await oauth.findAccessToken(token.digest)).toBeNull();
@@ -1350,7 +1350,7 @@ export function runStoreContract(
       expect((await oauth.findGrant(kept.id))?.grant).toEqual(kept);
       const empty = oauthClient();
       await oauth.insertClient(empty);
-      expect(await oauth.deleteClient(empty.id)).toEqual([]);
+      expect(await oauth.deleteClient(empty.id, T0)).toEqual([]);
     });
 
     it("oauth grants: an import never replaces and names why it did not insert", async () => {
@@ -1467,6 +1467,125 @@ export function runStoreContract(
       expect(await oauth.findAccessToken(oldToken.digest)).toBeNull();
       expect(await oauth.consumeCode(oldCode.digest)).toBeNull();
       expect(await oauth.consumeCode(liveCode.digest)).toEqual(liveCode);
+    });
+
+    it("oauth import tombstones: every end of an imported row writes one; a rollback writes none", async () => {
+      const { store, oauth, accountId } = await oauthFixture();
+      const day = 86_400;
+      const limit = { maxOtherGrants: 50, at: T0 };
+      const ended = addSeconds(T0, 7);
+      const importedClient = () => oauthClient({ source: "import" });
+      const importedGrant = (clientId: string, overrides: Partial<OAuthGrantRecord> = {}) =>
+        oauthGrant(accountId, clientId, {
+          source: "import",
+          refreshRefDigest: null,
+          refreshDigestAlgorithm: "sha256",
+          codeDigest: null,
+          ...overrides,
+        });
+      /** A fresh imported client with an imported grant of the fixture's account. */
+      async function pair(grantOverrides: Partial<OAuthGrantRecord> = {}) {
+        const client = importedClient();
+        expect(await oauth.insertClient(client)).toBe("inserted");
+        const grant = importedGrant(client.id, grantOverrides);
+        expect(await oauth.importGrant(grant, limit)).toBe("inserted");
+        return { client, grant };
+      }
+      const tombstone = (kind: "grant" | "client", id: string) =>
+        oauth.findImportTombstone(kind, id);
+
+      // The control: a live imported grant has no tombstone.
+      const byClient = await pair();
+      expect(await tombstone("grant", byClient.grant.id)).toBeNull();
+      // A grant end scoped to the client, then to the account.
+      expect(
+        await oauth.deleteGrant(byClient.grant.id, { clientId: byClient.client.id }, ended),
+      ).not.toBeNull();
+      expect(await tombstone("grant", byClient.grant.id)).toEqual(ended);
+      expect(await oauth.importGrant(byClient.grant, limit)).toBe("revoked");
+      expect(await oauth.findGrant(byClient.grant.id)).toBeNull();
+      const byAccount = await pair();
+      await oauth.deleteGrant(byAccount.grant.id, { accountId }, ended);
+      expect(await tombstone("grant", byAccount.grant.id)).toEqual(ended);
+
+      // A code reuse.
+      const byCode = await pair({ codeDigest: uid("code") });
+      await oauth.endGrantByCode(byCode.grant.codeDigest ?? "", ended);
+      expect(await tombstone("grant", byCode.grant.id)).toEqual(ended);
+
+      // A replacing insert of the same account and client.
+      const replaced = await pair();
+      const replacement = oauthGrant(accountId, replaced.client.id);
+      const inserted = await oauth.insertGrant(replacement, oauthAccessToken(replacement.id), {
+        maxOtherGrants: 50,
+        at: ended,
+      });
+      expect(inserted).toMatchObject({ status: "inserted", replaced: { id: replaced.grant.id } });
+      expect(await tombstone("grant", replaced.grant.id)).toEqual(ended);
+      // A grant that identkit created gets none when it ends.
+      await oauth.deleteGrant(replacement.id, { accountId }, ended);
+      expect(await tombstone("grant", replacement.id)).toBeNull();
+
+      // A client delete: the client and its imported grants.
+      const deleted = await pair();
+      expect(await oauth.deleteClient(deleted.client.id, ended)).toHaveLength(1);
+      expect(await tombstone("client", deleted.client.id)).toEqual(ended);
+      expect(await tombstone("grant", deleted.grant.id)).toEqual(ended);
+      expect(await oauth.insertClient(deleted.client)).toBe("revoked");
+      expect(await oauth.findClient(deleted.client.id)).toBeNull();
+      const dynamic = oauthClient();
+      await oauth.insertClient(dynamic);
+      await oauth.deleteClient(dynamic.id, ended);
+      expect(await tombstone("client", dynamic.id)).toBeNull();
+
+      // A rollback writes none, so the import can run again.
+      const rolled = await pair();
+      expect(await oauth.rollBackImport("grant", rolled.grant.id)).toBe(true);
+      expect(await oauth.findGrant(rolled.grant.id)).toBeNull();
+      expect(await tombstone("grant", rolled.grant.id)).toBeNull();
+      expect(await oauth.importGrant(rolled.grant, limit)).toBe("inserted");
+      expect(await oauth.rollBackImport("client", rolled.client.id)).toBe(true);
+      expect(await oauth.findClient(rolled.client.id)).toBeNull();
+      expect(await oauth.findGrant(rolled.grant.id)).toBeNull();
+      expect(await tombstone("client", rolled.client.id)).toBeNull();
+      expect(await tombstone("grant", rolled.grant.id)).toBeNull();
+      expect(await oauth.insertClient(rolled.client)).toBe("inserted");
+      // Only an imported row: a rollback leaves a dynamic client and a created grant alone.
+      expect(await oauth.rollBackImport("client", dynamic.id)).toBe(false);
+      const created = oauthGrant(accountId, rolled.client.id);
+      await oauth.insertGrant(created, oauthAccessToken(created.id), limit);
+      expect(await oauth.rollBackImport("grant", created.id)).toBe(false);
+      expect(await oauth.findGrant(created.id)).not.toBeNull();
+
+      // Purge: an expired imported grant and an unused imported client.
+      const expiring = await pair({ expiresAt: addSeconds(T0, day) });
+      const unused = importedClient();
+      await oauth.insertClient(unused);
+      const at = addSeconds(T0, 200 * day);
+      await oauth.purge({
+        at,
+        unusedBefore: addSeconds(at, -30 * day),
+        idleBefore: addSeconds(at, -180 * day),
+        windowBefore: addSeconds(at, -day),
+      });
+      expect(await tombstone("grant", expiring.grant.id)).toEqual(at);
+      expect(await tombstone("client", unused.id)).toEqual(at);
+
+      // An account disable.
+      const other = account();
+      await store.accounts.insert(other);
+      const held = importedClient();
+      await oauth.insertClient(held);
+      const disabled = oauthGrant(other.id, held.id, {
+        source: "import",
+        refreshRefDigest: null,
+        codeDigest: null,
+        expiresAt: addSeconds(at, 90 * day),
+      });
+      expect(await oauth.importGrant(disabled, { maxOtherGrants: 5, at })).toBe("inserted");
+      expect(await oauth.deleteGrantsForAccount(other.id, ended)).toHaveLength(1);
+      expect(await tombstone("grant", disabled.id)).toEqual(ended);
+      expect(await oauth.importGrant(disabled, { maxOtherGrants: 5, at })).toBe("revoked");
     });
   });
 }

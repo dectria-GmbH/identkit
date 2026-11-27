@@ -321,7 +321,7 @@ export function createTokenEndpoint(internals: OAuthInternals) {
     const record = await store.consumeCode(codeDigest);
     if (!record) {
       // A code that comes back after its exchange was copied: its grant ends (RFC 6749 4.1.2).
-      const ended = await store.endGrantByCode(codeDigest);
+      const ended = await store.endGrantByCode(codeDigest, clock.now());
       if (ended) await grantEnded(ended, "code_reuse");
       else await failed(client, "code_unknown");
       return invalidGrant("The authorization code is invalid.");
@@ -411,7 +411,7 @@ export function createTokenEndpoint(internals: OAuthInternals) {
       // No grant stands without its audit record. The replaced grant stays ended: its tokens
       // are deleted and cannot come back. If the delete fails, its error goes up and the new
       // grant stands, unusable: its tokens were never returned.
-      await store.deleteGrant(grant.id, { clientId: client.id });
+      await store.deleteGrant(grant.id, { clientId: client.id }, clock.now());
       throw new OperationRolledBackError(grant.accountId, { cause: error, hookFailed: false });
     }
     // No last-use write here: the approval that issued the code wrote it, at most a few minutes
@@ -474,7 +474,7 @@ export function createTokenEndpoint(internals: OAuthInternals) {
         return invalidGrant("The refresh token was already used.");
       }
       // An older token of this grant: a copy is in other hands. End the grant (RFC 9700 4.14.2).
-      const ended = await store.deleteGrant(grant.id, { clientId: client.id });
+      const ended = await store.deleteGrant(grant.id, { clientId: client.id }, now);
       if (ended) await grantEnded(ended, "refresh_reuse");
       // A concurrent call ended it first; record the attempt all the same.
       else await failed(client, "refresh_unknown");
@@ -485,7 +485,7 @@ export function createTokenEndpoint(internals: OAuthInternals) {
       (grant.refreshExpiresAt !== null && now.getTime() >= grant.refreshExpiresAt.getTime()) ||
       (presented.kind === "legacy" && now.getTime() >= presented.expiresAt.getTime())
     ) {
-      const ended = await store.deleteGrant(grant.id, { clientId: client.id });
+      const ended = await store.deleteGrant(grant.id, { clientId: client.id }, now);
       if (ended) await grantEnded(ended, "expired");
       // A concurrent call ended it first; record the attempt all the same.
       else await failed(client, "refresh_unknown");
@@ -711,7 +711,7 @@ export function createTokenEndpoint(internals: OAuthInternals) {
       // Scoped to the authenticated client: a token of another client ends nothing. The answer
       // is 200 either way (RFC 7009 section 2.2).
       if (grantId !== null) {
-        const ended = await store.deleteGrant(grantId, { clientId: client.id });
+        const ended = await store.deleteGrant(grantId, { clientId: client.id }, clock.now());
         if (ended) await grantEnded(ended, "revoked_by_client");
       }
       return endpointResult(200, null);

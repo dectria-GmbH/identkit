@@ -1,4 +1,10 @@
-import { sql, type Kysely, type Selectable, type Transaction } from "kysely";
+import {
+  sql,
+  type ExpressionBuilder,
+  type Kysely,
+  type Selectable,
+  type Transaction,
+} from "kysely";
 import { addSeconds } from "../clock.js";
 import { knownAuthMethods } from "../storage/auth-methods.js";
 import { applyThrottle } from "../storage/throttle-logic.js";
@@ -13,6 +19,7 @@ import type {
   OAuthClientRecord,
   OAuthCodeRecord,
   OAuthGrantRecord,
+  OAuthImportTombstoneKind,
   OidcLinkRecord,
   OtpFlowRecord,
   SessionRecord,
@@ -24,7 +31,7 @@ import type { IdentkitDatabase } from "./schema.js";
 type Row<T extends keyof IdentkitDatabase> = Selectable<IdentkitDatabase[T]>;
 
 const UNIQUE_VIOLATION = "23505";
-/** Client ids per DELETE in `oauth.purge`. */
+/** Ids per statement in `oauth.purge` and in a tombstone insert. */
 const PURGE_CHUNK = 1000;
 /** serialization_failure and deadlock_detected. */
 const LOST_RACE = new Set(["40001", "40P01"]);
@@ -62,6 +69,85 @@ async function lockClientForGrant(
     .forKeyShare()
     .executeTakeFirst();
   if (!client) throw new Error("oauth grant references a missing client");
+}
+
+/** An expression builder over `identkit_oauth_clients as c`. */
+type ClientsAsC = ExpressionBuilder<
+  IdentkitDatabase & { c: IdentkitDatabase["identkit_oauth_clients"] },
+  "c"
+>;
+
+/**
+ * The purge rule for a client: past its date rule (never used and created before
+ * `unusedBefore`, or last used before `idleBefore`), and holding no live grant and no live code.
+ */
+function purgeable(eb: ClientsAsC, b: { at: Date; unusedBefore: Date; idleBefore: Date }) {
+  return eb.and([
+    eb.or([
+      eb.and([eb("c.last_used_at", "is", null), eb("c.created_at", "<", b.unusedBefore)]),
+      eb.and([eb("c.last_used_at", "is not", null), eb("c.last_used_at", "<", b.idleBefore)]),
+    ]),
+    eb.not(
+      eb.exists(
+        eb
+          .selectFrom("identkit_oauth_grants as g")
+          .select("g.id")
+          .whereRef("g.client_id", "=", "c.id")
+          .where("g.expires_at", ">", b.at),
+      ),
+    ),
+    eb.not(
+      eb.exists(
+        eb
+          .selectFrom("identkit_oauth_codes as o")
+          .select("o.digest")
+          .whereRef("o.client_id", "=", "c.id")
+          .where("o.expires_at", ">", b.at),
+      ),
+    ),
+  ]);
+}
+
+/** Thrown inside a transaction to roll back an insert that a tombstone refuses. */
+class RefusedByTombstone extends Error {}
+
+/**
+ * Writes the import tombstones of the deleted rows whose source is `import`, in the transaction
+ * of their delete.
+ */
+async function writeTombstones(
+  trx: Transaction<IdentkitDatabase>,
+  kind: OAuthImportTombstoneKind,
+  deleted: readonly { id: string; source: string }[],
+  at: Date,
+): Promise<void> {
+  const ids = deleted.filter((row) => row.source === "import").map((row) => row.id);
+  for (let i = 0; i < ids.length; i += PURGE_CHUNK) {
+    await trx
+      .insertInto("identkit_oauth_import_tombstones")
+      .values(ids.slice(i, i + PURGE_CHUNK).map((id) => ({ kind, id, ended_at: at })))
+      .onConflict((oc) => oc.columns(["kind", "id"]).doNothing())
+      .execute();
+  }
+}
+
+/**
+ * True if a tombstone names the id. Called after the insert of the id, in its READ COMMITTED
+ * transaction: a new statement, so it sees a tombstone that a concurrent delete of the same id
+ * committed while the insert waited on that row.
+ */
+async function hasTombstone(
+  trx: Transaction<IdentkitDatabase>,
+  kind: OAuthImportTombstoneKind,
+  id: string,
+): Promise<boolean> {
+  const row = await trx
+    .selectFrom("identkit_oauth_import_tombstones")
+    .select("id")
+    .where("kind", "=", kind)
+    .where("id", "=", id)
+    .executeTakeFirst();
+  return row !== undefined;
 }
 
 /** Checks a value read from the database against the allowed set. */
@@ -1185,25 +1271,38 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
     },
     oauth: {
       async insertClient(c) {
-        // Atomic: one INSERT; the primary key makes a second insert of an id a no-op.
-        const row = await db
-          .insertInto("identkit_oauth_clients")
-          .values({
-            id: c.id,
-            secret_digest: c.secretDigest,
-            secret_digest_algorithm: c.secretDigestAlgorithm,
-            auth_method: c.authMethod,
-            grant_types: c.grantTypes,
-            redirect_uris: c.redirectUris,
-            name: c.name,
-            source: c.source,
-            created_at: c.createdAt,
-            last_used_at: c.lastUsedAt,
-          })
-          .onConflict((oc) => oc.column("id").doNothing())
-          .returning("id")
-          .executeTakeFirst();
-        return row ? "inserted" : "id_taken";
+        try {
+          // The primary key makes a second insert of an id a no-op. Then the tombstone, in the
+          // same transaction (see `hasTombstone`): a refused insert is rolled back.
+          return await db
+            .transaction()
+            .setIsolationLevel("read committed")
+            .execute(async (trx) => {
+              const row = await trx
+                .insertInto("identkit_oauth_clients")
+                .values({
+                  id: c.id,
+                  secret_digest: c.secretDigest,
+                  secret_digest_algorithm: c.secretDigestAlgorithm,
+                  auth_method: c.authMethod,
+                  grant_types: c.grantTypes,
+                  redirect_uris: c.redirectUris,
+                  name: c.name,
+                  source: c.source,
+                  created_at: c.createdAt,
+                  last_used_at: c.lastUsedAt,
+                })
+                .onConflict((oc) => oc.column("id").doNothing())
+                .returning("id")
+                .executeTakeFirst();
+              if (!row) return "id_taken" as const;
+              if (await hasTombstone(trx, "client", c.id)) throw new RefusedByTombstone();
+              return "inserted" as const;
+            });
+        } catch (error) {
+          if (error instanceof RefusedByTombstone) return "revoked";
+          throw error;
+        }
       },
       async findClient(id) {
         const r = await db
@@ -1243,7 +1342,7 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           .executeTakeFirst();
         return row !== undefined;
       },
-      async deleteClient(id) {
+      async deleteClient(id, at) {
         return db
           .transaction()
           .setIsolationLevel("read committed")
@@ -1256,7 +1355,7 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
             // the grant it deletes).
             const client = await trx
               .selectFrom("identkit_oauth_clients")
-              .select("id")
+              .select(["id", "source"])
               .where("id", "=", id)
               .forUpdate()
               .executeTakeFirst();
@@ -1268,6 +1367,8 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
               .execute();
             // The foreign keys remove the grants' access tokens and the client's codes.
             await trx.deleteFrom("identkit_oauth_clients").where("id", "=", id).execute();
+            await writeTombstones(trx, "grant", grants, at);
+            await writeTombstones(trx, "client", [client], at);
             return grants.map(toOAuthGrant);
           });
       },
@@ -1311,14 +1412,21 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           .executeTakeFirst();
         return r ? toOAuthCode(r) : null;
       },
-      async endGrantByCode(codeDigest) {
-        // Atomic: one DELETE ... RETURNING.
-        const r = await db
-          .deleteFrom("identkit_oauth_grants")
-          .where("code_digest", "=", codeDigest)
-          .returningAll()
-          .executeTakeFirst();
-        return r ? toOAuthGrant(r) : null;
+      async endGrantByCode(codeDigest, at) {
+        // Atomic: one DELETE ... RETURNING, and the tombstone in the same transaction.
+        return db
+          .transaction()
+          .setIsolationLevel("read committed")
+          .execute(async (trx) => {
+            const r = await trx
+              .deleteFrom("identkit_oauth_grants")
+              .where("code_digest", "=", codeDigest)
+              .returningAll()
+              .executeTakeFirst();
+            if (!r) return null;
+            await writeTombstones(trx, "grant", [r], at);
+            return toOAuthGrant(r);
+          });
       },
       async insertGrant(grant, firstAccessToken, limit) {
         // READ COMMITTED whatever the database default, for the reason given at `oidcLinks`.
@@ -1354,6 +1462,7 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
               .where("client_id", "=", grant.clientId)
               .returningAll()
               .executeTakeFirst();
+            if (replaced) await writeTombstones(trx, "grant", [replaced], limit.at);
             await trx.insertInto("identkit_oauth_grants").values(oauthGrantRow(grant)).execute();
             await trx
               .insertInto("identkit_oauth_access_tokens")
@@ -1366,48 +1475,56 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           });
       },
       async importGrant(grant, limit) {
-        return db
-          .transaction()
-          .setIsolationLevel("read committed")
-          .execute(async (trx) => {
-            // The same account and client row locks as `insertGrant`.
-            const account = await trx
-              .selectFrom("identkit_accounts")
-              .select("status")
-              .where("id", "=", grant.accountId)
-              .forNoKeyUpdate()
-              .executeTakeFirst();
-            if (account) await lockClientForGrant(trx, grant.clientId);
-            const sameId = await trx
-              .selectFrom("identkit_oauth_grants")
-              .select("id")
-              .where("id", "=", grant.id)
-              .executeTakeFirst();
-            if (sameId) return "id_taken";
-            if (!account || account.status !== "active") return "account_inactive";
-            const taken = await trx
-              .selectFrom("identkit_oauth_grants")
-              .select("id")
-              .where("account_id", "=", grant.accountId)
-              .where("client_id", "=", grant.clientId)
-              .executeTakeFirst();
-            if (taken) return "account_client_taken";
-            const { live } = await trx
-              .selectFrom("identkit_oauth_grants")
-              .select((eb) => eb.fn.countAll<string>().as("live"))
-              .where("account_id", "=", grant.accountId)
-              .where("client_id", "<>", grant.clientId)
-              .where("expires_at", ">", limit.at)
-              .executeTakeFirstOrThrow();
-            if (Number(live) >= limit.maxOtherGrants) return "limit_reached";
-            const row = await trx
-              .insertInto("identkit_oauth_grants")
-              .values(oauthGrantRow(grant))
-              .onConflict((oc) => oc.column("id").doNothing())
-              .returning("id")
-              .executeTakeFirst();
-            return row ? "inserted" : "id_taken";
-          });
+        try {
+          return await db
+            .transaction()
+            .setIsolationLevel("read committed")
+            .execute(async (trx) => {
+              // The same account and client row locks as `insertGrant`.
+              const account = await trx
+                .selectFrom("identkit_accounts")
+                .select("status")
+                .where("id", "=", grant.accountId)
+                .forNoKeyUpdate()
+                .executeTakeFirst();
+              if (account) await lockClientForGrant(trx, grant.clientId);
+              const sameId = await trx
+                .selectFrom("identkit_oauth_grants")
+                .select("id")
+                .where("id", "=", grant.id)
+                .executeTakeFirst();
+              if (sameId) return "id_taken";
+              if (!account || account.status !== "active") return "account_inactive";
+              const taken = await trx
+                .selectFrom("identkit_oauth_grants")
+                .select("id")
+                .where("account_id", "=", grant.accountId)
+                .where("client_id", "=", grant.clientId)
+                .executeTakeFirst();
+              if (taken) return "account_client_taken";
+              const { live } = await trx
+                .selectFrom("identkit_oauth_grants")
+                .select((eb) => eb.fn.countAll<string>().as("live"))
+                .where("account_id", "=", grant.accountId)
+                .where("client_id", "<>", grant.clientId)
+                .where("expires_at", ">", limit.at)
+                .executeTakeFirstOrThrow();
+              if (Number(live) >= limit.maxOtherGrants) return "limit_reached";
+              const row = await trx
+                .insertInto("identkit_oauth_grants")
+                .values(oauthGrantRow(grant))
+                .onConflict((oc) => oc.column("id").doNothing())
+                .returning("id")
+                .executeTakeFirst();
+              if (!row) return "id_taken";
+              // After the insert, in the same transaction (see `hasTombstone`).
+              if (await hasTombstone(trx, "grant", grant.id)) throw new RefusedByTombstone();
+              return "inserted";
+            });
+        } catch (error) {
+          if (error instanceof RefusedByTombstone) return "revoked";
+          throw error;
+        }
       },
       async findGrantByRefreshRef(refDigest) {
         // One query: the grant and the status of its account.
@@ -1506,17 +1623,25 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           accountStatus: oneOf(r.account_status, ACCOUNT_STATUSES),
         };
       },
-      async deleteGrant(id, match) {
-        // Atomic: one DELETE ... RETURNING, scoped to the client or the account.
-        let query = db.deleteFrom("identkit_oauth_grants").where("id", "=", id);
-        query =
-          "clientId" in match
-            ? query.where("client_id", "=", match.clientId)
-            : query.where("account_id", "=", match.accountId);
-        const r = await query.returningAll().executeTakeFirst();
-        return r ? toOAuthGrant(r) : null;
+      async deleteGrant(id, match, at) {
+        // Atomic: one DELETE ... RETURNING, scoped to the client or the account, and the
+        // tombstone in the same transaction.
+        return db
+          .transaction()
+          .setIsolationLevel("read committed")
+          .execute(async (trx) => {
+            let query = trx.deleteFrom("identkit_oauth_grants").where("id", "=", id);
+            query =
+              "clientId" in match
+                ? query.where("client_id", "=", match.clientId)
+                : query.where("account_id", "=", match.accountId);
+            const r = await query.returningAll().executeTakeFirst();
+            if (!r) return null;
+            await writeTombstones(trx, "grant", [r], at);
+            return toOAuthGrant(r);
+          });
       },
-      async deleteGrantsForAccount(accountId) {
+      async deleteGrantsForAccount(accountId, at) {
         // One transaction: if the code delete failed after a committed grant delete, the ended
         // grants would never be returned, and a retry would find none to record.
         return db
@@ -1532,6 +1657,7 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
               .deleteFrom("identkit_oauth_codes")
               .where("account_id", "=", accountId)
               .execute();
+            await writeTombstones(trx, "grant", rows, at);
             return rows.map(toOAuthGrant);
           });
       },
@@ -1547,13 +1673,20 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
         return rows.map(toOAuthGrant);
       },
       async purge({ at, unusedBefore, idleBefore, windowBefore }) {
-        // Each statement is idempotent. The expired rows first, each on its own: they need no
-        // shared invariant.
+        // The expired grants with their tombstones in one transaction. The other expired rows
+        // each on their own: they need no shared invariant, and each statement is idempotent.
         const grants = await db
-          .deleteFrom("identkit_oauth_grants")
-          .where("expires_at", "<=", at)
-          .returningAll()
-          .execute();
+          .transaction()
+          .setIsolationLevel("read committed")
+          .execute(async (trx) => {
+            const rows = await trx
+              .deleteFrom("identkit_oauth_grants")
+              .where("expires_at", "<=", at)
+              .returningAll()
+              .execute();
+            await writeTombstones(trx, "grant", rows, at);
+            return rows;
+          });
         const codes = await db
           .deleteFrom("identkit_oauth_codes")
           .where("expires_at", "<=", at)
@@ -1562,65 +1695,44 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           .deleteFrom("identkit_oauth_access_tokens")
           .where("expires_at", "<=", at)
           .executeTakeFirst();
-        // The rule of each kind: never used and old, or used long ago.
-        const before = { unused: unusedBefore, idle: idleBefore };
-        const used = { unused: "is", idle: "is not" } as const;
-        const dateColumn = { unused: "c.created_at", idle: "c.last_used_at" } as const;
-        // The clients in one READ COMMITTED transaction. First the candidates FOR UPDATE: a grant
-        // insert or import holds a key share lock on its client until it commits, so this waits
-        // for it, and one that starts later waits here and then fails on the deleted client. The
-        // delete is a second statement, so its snapshot sees every grant committed during the
-        // wait, and its NOT EXISTS keeps that client. A single DELETE would not: after its wait
-        // it re-checks only the client row, which the grant insert did not change.
+        // The clients in one READ COMMITTED transaction. First the candidates FOR UPDATE: only
+        // clients past their date rule (never used and old, or used long ago) that hold no live
+        // grant and no live code, in id order. So a busy client is never locked, and two
+        // overlapping purges lock in the same order and never wait on each other in a cycle.
+        // A grant insert or import holds a key share lock on its client until it commits, so
+        // this waits for it, and one that starts later waits here and then fails on the deleted
+        // client. The delete is a second statement, so its snapshot sees every grant committed
+        // during the wait, and its NOT EXISTS keeps that client. A single DELETE would not: after
+        // its wait it re-checks only the client row, which the grant insert did not change. A
+        // grant that the client delete cascades is past its expiry (no live grant is left), so
+        // it gets no tombstone; its import answers `expired` anyway.
         const deleted = await db
           .transaction()
           .setIsolationLevel("read committed")
           .execute(async (trx) => {
+            const candidates = await trx
+              .selectFrom("identkit_oauth_clients as c")
+              .select("c.id")
+              .where((eb) => purgeable(eb, { at, unusedBefore, idleBefore }))
+              .orderBy("c.id")
+              .forUpdate()
+              .execute();
             const removed: { id: string; reason: "unused" | "idle" }[] = [];
-            for (const rule of ["unused", "idle"] as const) {
-              const candidates = await trx
-                .selectFrom("identkit_oauth_clients as c")
-                .select("c.id")
-                .where("c.last_used_at", used[rule], null)
-                .where(dateColumn[rule], "<", before[rule])
-                .forUpdate()
+            // In chunks, to stay far below the parameter limit of one statement.
+            for (let i = 0; i < candidates.length; i += PURGE_CHUNK) {
+              const rows = await trx
+                .deleteFrom("identkit_oauth_clients as c")
+                .where(
+                  "c.id",
+                  "in",
+                  candidates.slice(i, i + PURGE_CHUNK).map((r) => r.id),
+                )
+                .where((eb) => purgeable(eb, { at, unusedBefore, idleBefore }))
+                .returning(["c.id", "c.source", "c.last_used_at"])
                 .execute();
-              // In chunks, to stay far below the parameter limit of one statement.
-              for (let i = 0; i < candidates.length; i += PURGE_CHUNK) {
-                const rows = await trx
-                  .deleteFrom("identkit_oauth_clients as c")
-                  .where(
-                    "c.id",
-                    "in",
-                    candidates.slice(i, i + PURGE_CHUNK).map((r) => r.id),
-                  )
-                  .where("c.last_used_at", used[rule], null)
-                  .where(dateColumn[rule], "<", before[rule])
-                  .where((eb) =>
-                    eb.not(
-                      eb.exists(
-                        eb
-                          .selectFrom("identkit_oauth_grants as g")
-                          .select("g.id")
-                          .whereRef("g.client_id", "=", "c.id")
-                          .where("g.expires_at", ">", at),
-                      ),
-                    ),
-                  )
-                  .where((eb) =>
-                    eb.not(
-                      eb.exists(
-                        eb
-                          .selectFrom("identkit_oauth_codes as o")
-                          .select("o.digest")
-                          .whereRef("o.client_id", "=", "c.id")
-                          .where("o.expires_at", ">", at),
-                      ),
-                    ),
-                  )
-                  .returning("c.id")
-                  .execute();
-                removed.push(...rows.map((r) => ({ id: r.id, reason: rule })));
+              await writeTombstones(trx, "client", rows, at);
+              for (const row of rows) {
+                removed.push({ id: row.id, reason: row.last_used_at === null ? "unused" : "idle" });
               }
             }
             return removed;
@@ -1636,6 +1748,34 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           accessTokens: Number(tokens.numDeletedRows),
           registrationWindows: Number(windows.numDeletedRows),
         };
+      },
+      async findImportTombstone(kind, id) {
+        const row = await db
+          .selectFrom("identkit_oauth_import_tombstones")
+          .select("ended_at")
+          .where("kind", "=", kind)
+          .where("id", "=", id)
+          .executeTakeFirst();
+        return row ? row.ended_at : null;
+      },
+      async rollBackImport(kind, id) {
+        // One DELETE, no tombstone. A client delete locks the client row first and then
+        // cascades its grants and codes, the lock order of `deleteClient`.
+        const row =
+          kind === "grant"
+            ? await db
+                .deleteFrom("identkit_oauth_grants")
+                .where("id", "=", id)
+                .where("source", "=", "import")
+                .returning("id")
+                .executeTakeFirst()
+            : await db
+                .deleteFrom("identkit_oauth_clients")
+                .where("id", "=", id)
+                .where("source", "=", "import")
+                .returning("id")
+                .executeTakeFirst();
+        return row !== undefined;
       },
     },
   };

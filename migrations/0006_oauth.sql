@@ -83,3 +83,14 @@ CREATE TABLE identkit_oauth_registration_counts (
   count integer NOT NULL CHECK (count >= 0),
   PRIMARY KEY (key, window_start)
 );
+
+-- Imported grants and clients that ended, by kind (grant or client) and id. Every identkit call
+-- that deletes an imported row writes its tombstone in the same transaction, and an import of
+-- an id that a tombstone names answers revoked: an ended grant never comes back with its
+-- earlier refresh token. identkit never deletes these rows.
+CREATE TABLE identkit_oauth_import_tombstones (
+  kind text NOT NULL,
+  id text NOT NULL,
+  ended_at timestamptz NOT NULL,
+  PRIMARY KEY (kind, id)
+);

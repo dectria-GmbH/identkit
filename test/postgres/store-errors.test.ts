@@ -76,6 +76,12 @@ const grantAnswer = (query: CompiledQuery): QueryResult<unknown> => {
   return { rows: [] };
 };
 
+/** As `grantAnswer`, and a tombstone names every id. */
+const tombstonedAnswer = (query: CompiledQuery): QueryResult<unknown> =>
+  query.sql.includes('from "identkit_oauth_import_tombstones"')
+    ? { rows: [{ id: "x" }] }
+    : grantAnswer(query);
+
 describe("postgresql store without a database", () => {
   it("rule: markUsed treats a serialization failure or deadlock as a lost race", async () => {
     for (const code of ["40001", "40P01"]) {
@@ -143,7 +149,7 @@ describe("postgresql store without a database", () => {
     });
     // Review a2 r1 L5: the grant delete committed on its own, so a failed code delete lost the
     // ended grants for good.
-    await expect(oauth.deleteGrantsForAccount("a1")).rejects.toThrow("sqlstate 57P01");
+    await expect(oauth.deleteGrantsForAccount("a1", new Date())).rejects.toThrow("sqlstate 57P01");
     expect(steps.map((s) => (s.startsWith("delete from") ? s.split(" ")[2] : s))).toEqual([
       "BEGIN",
       '"identkit_oauth_grants"',
@@ -215,7 +221,7 @@ describe("postgresql store without a database", () => {
     const { oauth, steps } = scriptedStore((query) => {
       if (query.sql.startsWith("select")) return { rows: [{ id: "c1" }] };
       if (query.sql.startsWith('delete from "identkit_oauth_clients"')) {
-        return { rows: [{ id: "c1" }] };
+        return { rows: [{ id: "c1", source: "dynamic", last_used_at: null }] };
       }
       return { rows: [], numAffectedRows: 0n };
     });
@@ -226,13 +232,13 @@ describe("postgresql store without a database", () => {
       idleBefore: at,
       windowBefore: at,
     });
-    expect(result.clients).toEqual([
-      { id: "c1", reason: "unused" },
-      { id: "c1", reason: "idle" },
-    ]);
+    expect(result.clients).toEqual([{ id: "c1", reason: "unused" }]);
     // Review a2 r1 L4: one DELETE with NOT EXISTS re-checks only the client row after it waited
     // on a grant insert's key share lock, and cascaded the grant that had just committed.
-    const begin = steps.indexOf("BEGIN");
+    const lock = steps.findIndex(
+      (q) => q.startsWith("select") && q.includes('"identkit_oauth_clients"'),
+    );
+    const begin = steps.lastIndexOf("BEGIN", lock);
     const clientSteps = steps
       .slice(begin)
       .filter((q) => q.includes('"identkit_oauth_clients"') || q === "BEGIN" || q === "COMMIT")
@@ -241,13 +247,161 @@ describe("postgresql store without a database", () => {
           ? `select${q.endsWith(" for update") ? " for update" : ""}`
           : q.split(" ")[0],
       );
-    expect(clientSteps).toEqual([
-      "BEGIN",
-      "select for update",
-      "delete",
-      "select for update",
-      "delete",
-      "COMMIT",
-    ]);
+    expect(clientSteps).toEqual(["BEGIN", "select for update", "delete", "COMMIT"]);
+    // Review a2 B r1 L5: only clients without a live grant or code, in id order, so a busy
+    // client is never locked and two purges lock in the same order.
+    const candidates = steps[lock] ?? "";
+    expect(candidates).toMatch(/ order by "c"\."id" for update$/);
+    expect(candidates.match(/not exists/g) ?? []).toHaveLength(2);
+  });
+
+  it("rule: every end of an imported row writes its tombstone in the transaction of its delete", async () => {
+    const at = new Date();
+    const importedRow = {
+      id: "g1",
+      account_id: "a1",
+      client_id: "c1",
+      scopes: ["mcp:read"],
+      resource: "https://example.com/mcp",
+      created_at: new Date(0),
+      expires_at: new Date(1),
+      generation: 1,
+      refresh_ref_digest: null,
+      refresh_digest: "d",
+      refresh_digest_algorithm: "sha256",
+      previous_refresh_digest: null,
+      refreshed_at: null,
+      refresh_expires_at: null,
+      code_digest: null,
+      source: "import",
+      last_used_at: null,
+    };
+    /** The kind of each tombstone written, in order. */
+    let kinds: unknown[] = [];
+    const answer = (query: CompiledQuery): QueryResult<unknown> => {
+      if (query.sql.startsWith('insert into "identkit_oauth_import_tombstones"')) {
+        kinds.push(query.parameters[0]);
+      }
+      if (query.sql.includes('from "identkit_accounts"')) return { rows: [{ status: "active" }] };
+      if (query.sql.includes("count(*)")) return { rows: [{ live: "0" }] };
+      if (query.sql.startsWith("select")) return { rows: [{ id: "c1", source: "import" }] };
+      if (query.sql.startsWith("delete")) return { rows: [importedRow], numAffectedRows: 1n };
+      return { rows: [], numAffectedRows: 0n };
+    };
+    const token: OAuthAccessTokenRecord = {
+      digest: "t",
+      grantId: "g2",
+      generation: 1,
+      scopes: ["mcp:read"],
+      createdAt: at,
+      expiresAt: at,
+    };
+    const replacing: OAuthGrantRecord = {
+      id: "g2",
+      accountId: "a1",
+      clientId: "c1",
+      scopes: ["mcp:read"],
+      resource: "https://example.com/mcp",
+      createdAt: at,
+      expiresAt: at,
+      generation: 1,
+      refreshRefDigest: null,
+      refreshDigest: null,
+      refreshDigestAlgorithm: null,
+      previousRefreshDigest: null,
+      refreshedAt: null,
+      refreshExpiresAt: null,
+      codeDigest: null,
+      source: "created",
+    };
+    type Call = (o: ReturnType<typeof scriptedStore>["oauth"]) => Promise<unknown>;
+    const calls: [string, Call, string[]][] = [
+      ["deleteGrant", (o) => o.deleteGrant("g1", { clientId: "c1" }, at), ["grant"]],
+      ["endGrantByCode", (o) => o.endGrantByCode("code", at), ["grant"]],
+      ["deleteGrantsForAccount", (o) => o.deleteGrantsForAccount("a1", at), ["grant"]],
+      ["deleteClient", (o) => o.deleteClient("c1", at), ["grant", "client"]],
+      ["insertGrant", (o) => o.insertGrant(replacing, token, { maxOtherGrants: 5, at }), ["grant"]],
+      [
+        "purge",
+        (o) => o.purge({ at, unusedBefore: at, idleBefore: at, windowBefore: at }),
+        ["grant", "client"],
+      ],
+    ];
+    for (const [name, call, expected] of calls) {
+      kinds = [];
+      const { oauth, steps } = scriptedStore(answer);
+      await call(oauth);
+      expect(kinds, name).toEqual(expected);
+      const tombstones = steps
+        .map((q, i) => ({ q, i }))
+        .filter(({ q }) => q.startsWith('insert into "identkit_oauth_import_tombstones"'));
+      expect(tombstones.length, name).toBeGreaterThan(0);
+      for (const { i } of tombstones) {
+        // Inside a transaction that a delete opened, before its COMMIT.
+        const begin = steps.lastIndexOf("BEGIN", i);
+        const commit = steps.indexOf("COMMIT", i);
+        expect(begin, name).toBeGreaterThanOrEqual(0);
+        expect(steps.lastIndexOf("COMMIT", i), name).toBeLessThan(begin);
+        expect(commit, name).toBeGreaterThan(i);
+        expect(
+          steps.slice(begin, i).some((q) => q.startsWith("delete from")),
+          name,
+        ).toBe(true);
+      }
+    }
+    // The rollback of a refused import writes none.
+    for (const kind of ["grant", "client"] as const) {
+      const { oauth, steps } = scriptedStore(answer);
+      expect(await oauth.rollBackImport(kind, "g1")).toBe(true);
+      expect(steps.some((q) => q.includes("identkit_oauth_import_tombstones"))).toBe(false);
+    }
+  });
+
+  it("rule: an insert or import that a tombstone names is rolled back and answers revoked", async () => {
+    const at = new Date();
+    const answer = tombstonedAnswer;
+    const grant: OAuthGrantRecord = {
+      id: "g1",
+      accountId: "a1",
+      clientId: "c1",
+      scopes: ["mcp:read"],
+      resource: "https://example.com/mcp",
+      createdAt: at,
+      expiresAt: new Date(at.getTime() + 60_000),
+      generation: 1,
+      refreshRefDigest: null,
+      refreshDigest: "d",
+      refreshDigestAlgorithm: "sha256",
+      previousRefreshDigest: null,
+      refreshedAt: null,
+      refreshExpiresAt: null,
+      codeDigest: null,
+      source: "import",
+    };
+    const imported = scriptedStore(answer);
+    expect(await imported.oauth.importGrant(grant, { maxOtherGrants: 5, at })).toBe("revoked");
+    const client = scriptedStore(answer);
+    expect(
+      await client.oauth.insertClient({
+        id: "c1",
+        secretDigest: null,
+        secretDigestAlgorithm: null,
+        authMethod: "none",
+        grantTypes: ["authorization_code"],
+        redirectUris: ["http://127.0.0.1/cb"],
+        name: null,
+        source: "import",
+        createdAt: at,
+        lastUsedAt: null,
+      }),
+    ).toBe("revoked");
+    // The tombstone read follows the insert, in its transaction, which is rolled back.
+    for (const { steps } of [imported, client]) {
+      const insert = steps.findIndex((q) => q.startsWith("insert"));
+      const read = steps.findIndex((q) => q.includes('from "identkit_oauth_import_tombstones"'));
+      expect(insert).toBeGreaterThan(steps.indexOf("BEGIN"));
+      expect(read).toBeGreaterThan(insert);
+      expect(steps.at(-1)).toBe("ROLLBACK");
+    }
   });
 });

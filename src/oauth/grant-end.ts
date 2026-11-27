@@ -24,7 +24,7 @@ export async function endAllOAuthGrants(
 ): Promise<OAuthGrantRecord[]> {
   const store = ctx.store.oauth;
   if (!store) return [];
-  return store.deleteGrantsForAccount(accountId);
+  return store.deleteGrantsForAccount(accountId, ctx.clock.now());
 }
 
 /**

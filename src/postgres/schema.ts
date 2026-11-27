@@ -188,6 +188,11 @@ export interface IdentkitDatabase {
     window_start: Date;
     count: number;
   };
+  identkit_oauth_import_tombstones: {
+    kind: string;
+    id: string;
+    ended_at: Date;
+  };
   identkit_migrations: {
     name: string;
     applied_at: Date;

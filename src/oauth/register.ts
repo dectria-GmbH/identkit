@@ -184,7 +184,7 @@ export function createRegister(internals: OAuthInternals) {
       });
     } catch (error) {
       // No client stands without its audit record.
-      await store.deleteClient(client.id);
+      await store.deleteClient(client.id, ctx.clock.now());
       throw new OAuthClientRolledBackError(client.id, { cause: error });
     }
     return endpointResult(201, {

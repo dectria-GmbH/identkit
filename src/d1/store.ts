@@ -196,6 +196,21 @@ const OAUTH_GRANT_COLUMNS =
   "id, account_id, client_id, scopes, resource, created_at, expires_at, generation, " +
   "refresh_ref_digest, refresh_digest, refresh_digest_algorithm, previous_refresh_digest, " +
   "refreshed_at, refresh_expires_at, code_digest, source";
+/**
+ * The tombstone insert for the imported grants that `where` selects, before their delete in the
+ * same batch. `?at` is the parameter that holds the time.
+ */
+const tombstoneGrants = (where: string, at: string) =>
+  `INSERT INTO identkit_oauth_import_tombstones (kind, id, ended_at)
+   SELECT 'grant', id, ${at} FROM identkit_oauth_grants
+   WHERE source = 'import' AND ${where}
+   ON CONFLICT DO NOTHING`;
+/** As `tombstoneGrants`, for the clients that `where` selects (table alias `c`). */
+const tombstoneClients = (where: string, at: string) =>
+  `INSERT INTO identkit_oauth_import_tombstones (kind, id, ended_at)
+   SELECT 'client', c.id, ${at} FROM identkit_oauth_clients AS c
+   WHERE c.source = 'import' AND ${where}
+   ON CONFLICT DO NOTHING`;
 const OAUTH_CODE_COLUMNS =
   "digest, client_id, account_id, redirect_uri, redirect_uri_explicit, code_challenge, resource, " +
   "scopes, created_at, expires_at";
@@ -1272,10 +1287,13 @@ export function createD1Store(db: D1DatabaseLike, options: D1StoreOptions = {}):
 
     oauth: {
       async insertClient(c) {
-        // Atomic: one INSERT; the primary key makes a second insert of an id a no-op.
+        // Atomic: one INSERT that a tombstone of the id refuses; the primary key makes a second
+        // insert of an id a no-op. The read after a miss only names the reason.
         const row = await one(
           `INSERT INTO identkit_oauth_clients (${OAUTH_CLIENT_COLUMNS})
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+           SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+           WHERE NOT EXISTS (SELECT 1 FROM identkit_oauth_import_tombstones
+                             WHERE kind = 'client' AND id = ?1)
            ON CONFLICT (id) DO NOTHING
            RETURNING id`,
           c.id,
@@ -1289,7 +1307,15 @@ export function createD1Store(db: D1DatabaseLike, options: D1StoreOptions = {}):
           ms(c.createdAt),
           msOrNull(c.lastUsedAt),
         );
-        return row ? "inserted" : "id_taken";
+        if (row) return "inserted";
+        if (await one("SELECT id FROM identkit_oauth_clients WHERE id = ?1", c.id)) {
+          return "id_taken";
+        }
+        const tombstone = await one(
+          "SELECT id FROM identkit_oauth_import_tombstones WHERE kind = 'client' AND id = ?1",
+          c.id,
+        );
+        return tombstone ? "revoked" : "id_taken";
       },
       async findClient(id) {
         const r = await one(
@@ -1323,10 +1349,12 @@ export function createD1Store(db: D1DatabaseLike, options: D1StoreOptions = {}):
         );
         return row !== null;
       },
-      async deleteClient(id) {
-        // One batch, so no grant can come between the two deletes. The foreign keys remove the
-        // grants' access tokens and the client's codes.
-        const [grants, client] = await db.batch([
+      async deleteClient(id, at) {
+        // One batch, so no grant can come between the two deletes, and the tombstones go with
+        // them. The foreign keys remove the grants' access tokens and the client's codes.
+        const [, , grants, client] = await db.batch([
+          db.prepare(tombstoneGrants("client_id = ?1", "?2")).bind(id, ms(at)),
+          db.prepare(tombstoneClients("c.id = ?1", "?2")).bind(id, ms(at)),
           db
             .prepare(
               `DELETE FROM identkit_oauth_grants WHERE client_id = ?1
@@ -1380,13 +1408,18 @@ export function createD1Store(db: D1DatabaseLike, options: D1StoreOptions = {}):
         );
         return r ? toOAuthCode(r) : null;
       },
-      async endGrantByCode(codeDigest) {
-        // Atomic: one DELETE ... RETURNING.
-        const r = await one(
-          `DELETE FROM identkit_oauth_grants WHERE code_digest = ?1
-           RETURNING ${OAUTH_GRANT_COLUMNS}`,
-          codeDigest,
-        );
+      async endGrantByCode(codeDigest, at) {
+        // Atomic: one batch, the tombstone and the DELETE ... RETURNING.
+        const [, deleted] = await db.batch([
+          db.prepare(tombstoneGrants("code_digest = ?1", "?2")).bind(codeDigest, ms(at)),
+          db
+            .prepare(
+              `DELETE FROM identkit_oauth_grants WHERE code_digest = ?1
+               RETURNING ${OAUTH_GRANT_COLUMNS}`,
+            )
+            .bind(codeDigest),
+        ]);
+        const [r] = batchRows(deleted);
         return r ? toOAuthGrant(r) : null;
       },
       async insertGrant(grant, firstAccessToken, limit) {
@@ -1399,7 +1432,10 @@ export function createD1Store(db: D1DatabaseLike, options: D1StoreOptions = {}):
           AND (SELECT count(*) FROM identkit_oauth_grants
                WHERE account_id = ?1 AND client_id <> ?2 AND expires_at > ?3) < ?4`;
         const guardValues = [grant.accountId, grant.clientId, ms(limit.at), limit.maxOtherGrants];
-        const [deleted, inserted] = await db.batch([
+        const [, deleted, inserted] = await db.batch([
+          db
+            .prepare(tombstoneGrants(`account_id = ?1 AND client_id = ?2 AND ${guard}`, "?3"))
+            .bind(...guardValues),
           db
             .prepare(
               `DELETE FROM identkit_oauth_grants
@@ -1437,8 +1473,8 @@ export function createD1Store(db: D1DatabaseLike, options: D1StoreOptions = {}):
       },
       async importGrant(grant, limit) {
         // Atomic: one INSERT ... SELECT with the guard of `insertGrant`, which also requires
-        // that the account holds no grant of this client; a unique key makes it a no-op. The
-        // reads after a miss only name the reason.
+        // that the account holds no grant of this client and that no tombstone names the id; a
+        // unique key makes it a no-op. The reads after a miss only name the reason.
         const row = await one(
           `INSERT INTO identkit_oauth_grants (${OAUTH_GRANT_COLUMNS})
            SELECT ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
@@ -1447,6 +1483,8 @@ export function createD1Store(db: D1DatabaseLike, options: D1StoreOptions = {}):
                              WHERE account_id = ?1 AND client_id = ?2)
              AND (SELECT count(*) FROM identkit_oauth_grants
                   WHERE account_id = ?1 AND client_id <> ?2 AND expires_at > ?3) < ?4
+             AND NOT EXISTS (SELECT 1 FROM identkit_oauth_import_tombstones
+                             WHERE kind = 'grant' AND id = ?5)
            ON CONFLICT DO NOTHING
            RETURNING id`,
           grant.accountId,
@@ -1459,6 +1497,11 @@ export function createD1Store(db: D1DatabaseLike, options: D1StoreOptions = {}):
         if (await one("SELECT id FROM identkit_oauth_grants WHERE id = ?1", grant.id)) {
           return "id_taken";
         }
+        const tombstone = await one(
+          "SELECT id FROM identkit_oauth_import_tombstones WHERE kind = 'grant' AND id = ?1",
+          grant.id,
+        );
+        if (tombstone) return "revoked";
         const account = await one(
           "SELECT status FROM identkit_accounts WHERE id = ?1",
           grant.accountId,
@@ -1569,21 +1612,28 @@ export function createD1Store(db: D1DatabaseLike, options: D1StoreOptions = {}):
           accountStatus: oneOf(r["account_status"], ACCOUNT_STATUSES),
         };
       },
-      async deleteGrant(id, match) {
-        // Atomic: one DELETE ... RETURNING, scoped to the client or the account.
+      async deleteGrant(id, match, at) {
+        // Atomic: one batch, the tombstone and the DELETE ... RETURNING, scoped to the client or
+        // the account.
         const column = "clientId" in match ? "client_id" : "account_id";
         const owner = "clientId" in match ? match.clientId : match.accountId;
-        const r = await one(
-          `DELETE FROM identkit_oauth_grants WHERE id = ?1 AND ${column} = ?2
-           RETURNING ${OAUTH_GRANT_COLUMNS}`,
-          id,
-          owner,
-        );
+        const [, deleted] = await db.batch([
+          db.prepare(tombstoneGrants(`id = ?1 AND ${column} = ?2`, "?3")).bind(id, owner, ms(at)),
+          db
+            .prepare(
+              `DELETE FROM identkit_oauth_grants WHERE id = ?1 AND ${column} = ?2
+               RETURNING ${OAUTH_GRANT_COLUMNS}`,
+            )
+            .bind(id, owner),
+        ]);
+        const [r] = batchRows(deleted);
         return r ? toOAuthGrant(r) : null;
       },
-      async deleteGrantsForAccount(accountId) {
-        // One batch: the grants (their access tokens go by foreign key) and the codes.
-        const [grants] = await db.batch([
+      async deleteGrantsForAccount(accountId, at) {
+        // One batch: the tombstones, the grants (their access tokens go by foreign key) and the
+        // codes.
+        const [, grants] = await db.batch([
+          db.prepare(tombstoneGrants("account_id = ?1", "?2")).bind(accountId, ms(at)),
           db
             .prepare(
               `DELETE FROM identkit_oauth_grants WHERE account_id = ?1
@@ -1606,12 +1656,16 @@ export function createD1Store(db: D1DatabaseLike, options: D1StoreOptions = {}):
       async purge({ at, unusedBefore, idleBefore, windowBefore }) {
         // One batch, which D1 runs as one transaction. A client delete checks in its own WHERE
         // that the client holds no live grant and no live code, so a grant created before the
-        // batch keeps its client, and a grant insert after it fails on the missing client.
+        // batch keeps its client, and a grant insert after it fails on the missing client. Each
+        // delete of grants or clients follows the tombstone insert with the same WHERE.
         const free = `NOT EXISTS (SELECT 1 FROM identkit_oauth_grants g
                                   WHERE g.client_id = c.id AND g.expires_at > ?1)
           AND NOT EXISTS (SELECT 1 FROM identkit_oauth_codes o
                           WHERE o.client_id = c.id AND o.expires_at > ?1)`;
-        const [grants, codes, tokens, unused, idle, windows] = await db.batch([
+        const unusedRule = `c.last_used_at IS NULL AND c.created_at < ?2 AND ${free}`;
+        const idleRule = `c.last_used_at IS NOT NULL AND c.last_used_at < ?2 AND ${free}`;
+        const [, grants, codes, tokens, , unused, , idle, windows] = await db.batch([
+          db.prepare(tombstoneGrants("expires_at <= ?1", "?1")).bind(ms(at)),
           db
             .prepare(
               `DELETE FROM identkit_oauth_grants WHERE expires_at <= ?1
@@ -1626,19 +1680,13 @@ export function createD1Store(db: D1DatabaseLike, options: D1StoreOptions = {}):
               "DELETE FROM identkit_oauth_access_tokens WHERE expires_at <= ?1 RETURNING digest",
             )
             .bind(ms(at)),
+          db.prepare(tombstoneClients(unusedRule, "?1")).bind(ms(at), ms(unusedBefore)),
           db
-            .prepare(
-              `DELETE FROM identkit_oauth_clients AS c
-               WHERE c.last_used_at IS NULL AND c.created_at < ?2 AND ${free}
-               RETURNING id`,
-            )
+            .prepare(`DELETE FROM identkit_oauth_clients AS c WHERE ${unusedRule} RETURNING id`)
             .bind(ms(at), ms(unusedBefore)),
+          db.prepare(tombstoneClients(idleRule, "?1")).bind(ms(at), ms(idleBefore)),
           db
-            .prepare(
-              `DELETE FROM identkit_oauth_clients AS c
-               WHERE c.last_used_at IS NOT NULL AND c.last_used_at < ?2 AND ${free}
-               RETURNING id`,
-            )
+            .prepare(`DELETE FROM identkit_oauth_clients AS c WHERE ${idleRule} RETURNING id`)
             .bind(ms(at), ms(idleBefore)),
           db
             .prepare(
@@ -1657,6 +1705,24 @@ export function createD1Store(db: D1DatabaseLike, options: D1StoreOptions = {}):
           accessTokens: batchRows(tokens).length,
           registrationWindows: batchRows(windows).length,
         };
+      },
+      async findImportTombstone(kind, id) {
+        const r = await one(
+          "SELECT ended_at FROM identkit_oauth_import_tombstones WHERE kind = ?1 AND id = ?2",
+          kind,
+          id,
+        );
+        return r ? date(r["ended_at"]) : null;
+      },
+      async rollBackImport(kind, id) {
+        // One DELETE, no tombstone. The foreign keys remove a grant's access tokens, and a
+        // client's grants and codes.
+        const table = kind === "grant" ? "identkit_oauth_grants" : "identkit_oauth_clients";
+        const r = await one(
+          `DELETE FROM ${table} WHERE id = ?1 AND source = 'import' RETURNING id`,
+          id,
+        );
+        return r !== null;
       },
     },
   };

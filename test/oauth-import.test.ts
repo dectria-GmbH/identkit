@@ -64,13 +64,16 @@ const publicClient = (overrides: Partial<ImportOAuthClientInput> = {}): ImportOA
   ...overrides,
 });
 
+type ImportedGrant = Awaited<ReturnType<typeof importedGrant>>;
+
 /** A public client and a grant of an earlier system, imported, with its legacy tokens. */
 async function importedGrant(
   t: ReturnType<typeof importSetup>,
   overrides: Partial<ImportOAuthGrantInput> = {},
 ) {
   const accountId = await t.account();
-  const client = await t.ik.oauth.importClient(publicClient({ id: `c-${accountId}` }));
+  const clientInput = publicClient({ id: `c-${accountId}` });
+  const client = await t.ik.oauth.importClient(clientInput);
   if (client.status !== "imported") throw new Error(client.status);
   const now = t.clock.now().getTime();
   const refreshToken = `legacy-refresh-${accountId}-3`;
@@ -101,7 +104,15 @@ async function importedGrant(
     audience: RESOURCE,
     expiresAt: new Date(now + 3_600_000),
   });
-  return { accountId, clientId: client.client.id, grantId: input.id, refreshToken, accessToken };
+  return {
+    accountId,
+    clientId: client.client.id,
+    grantId: input.id,
+    refreshToken,
+    accessToken,
+    input,
+    clientInput,
+  };
 }
 
 const refreshForm = (clientId: string, refreshToken: string) =>
@@ -436,6 +447,188 @@ describe("oauth importGrant", () => {
     expect(error).toBeInstanceOf(OperationRolledBackError);
     expect(error).toMatchObject({ accountId, hookFailed: false });
     expect(await t.ik.oauth.listGrants(accountId)).toEqual([]);
+  });
+});
+
+describe("oauth import after an end (review a2 B r1 M1)", () => {
+  /**
+   * Ends the imported grant one way, then runs the same import again: it answers `revoked`, and
+   * the earlier legacy refresh token stays dead.
+   */
+  const ends: [
+    string,
+    (t: ReturnType<typeof importSetup>, g: ImportedGrant) => Promise<unknown>,
+  ][] = [
+    [
+      "revokeGrant",
+      (t, g) => t.ik.oauth.revokeGrant({ accountId: g.accountId, grantId: g.grantId }),
+    ],
+    ["revokeAll", (t, g) => t.ik.oauth.revokeAll(g.accountId)],
+    [
+      "revocation by the client",
+      (t, g) =>
+        t.ik.oauth.revoke({
+          form: new URLSearchParams({ token: g.refreshToken, client_id: g.clientId }),
+          authorization: null,
+        }),
+    ],
+    [
+      "refresh token reuse",
+      async (t, g) => {
+        t.legacy.refresh.set("older", {
+          grantId: g.grantId,
+          generation: 1,
+          expiresAt: new Date(t.clock.now().getTime() + DAY),
+        });
+        await t.ik.oauth.token({ form: refreshForm(g.clientId, "older"), authorization: null });
+      },
+    ],
+    [
+      "expired legacy refresh token",
+      async (t, g) => {
+        t.legacy.refresh.set(g.refreshToken, {
+          grantId: g.grantId,
+          generation: g.input.generation,
+          expiresAt: t.clock.now(),
+        });
+        await t.ik.oauth.token({
+          form: refreshForm(g.clientId, g.refreshToken),
+          authorization: null,
+        });
+      },
+    ],
+    [
+      "account disable, then enabled again in the store",
+      async (t, g) => {
+        await t.ik.accounts.disable(g.accountId);
+        await t.store.accounts.setStatus(g.accountId, "active");
+      },
+    ],
+  ];
+  for (const [name, end] of ends) {
+    it(`a re-import after ${name} answers revoked`, async () => {
+      const t = importSetup();
+      const g = await importedGrant(t);
+      await end(t, g);
+      expect(await t.ik.oauth.listGrants(g.accountId)).toEqual([]);
+      // Restore what the legacy verifier said at the import, as a re-run would find it.
+      t.legacy.refresh.set(g.refreshToken, {
+        grantId: g.grantId,
+        generation: g.input.generation,
+        expiresAt: g.input.refreshExpiresAt,
+      });
+      expect(await t.ik.oauth.importGrant(g.input)).toEqual({ status: "revoked" });
+      expect(await t.ik.oauth.listGrants(g.accountId)).toEqual([]);
+      const refreshed = await t.ik.oauth.token({
+        form: refreshForm(g.clientId, g.refreshToken),
+        authorization: null,
+      });
+      expect(refreshed.body).toMatchObject({ error: "invalid_grant" });
+      expect(t.audit.ofType("oauth.grant_imported")).toHaveLength(1);
+    });
+  }
+
+  it("a re-import after deleteClient answers revoked for the client and its grant", async () => {
+    const t = importSetup();
+    const g = await importedGrant(t);
+    expect(await t.ik.oauth.deleteClient(g.clientId)).toBe(true);
+    expect(await t.ik.oauth.importClient(g.clientInput)).toEqual({ status: "revoked" });
+    expect(await t.ik.oauth.getClient(g.clientId)).toBeNull();
+    expect(await t.ik.oauth.importGrant(g.input)).toEqual({ status: "revoked" });
+    expect(t.audit.ofType("oauth.client_imported")).toHaveLength(1);
+  });
+
+  it("a re-import after purge answers revoked for the client", async () => {
+    const t = importSetup();
+    const accountId = await t.account();
+    const input = publicClient({ id: `idle-${accountId}` });
+    expect((await t.ik.oauth.importClient(input)).status).toBe("imported");
+    // Never used: purged once it is older than unusedDays.
+    t.clock.advanceSeconds(400 * 86_400);
+    expect((await t.ik.oauth.purge()).clients).toBe(1);
+    expect(await t.ik.oauth.importClient(input)).toEqual({ status: "revoked" });
+  });
+
+  it("a rolled-back import leaves no tombstone: the retry imports", async () => {
+    const t = importSetup();
+    const accountId = await t.account();
+    const clientInput = publicClient({ id: `retry-${accountId}` });
+    failSinkOnce(t.audit, "oauth.client_imported");
+    await expect(t.ik.oauth.importClient(clientInput)).rejects.toBeInstanceOf(
+      OAuthClientRolledBackError,
+    );
+    expect((await t.ik.oauth.importClient(clientInput)).status).toBe("imported");
+    const now = t.clock.now().getTime();
+    const grantInput: ImportOAuthGrantInput = {
+      id: `retry-g-${accountId}`,
+      accountId,
+      clientId: clientInput.id,
+      scopes: ["mcp:read"],
+      resource: RESOURCE,
+      createdAt: new Date(now - DAY),
+      expiresAt: new Date(now + DAY),
+      generation: 1,
+      refreshExpiresAt: new Date(now + DAY),
+      refreshSha256: sha256Hex("t"),
+    };
+    failSinkOnce(t.audit, "oauth.grant_imported");
+    await expect(t.ik.oauth.importGrant(grantInput)).rejects.toBeInstanceOf(
+      OperationRolledBackError,
+    );
+    expect(await t.ik.oauth.importGrant(grantInput)).toEqual({ status: "imported" });
+  });
+
+  it("an end that races with the import's store write still answers revoked", async () => {
+    // The store's import runs after a concurrent end wrote the tombstone: the store refuses.
+    const inner = createMemoryStore();
+    const oauth = inner.oauth;
+    if (!oauth) throw new Error("no oauth");
+    let beforeImport: (() => Promise<void>) | null = null;
+    const store: IdentkitStore = {
+      ...inner,
+      oauth: {
+        ...oauth,
+        importGrant: async (grant, limit) => {
+          const hook = beforeImport;
+          beforeImport = null;
+          await hook?.();
+          return oauth.importGrant(grant, limit);
+        },
+      },
+    };
+    const t = importSetup({}, store);
+    const g = await importedGrant(t);
+    // Frees the account's slot of this client for the second grant id.
+    await t.ik.oauth.revokeGrant({ accountId: g.accountId, grantId: g.grantId });
+    // A second grant id, imported and ended by another call after the import's own reads found
+    // nothing, right before its store write.
+    const fresh: ImportOAuthGrantInput = { ...g.input, id: `${g.input.id}-2` };
+    beforeImport = async () => {
+      await oauth.importGrant(
+        {
+          id: fresh.id,
+          accountId: fresh.accountId,
+          clientId: fresh.clientId,
+          scopes: fresh.scopes,
+          resource: fresh.resource,
+          createdAt: fresh.createdAt,
+          expiresAt: fresh.expiresAt,
+          generation: fresh.generation,
+          refreshRefDigest: null,
+          refreshDigest: fresh.refreshSha256,
+          refreshDigestAlgorithm: "sha256",
+          previousRefreshDigest: null,
+          refreshedAt: null,
+          refreshExpiresAt: fresh.refreshExpiresAt,
+          codeDigest: null,
+          source: "import",
+        },
+        { maxOtherGrants: 10, at: t.clock.now() },
+      );
+      await oauth.deleteGrant(fresh.id, { accountId: fresh.accountId }, t.clock.now());
+    };
+    expect(await t.ik.oauth.importGrant(fresh)).toEqual({ status: "revoked" });
+    expect(await t.ik.oauth.listGrants(g.accountId)).toEqual([]);
   });
 });
 

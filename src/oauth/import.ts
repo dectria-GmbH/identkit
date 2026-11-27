@@ -59,7 +59,12 @@ export type ImportOAuthClientResult =
   /** A client with this id and the same data exists. Nothing changed. */
   | { status: "already_imported"; client: OAuthClientView }
   /** A client with this id and other data exists, or identkit cannot tell. Nothing changed. */
-  | { status: "id_taken" };
+  | { status: "id_taken" }
+  /**
+   * An imported client with this id was deleted (`deleteClient` or `purge`). It stays deleted:
+   * nothing changed.
+   */
+  | { status: "revoked" };
 
 /**
  * A grant of an earlier system, with the state of its refresh token. The grant id is kept as
@@ -95,6 +100,12 @@ export type ImportOAuthGrantResult =
   | { status: "id_taken" }
   /** The account holds a grant of this client already. Nothing changed. */
   | { status: "account_client_taken" }
+  /**
+   * An imported grant with this id ended (revoked, replaced, reused token, expired, account
+   * disabled, client deleted or purged). It stays ended, and its earlier refresh token stays
+   * dead: nothing changed.
+   */
+  | { status: "revoked" }
   | { status: "limit_reached" }
   | { status: "expired" }
   | { status: "no_account" }
@@ -283,7 +294,12 @@ export function createImport(internals: OAuthInternals) {
           ? { status: "already_imported", client: toClientView(existing) }
           : { status: "id_taken" };
       }
-      if ((await store.insertClient(record)) !== "inserted") {
+      // A deleted imported client never comes back. The insert checks the tombstone once more,
+      // atomically with a concurrent delete.
+      if (await store.findImportTombstone("client", id)) return { status: "revoked" };
+      const inserted = await store.insertClient(record);
+      if (inserted === "revoked") return { status: "revoked" };
+      if (inserted !== "inserted") {
         // Inserted by a concurrent call between the read and the insert.
         const raced = await store.findClient(id);
         return raced && (await sameClient(raced, record, secret))
@@ -298,9 +314,10 @@ export function createImport(internals: OAuthInternals) {
           reason: algorithm ?? "none",
         });
       } catch (error) {
-        // No client stands without its audit record. If the delete fails, its error goes up
-        // and the client stands without its record.
-        await store.deleteClient(id);
+        // No client stands without its audit record. The delete writes no tombstone: for the
+        // audit trail the import did not happen, so a retry may import it. If the delete fails,
+        // its error goes up and the client stands without its record.
+        await store.rollBackImport("client", id);
         throw new OAuthClientRolledBackError(id, { cause: error });
       }
       return { status: "imported", client: toClientView(record) };
@@ -355,9 +372,10 @@ export function createImport(internals: OAuthInternals) {
         throw new InvalidArgumentError("refreshSha256 must be 64 hex characters");
       }
 
-      /** The result for a grant with this id that exists already. */
+      /** The result for a grant with this id that exists already, or that ended since. */
       const existingResult = async (): Promise<ImportOAuthGrantResult> => {
         const found = await store.findGrant(id);
+        if (!found && (await store.findImportTombstone("grant", id))) return { status: "revoked" };
         const grant = found?.grant;
         // The same grant, also after identkit rotated it since the import.
         return grant &&
@@ -370,6 +388,9 @@ export function createImport(internals: OAuthInternals) {
           : { status: "id_taken" };
       };
       if (await store.findGrant(id)) return existingResult();
+      // An ended imported grant never comes back: its legacy refresh token would work again.
+      // The store checks the tombstone once more, atomically with a concurrent end.
+      if (await store.findImportTombstone("grant", id)) return { status: "revoked" };
       const account = await ctx.store.accounts.findById(accountId);
       if (!account) return { status: "no_account" };
       if (account.status !== "active") return { status: "account_disabled" };
@@ -401,6 +422,7 @@ export function createImport(internals: OAuthInternals) {
       });
       if (inserted === "id_taken") return existingResult();
       if (inserted === "account_inactive") return { status: "account_disabled" };
+      if (inserted === "revoked") return { status: "revoked" };
       if (inserted !== "inserted") return { status: inserted };
       try {
         await ctx.emit({
@@ -412,9 +434,10 @@ export function createImport(internals: OAuthInternals) {
           method: "sha256",
         });
       } catch (error) {
-        // No grant stands without its audit record. If the delete fails, its error goes up and
-        // the grant stands without its record.
-        await store.deleteGrant(id, { accountId });
+        // No grant stands without its audit record. The delete writes no tombstone: for the
+        // audit trail the import did not happen, so a retry may import it. If the delete fails,
+        // its error goes up and the grant stands without its record.
+        await store.rollBackImport("grant", id);
         throw new OperationRolledBackError(accountId, { cause: error, hookFailed: false });
       }
       return { status: "imported" };

@@ -19,9 +19,9 @@ function brokenGrantStore() {
     ...inner,
     oauth: {
       ...oauth,
-      deleteGrantsForAccount: async (accountId) => {
+      deleteGrantsForAccount: async (accountId, at) => {
         if (broken.on) throw new Error("no such table: identkit_oauth_grants");
-        return oauth.deleteGrantsForAccount(accountId);
+        return oauth.deleteGrantsForAccount(accountId, at);
       },
     },
   };

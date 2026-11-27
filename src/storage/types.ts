@@ -263,6 +263,12 @@ export type OAuthClientSource = "dynamic" | "import";
 /** `created`: by a code exchange. `import`: by `oauth.importGrant`. */
 export type OAuthGrantSource = "created" | "import";
 
+/**
+ * What an import tombstone names. Every built-in store keeps one for each imported grant and
+ * each imported client that ended, so that a later import of the same id answers `revoked`.
+ */
+export type OAuthImportTombstoneKind = "grant" | "client";
+
 /** A registered OAuth client. The store holds only the digest of its secret. */
 export interface OAuthClientRecord {
   /** The public `client_id`. */
@@ -384,10 +390,15 @@ export type InsertOAuthGrantResult =
 
 /**
  * `id_taken`: a grant with this id exists. `account_client_taken`: the account holds a grant of
- * this client. Others as for `InsertOAuthGrantResult`.
+ * this client. `revoked`: a tombstone names the id. Others as for `InsertOAuthGrantResult`.
  */
 export type ImportOAuthGrantStoreResult =
-  "inserted" | "id_taken" | "account_client_taken" | "limit_reached" | "account_inactive";
+  | "inserted"
+  | "id_taken"
+  | "account_client_taken"
+  | "limit_reached"
+  | "account_inactive"
+  | "revoked";
 
 /** What `oauth.purge` removed in the store. */
 export interface OAuthPurgeStoreResult {
@@ -633,10 +644,19 @@ export interface IdentkitStore {
    * the store has no `oauth`. The built-in stores implement it. A grant delete removes its
    * access tokens; a client delete removes its grants and codes; an account delete removes its
    * grants and codes.
+   *
+   * Import tombstones: every call that deletes a grant or a client whose `source` is `import`
+   * writes a tombstone of its kind and id, atomically with the delete, with the time `at` of the
+   * call. Only `rollBackImport` deletes without one. Inserts and imports refuse an id that a
+   * tombstone names, so an ended imported grant or client never comes back by a new import.
    */
   oauth?: {
-    /** Inserts the client unless a client with its id exists. */
-    insertClient(client: OAuthClientRecord): Promise<"inserted" | "id_taken">;
+    /**
+     * Inserts the client unless a client with its id exists (`id_taken`) or a client tombstone
+     * names the id (`revoked`). Against a concurrent delete that writes the tombstone, the insert
+     * is either refused or deleted by it.
+     */
+    insertClient(client: OAuthClientRecord): Promise<"inserted" | "id_taken" | "revoked">;
     findClient(id: string): Promise<OAuthClientRecord | null>;
     /**
      * Atomically sets `lastUsedAt` to `at` if it is null or at most `notAfter`. Returns false
@@ -653,7 +673,7 @@ export interface IdentkitStore {
      * null if the client does not exist. A grant inserted concurrently is either returned or
      * refused (its client is gone); it is never deleted unreturned.
      */
-    deleteClient(id: string): Promise<OAuthGrantRecord[] | null>;
+    deleteClient(id: string, at: Date): Promise<OAuthGrantRecord[] | null>;
     /**
      * Counts one registration for each key in order, in the window that starts at
      * `windowStart`. Stops at the first key whose count is at `max` already and returns it;
@@ -668,7 +688,7 @@ export interface IdentkitStore {
     /** Atomically removes and returns the code. Of concurrent calls exactly one gets it. */
     consumeCode(digest: string): Promise<OAuthCodeRecord | null>;
     /** Atomically deletes and returns the grant that the code created, or null. */
-    endGrantByCode(codeDigest: string): Promise<OAuthGrantRecord | null>;
+    endGrantByCode(codeDigest: string, at: Date): Promise<OAuthGrantRecord | null>;
     /**
      * Atomically: if the account is active and holds fewer than `limit.maxOtherGrants` live
      * grants (`expiresAt` after `limit.at`) of other clients, deletes the account's grant of
@@ -682,7 +702,10 @@ export interface IdentkitStore {
       firstAccessToken: OAuthAccessTokenRecord,
       limit: { maxOtherGrants: number; at: Date },
     ): Promise<InsertOAuthGrantResult>;
-    /** As `insertGrant`, without an access token, and it never replaces a grant. */
+    /**
+     * As `insertGrant`, without an access token, and it never replaces a grant. Refuses an id
+     * that a grant tombstone names (`revoked`), also one written by a concurrent delete.
+     */
     importGrant(
       grant: OAuthGrantRecord,
       limit: { maxOtherGrants: number; at: Date },
@@ -711,12 +734,13 @@ export interface IdentkitStore {
     deleteGrant(
       id: string,
       match: { clientId: string } | { accountId: string },
+      at: Date,
     ): Promise<OAuthGrantRecord | null>;
     /**
      * Deletes every grant and code of the account and returns the grants, atomically: a failure
      * deletes nothing, so a retry still returns every grant. Idempotent.
      */
-    deleteGrantsForAccount(accountId: string): Promise<OAuthGrantRecord[]>;
+    deleteGrantsForAccount(accountId: string, at: Date): Promise<OAuthGrantRecord[]>;
     /** The grants of the account with `expiresAt` after `at`, oldest first. */
     listGrants(accountId: string, at: Date): Promise<OAuthGrantRecord[]>;
     /**
@@ -732,5 +756,14 @@ export interface IdentkitStore {
       idleBefore: Date;
       windowBefore: Date;
     }): Promise<OAuthPurgeStoreResult>;
+    /** The time of the tombstone of this kind and id, or null if there is none. */
+    findImportTombstone(kind: OAuthImportTombstoneKind, id: string): Promise<Date | null>;
+    /**
+     * Deletes an imported grant or client whose import the audit sink refused, without a
+     * tombstone: for the audit trail the import did not happen, so a retry may import it again.
+     * Matches only a row whose `source` is `import`. A client delete takes its grants and codes,
+     * without tombstones either. Returns false if no such row exists.
+     */
+    rollBackImport(kind: OAuthImportTombstoneKind, id: string): Promise<boolean>;
   };
 }

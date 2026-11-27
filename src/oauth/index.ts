@@ -167,22 +167,30 @@ export interface OAuth {
   deleteClient(clientId: string): Promise<boolean>;
   /**
    * Administrative: records a client of an earlier system. Idempotent: the same input again
-   * answers `already_imported`. Records `oauth.client_imported`; if the sink refuses it, the
-   * client is deleted again and the call throws `OAuthClientRolledBackError`.
+   * answers `already_imported`, and an imported client that was deleted since answers
+   * `revoked`. It applies the redirect URI rules of registration, not
+   * `registration.allowedAuthMethods`: an administrative import may bring a public client also
+   * where registration allows only confidential ones. Records `oauth.client_imported`; if the
+   * sink refuses it, the client is deleted again (without a tombstone, so a retry imports) and
+   * the call throws `OAuthClientRolledBackError`. A concurrent identical import may answer
+   * `already_imported` for a client that the other call then rolls back; run imports one at a
+   * time.
    */
   importClient(input: ImportOAuthClientInput): Promise<ImportOAuthClientResult>;
   /**
    * Administrative: records a grant of an earlier system, so that its legacy tokens keep
-   * working through the option `legacy`. Never replaces a grant. Idempotent. Records
-   * `oauth.grant_imported`; if the sink refuses it, the grant is deleted again and the call
-   * throws `OperationRolledBackError`.
+   * working through the option `legacy`. Never replaces a grant. Idempotent, and an imported
+   * grant that ended since answers `revoked`: it never comes back. Records
+   * `oauth.grant_imported`; if the sink refuses it, the grant is deleted again (without a
+   * tombstone, so a retry imports) and the call throws `OperationRolledBackError`.
    */
   importGrant(input: ImportOAuthGrantInput): Promise<ImportOAuthGrantResult>;
   /**
    * Administrative: deletes expired grants, codes and access tokens, registration counts of
    * earlier days, and clients by `clientRetention`: never used and older than `unusedDays`, or
    * last used more than `idleDays` ago. Never deletes a client that holds a live grant or code;
-   * an approval counts as use, so a client in the middle of a flow stays. Records
+   * an approval counts as use, so from the approval on a client in the middle of a flow stays
+   * (before it, `approve` answers `invalid_ticket` for a purged client). Records
    * `oauth.grant_ended` (reason `expired`) for each grant and `oauth.client_deleted` (reason
    * `unused` or `idle`) for each client. The deletions stand if the sink refuses an event; every
    * other event is still sent, and the first error goes up. Run it on a schedule, for example
@@ -262,7 +270,7 @@ export function createOAuth(
       }
       const accountId = requireId(input.accountId, "accountId");
       const grantId = requireId(input.grantId, "grantId");
-      const ended = await store.deleteGrant(grantId, { accountId });
+      const ended = await store.deleteGrant(grantId, { accountId }, ctx.clock.now());
       // The event after the delete: a refused event undoes no revocation.
       if (ended) await emitOAuthGrantsEnded(ctx, accountId, [ended], "revoked");
       return ended !== null;
@@ -324,7 +332,7 @@ export function createOAuth(
 
     async deleteClient(clientId) {
       requireId(clientId, "clientId");
-      const ended = await store.deleteClient(clientId);
+      const ended = await store.deleteClient(clientId, ctx.clock.now());
       if (ended === null) return false;
       // The events after the delete: a refused event undoes no deletion. A throwing sink does
       // not skip the other events; the first error goes up after all of them.

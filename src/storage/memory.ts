@@ -12,6 +12,7 @@ import type {
   OAuthClientRecord,
   OAuthCodeRecord,
   OAuthGrantRecord,
+  OAuthImportTombstoneKind,
   OAuthPurgeStoreResult,
   OidcLinkRecord,
   OtpFlowRecord,
@@ -43,6 +44,9 @@ function isFlowOpen(flow: OtpFlowRecord, at: Date): boolean {
  * In-memory store for tests, demos and single-process prototypes. JavaScript runs each
  * method body without interruption, so every method is atomic. Data is lost on exit.
  */
+/** The key of an import tombstone in the memory store. */
+const tombstoneKey = (kind: OAuthImportTombstoneKind, id: string) => `${kind}\u0000${id}`;
+
 export function createMemoryStore(): IdentkitStore {
   const accounts = new Map<string, AccountRecord>();
   const flows = new Map<string, OtpFlowRecord>();
@@ -62,16 +66,44 @@ export function createMemoryStore(): IdentkitStore {
   const oauthCodes = new Map<string, OAuthCodeRecord>();
   /** Registration counts by key and window start (ms). */
   const registrationCounts = new Map<string, number>();
+  /** Import tombstones by kind and id. */
+  const importTombstones = new Map<string, Date>();
 
-  /** Deletes the grant and its access tokens, as the foreign key cascade does. */
-  function dropGrant(id: string): OAuthGrantRecord | null {
+  /**
+   * Deletes the grant and its access tokens, as the foreign key cascade does. An imported grant
+   * gets its tombstone, unless `at` is null (a rolled-back import).
+   */
+  function dropGrant(id: string, at: Date | null): OAuthGrantRecord | null {
     const grant = oauthGrants.get(id);
     if (!grant) return null;
     oauthGrants.delete(id);
     for (const [digest, token] of oauthAccessTokens) {
       if (token.grantId === id) oauthAccessTokens.delete(digest);
     }
+    if (at !== null && grant.source === "import") {
+      importTombstones.set(tombstoneKey("grant", id), at);
+    }
     return grant;
+  }
+
+  /** Deletes the client, its grants and its codes. Returns the grants, or null. */
+  function dropClient(id: string, at: Date | null): OAuthGrantRecord[] | null {
+    const client = oauthClients.get(id);
+    if (!client) return null;
+    oauthClients.delete(id);
+    if (at !== null && client.source === "import") {
+      importTombstones.set(tombstoneKey("client", id), at);
+    }
+    const ended: OAuthGrantRecord[] = [];
+    for (const grant of oauthGrants.values()) {
+      if (grant.clientId !== id) continue;
+      const dropped = dropGrant(grant.id, at);
+      if (dropped) ended.push(dropped);
+    }
+    for (const [digest, code] of oauthCodes) {
+      if (code.clientId === id) oauthCodes.delete(digest);
+    }
+    return ended;
   }
 
   /** Live grants of the account, other than those of `exceptClientId`. */
@@ -567,6 +599,9 @@ export function createMemoryStore(): IdentkitStore {
     oauth: {
       insertClient(client) {
         if (oauthClients.has(client.id)) return Promise.resolve("id_taken");
+        if (importTombstones.has(tombstoneKey("client", client.id))) {
+          return Promise.resolve("revoked");
+        }
         oauthClients.set(client.id, copy(client));
         return Promise.resolve("inserted");
       },
@@ -592,18 +627,8 @@ export function createMemoryStore(): IdentkitStore {
         found.secretDigestAlgorithm = "hmac-sha256";
         return Promise.resolve(true);
       },
-      deleteClient(id) {
-        if (!oauthClients.delete(id)) return Promise.resolve(null);
-        const ended: OAuthGrantRecord[] = [];
-        for (const grant of oauthGrants.values()) {
-          if (grant.clientId !== id) continue;
-          const dropped = dropGrant(grant.id);
-          if (dropped) ended.push(dropped);
-        }
-        for (const [digest, code] of oauthCodes) {
-          if (code.clientId === id) oauthCodes.delete(digest);
-        }
-        return Promise.resolve(ended);
+      deleteClient(id, at) {
+        return Promise.resolve(dropClient(id, at));
       },
       reserveRegistration({ keys, windowStart }) {
         for (const { key, max } of keys) {
@@ -628,9 +653,9 @@ export function createMemoryStore(): IdentkitStore {
         oauthCodes.delete(digest);
         return Promise.resolve(found);
       },
-      endGrantByCode(codeDigest) {
+      endGrantByCode(codeDigest, at) {
         for (const grant of oauthGrants.values()) {
-          if (grant.codeDigest === codeDigest) return Promise.resolve(dropGrant(grant.id));
+          if (grant.codeDigest === codeDigest) return Promise.resolve(dropGrant(grant.id, at));
         }
         return Promise.resolve(null);
       },
@@ -657,7 +682,7 @@ export function createMemoryStore(): IdentkitStore {
         let replaced: OAuthGrantRecord | null = null;
         for (const existing of oauthGrants.values()) {
           if (existing.accountId === grant.accountId && existing.clientId === grant.clientId) {
-            replaced = dropGrant(existing.id);
+            replaced = dropGrant(existing.id, limit.at);
           }
         }
         oauthGrants.set(grant.id, copy(grant));
@@ -666,6 +691,9 @@ export function createMemoryStore(): IdentkitStore {
       },
       importGrant(grant, limit) {
         if (oauthGrants.has(grant.id)) return Promise.resolve("id_taken");
+        if (importTombstones.has(tombstoneKey("grant", grant.id))) {
+          return Promise.resolve("revoked");
+        }
         const account = accounts.get(grant.accountId);
         if (!account || account.status !== "active") return Promise.resolve("account_inactive");
         const taken = [...oauthGrants.values()].some(
@@ -713,20 +741,20 @@ export function createMemoryStore(): IdentkitStore {
           accountStatus: account.status,
         });
       },
-      deleteGrant(id, match) {
+      deleteGrant(id, match, at) {
         const found = oauthGrants.get(id);
         if (!found) return Promise.resolve(null);
         const owned =
           "clientId" in match
             ? found.clientId === match.clientId
             : found.accountId === match.accountId;
-        return Promise.resolve(owned ? dropGrant(id) : null);
+        return Promise.resolve(owned ? dropGrant(id, at) : null);
       },
-      deleteGrantsForAccount(accountId) {
+      deleteGrantsForAccount(accountId, at) {
         const ended: OAuthGrantRecord[] = [];
         for (const grant of oauthGrants.values()) {
           if (grant.accountId !== accountId) continue;
-          const dropped = dropGrant(grant.id);
+          const dropped = dropGrant(grant.id, at);
           if (dropped) ended.push(dropped);
         }
         for (const [digest, code] of oauthCodes) {
@@ -749,7 +777,7 @@ export function createMemoryStore(): IdentkitStore {
         const grants: OAuthGrantRecord[] = [];
         for (const grant of oauthGrants.values()) {
           if (grant.expiresAt.getTime() > now) continue;
-          const dropped = dropGrant(grant.id);
+          const dropped = dropGrant(grant.id, at);
           if (dropped) grants.push(dropped);
         }
         let codes = 0;
@@ -782,7 +810,8 @@ export function createMemoryStore(): IdentkitStore {
                 ? "idle"
                 : null;
           if (reason === null) continue;
-          oauthClients.delete(client.id);
+          // No grant of it is left (no live one, the expired ones went above): nothing cascades.
+          dropClient(client.id, at);
           clients.push({ id: client.id, reason });
         }
         let registrationWindows = 0;
@@ -794,6 +823,20 @@ export function createMemoryStore(): IdentkitStore {
           }
         }
         return Promise.resolve({ clients, grants, codes, accessTokens, registrationWindows });
+      },
+      findImportTombstone(kind, id) {
+        const at = importTombstones.get(tombstoneKey(kind, id));
+        return Promise.resolve(at ? new Date(at) : null);
+      },
+      rollBackImport(kind, id) {
+        if (kind === "grant") {
+          if (oauthGrants.get(id)?.source !== "import") return Promise.resolve(false);
+          dropGrant(id, null);
+          return Promise.resolve(true);
+        }
+        if (oauthClients.get(id)?.source !== "import") return Promise.resolve(false);
+        dropClient(id, null);
+        return Promise.resolve(true);
       },
     },
   };
