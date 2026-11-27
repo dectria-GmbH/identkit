@@ -212,9 +212,13 @@ describe("oidc sign-in", () => {
   it("rule: a Microsoft guest never binds by default; allowGuests binds it by xms_edov only", async () => {
     const t = await oidcSetup({ microsoftTenant: TENANT, microsoft: { upnAsAddress: true } });
     const refusedAsGuest = { status: "refused", reason: "guest_account" };
-    // An invited personal account: Microsoft marks its address verified, idp is live.com.
+    // An invited personal account: Microsoft marks its address verified, idp is live.com. It is
+    // a personal account, so binding rule 2 refuses it first.
     const personalGuest = msClaims("victim@mail.example", { idp: "live.com" });
-    expect(await t.signInWith("microsoft", personalGuest)).toEqual(refusedAsGuest);
+    expect(await t.signInWith("microsoft", personalGuest)).toEqual({
+      status: "refused",
+      reason: "consumer_tenant",
+    });
     // A guest homed in another tenant: idp is that tenant's STS.
     const tenantGuest = msClaims("g@fabrikam.example", {
       idp: `https://sts.windows.net/${OTHER_TENANT}/`,
@@ -232,7 +236,7 @@ describe("oidc sign-in", () => {
     });
     expect(await t.signInWith("microsoft", federatedGuest)).toEqual(refusedAsGuest);
     expect(t.audit.ofType("oidc.binding_refused").map((e) => e.reason)).toEqual([
-      "guest_account",
+      "consumer_tenant",
       "guest_account",
       "guest_account",
       "guest_account",
@@ -255,14 +259,36 @@ describe("oidc sign-in", () => {
       microsoftTenant: TENANT,
       microsoft: { upnAsAddress: true, allowGuests: true },
     });
-    const bound = await open.signInWith("microsoft", personalGuest);
+    const bound = await open.signInWith("microsoft", tenantGuest);
     if (bound.status !== "signed_in") throw new Error(bound.status);
-    expect(bound.account.email).toBe("victim@mail.example");
+    expect(bound.account.email).toBe("g@fabrikam.example");
     // Never by preferred_username for a guest, even with upnAsAddress.
     expect(await open.signInWith("microsoft", federatedGuest)).toEqual({
       status: "refused",
       reason: "unverified_address",
     });
+  });
+
+  it("rule: an invited personal Microsoft account never binds, also with allowGuests", async () => {
+    const open = await oidcSetup({
+      microsoftTenant: TENANT,
+      microsoft: { upnAsAddress: true, allowGuests: true },
+    });
+    const personalIdps = [
+      "live.com",
+      "LIVE.COM",
+      "https://login.live.com",
+      `https://sts.windows.net/${MICROSOFT_CONSUMER_TENANT_ID}/`,
+      `https://login.microsoftonline.com/${MICROSOFT_CONSUMER_TENANT_ID.toUpperCase()}/v2.0`,
+    ];
+    for (const idp of personalIdps) {
+      const email = `p${guid()}@mail.example`;
+      expect(await open.signInWith("microsoft", msClaims(email, { idp })), idp).toEqual({
+        status: "refused",
+        reason: "consumer_tenant",
+      });
+      expect(await open.ik.accounts.findByEmail(email), idp).toBeNull();
+    }
   });
 
   it("rule: an address that normalization changes beyond ASCII case does not bind", async () => {

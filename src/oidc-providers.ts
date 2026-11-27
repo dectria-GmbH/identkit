@@ -225,6 +225,8 @@ export interface MicrosoftProviderOptions extends CommonOptions {
    * Let a guest account (a user homed in another tenant or at another identity provider, signed
    * in to the authority tenant) bind by its `email` with `xms_edov` true. Default false: a guest
    * never binds by address. A guest with a link (for example an imported one) signs in either way.
+   * An invited personal Microsoft account (`idp` `live.com` or the consumer tenant) never binds,
+   * also with this option (`consumer_tenant`).
    */
   allowGuests?: boolean;
   /** Default `select_account`; null sends no prompt. */
@@ -292,7 +294,8 @@ export function microsoftProvider(options: MicrosoftProviderOptions): OidcProvid
         const email = emailClaim(claims);
         const upn = claims["preferred_username"];
         const guest = isMicrosoftGuest(claims, tenantId);
-        if (consumer) {
+        // A personal account never binds, also when invited as a guest into a work tenant.
+        if (consumer || isPersonalMicrosoftIdp(claims["idp"])) {
           address = { ok: false, reason: "consumer_tenant" };
         } else if (guest && !allowGuests) {
           address = { ok: false, reason: "guest_account" };
@@ -344,6 +347,27 @@ function isMicrosoftGuest(claims: Record<string, unknown>, tenantId: string): bo
     url.hostname === "sts.windows.net" || url.hostname === "login.microsoftonline.com";
   const firstSegment = url.pathname.split("/")[1]?.toLowerCase();
   return !(url.protocol === "https:" && stsHost && firstSegment === tenantId);
+}
+
+/**
+ * True if `idp` names a Microsoft personal account: `live.com` (any case, also as a URL with a
+ * host under `live.com`) or a Microsoft STS URI of the consumer tenant. Microsoft documents both
+ * for a personal account invited as a guest.
+ */
+function isPersonalMicrosoftIdp(idp: unknown): boolean {
+  if (typeof idp !== "string") return false;
+  const plain = idp.trim().toLowerCase();
+  if (plain === "live.com") return true;
+  let url: URL;
+  try {
+    url = new URL(plain);
+  } catch {
+    return false;
+  }
+  if (url.hostname === "live.com" || url.hostname.endsWith(".live.com")) return true;
+  const stsHost =
+    url.hostname === "sts.windows.net" || url.hostname === "login.microsoftonline.com";
+  return stsHost && url.pathname.split("/")[1] === MICROSOFT_CONSUMER_TENANT_ID;
 }
 
 export interface GoogleProviderOptions extends CommonOptions {

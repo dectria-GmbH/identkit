@@ -603,8 +603,8 @@ Providers:
   `consumers` or a tenant id. Scopes `openid email profile`, `prompt=select_account` by default.
   The multi-tenant endpoints sign tokens for every tenant, so identkit checks that `iss` is
   `https://login.microsoftonline.com/{tid}/v2.0` for the token's own `tid`. `allowedTenants`
-  limits sign-in to those tenant ids. `allowGuests` (default false) lets a guest bind by address;
-  see the binding rules.
+  limits sign-in to those tenant ids. `allowGuests` (default false) lets a guest bind by address,
+  but never a personal account; see the binding rules.
 - `googleProvider({ clientId, clientSecret, redirectUri, hostedDomains?, prompt? })`: issuer
   `https://accounts.google.com` (also accepted without `https://`, as Google documents).
   `hostedDomains` limits sign-in to those Workspace domains (`hd` claim).
@@ -669,9 +669,11 @@ First binding (no link for the subject yet), in this order:
 
 1. `allowedTenants`, a tenant authority, or `hostedDomains` refuse other organizations
    (`organization_not_allowed`), for every sign-in, linked or not.
-2. Microsoft personal accounts (tenant `9188040d-6c67-4c5b-b112-36a304b66dad`) never bind
-   (`consumer_tenant`). This is identkit's requirement, not a claim that Microsoft leaves their
-   address unchecked: a personal account belongs to no organization's tenant, so no tenant
+2. Microsoft personal accounts never bind (`consumer_tenant`), also with `allowGuests: true`: a
+   token of the consumer tenant (`9188040d-6c67-4c5b-b112-36a304b66dad`), and a personal account
+   invited as a guest into a work tenant (`idp` is `live.com`, a host under `live.com`, or an STS
+   URI of the consumer tenant). This is identkit's requirement, not a claim that Microsoft leaves
+   their address unchecked: a personal account belongs to no organization's tenant, so no tenant
    administrator has verified the domain of its address, which is what `xms_edov` reports for a
    work account. A link you import for one still signs in.
 3. Microsoft guests never bind by default (`guest_account`): a user who is homed in another
@@ -680,8 +682,9 @@ First binding (no link for the subject yet), in this order:
    or if `idp` is present and is neither `iss` nor a Microsoft STS URI of the token's own tenant
    (Microsoft documents `idp` as equal to the issuer except for users from another tenant, and as
    `live.com` or the consumer tenant for an invited personal account). An unknown `idp` form
-   counts as a guest, so it fails closed. With `allowGuests: true` a guest binds by `email` with
-   `xms_edov` true, never by `preferred_username`. A link you import for a guest still signs in.
+   counts as a guest, so it fails closed. With `allowGuests: true` a guest (except a personal
+   account, see rule 2) binds by `email` with `xms_edov` true, never by `preferred_username`. A
+   link you import for a guest still signs in.
 4. The address must be verified by the provider (`unverified_address` otherwise): Google and
    other providers by `email_verified` true. Microsoft by `email` with the optional claim
    `xms_edov` true (add the optional claims `email` and `xms_edov` to the app registration). With
