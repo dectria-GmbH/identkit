@@ -2,7 +2,7 @@
 
 Identity toolkit for TypeScript: accounts, e-mail codes, passkeys, TOTP, sessions, step-up and approval evidence.
 
-Status: early development, release 0.1.1. It covers sign-in by e-mail code, passkeys, TOTP
+Status: early development, release 0.2.0. It covers sign-in by e-mail code, passkeys, TOTP
 (authenticator apps), sessions, step-up, approval evidence at two levels, an identity
 verification port and storage. See "Not built" for what comes later.
 
