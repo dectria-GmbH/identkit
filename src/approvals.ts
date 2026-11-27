@@ -1,4 +1,5 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
+import { randomBytes, toBase64Url } from "./bytes.js";
 import { addSeconds } from "./clock.js";
 import type { ApprovalEvidenceLevel } from "./config.js";
 import type { Context } from "./context.js";
@@ -370,7 +371,7 @@ export function createApprovals(
     session: { id: string; accountId: string },
     allow: { id: string; transports: string[] }[],
   ): Promise<StartApprovalResult> {
-    const nonce = randomBytes(32).toString("base64url");
+    const nonce = toBase64Url(randomBytes(32));
     const challenge = approvalChallenge(nonce, input.payloadHash, session.accountId);
     const { record } = await core.issueChallenge(
       "approval",

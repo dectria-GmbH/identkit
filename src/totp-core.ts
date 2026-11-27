@@ -1,8 +1,8 @@
 /**
- * TOTP primitives (RFC 6238 over HOTP, RFC 4226) with `node:crypto` only. No storage, no
- * policy: the TOTP service in `totp.ts` applies those.
+ * TOTP primitives (RFC 6238 over HOTP, RFC 4226) with the Web Crypto API only. No storage,
+ * no policy: the TOTP service in `totp.ts` applies those.
  */
-import { createHmac, randomBytes } from "node:crypto";
+import { hmac, importHmacKey, randomBytes, type HashName, type WebCryptoKey } from "./bytes.js";
 import { digestsEqual } from "./crypto.js";
 
 export type TotpAlgorithm = "SHA1" | "SHA256" | "SHA512";
@@ -18,10 +18,10 @@ export const TOTP_PERIOD_SECONDS = 30;
  */
 export const TOTP_INTEROPERABLE_PARAMETERS = { algorithm: "SHA1", digits: 6 } as const;
 
-const NODE_ALGORITHM: Record<TotpAlgorithm, string> = {
-  SHA1: "sha1",
-  SHA256: "sha256",
-  SHA512: "sha512",
+const HASH: Record<TotpAlgorithm, HashName> = {
+  SHA1: "SHA-1",
+  SHA256: "SHA-256",
+  SHA512: "SHA-512",
 };
 
 /**
@@ -34,7 +34,7 @@ export const TOTP_SECRET_BYTES: Record<TotpAlgorithm, number> = {
   SHA512: 64,
 };
 
-export function generateTotpSecret(algorithm: TotpAlgorithm): Buffer {
+export function generateTotpSecret(algorithm: TotpAlgorithm): Uint8Array {
   return randomBytes(TOTP_SECRET_BYTES[algorithm]);
 }
 
@@ -43,18 +43,16 @@ export function timeStepAt(at: Date): number {
   return Math.floor(at.getTime() / 1000 / TOTP_PERIOD_SECONDS);
 }
 
-/** HOTP value (RFC 4226) for one counter value. */
-export function hotp(
-  secret: Uint8Array,
-  counter: number,
-  algorithm: TotpAlgorithm,
-  digits: TotpDigits,
-): string {
+/** The 8-byte big-endian counter message of HOTP. */
+function counterMessage(counter: number): Uint8Array {
   if (!Number.isSafeInteger(counter) || counter < 0) throw new RangeError("invalid counter");
-  const message = Buffer.alloc(8);
-  message.writeBigUInt64BE(BigInt(counter));
-  const mac = createHmac(NODE_ALGORITHM[algorithm], secret).update(message).digest();
-  // Dynamic truncation, RFC 4226 section 5.3.
+  const message = new Uint8Array(8);
+  new DataView(message.buffer).setBigUint64(0, BigInt(counter));
+  return message;
+}
+
+/** Dynamic truncation, RFC 4226 section 5.3, of an HMAC value to `digits` digits. */
+export function truncateHotp(mac: Uint8Array, digits: TotpDigits): string {
   const offset = (mac[mac.length - 1] ?? 0) & 0x0f;
   const binary =
     (((mac[offset] ?? 0) & 0x7f) << 24) |
@@ -64,13 +62,31 @@ export function hotp(
   return (binary % 10 ** digits).toString().padStart(digits, "0");
 }
 
+async function hotpWithKey(
+  key: WebCryptoKey,
+  counter: number,
+  digits: TotpDigits,
+): Promise<string> {
+  return truncateHotp(await hmac(key, counterMessage(counter)), digits);
+}
+
+/** HOTP value (RFC 4226) for one counter value. */
+export async function hotp(
+  secret: Uint8Array,
+  counter: number,
+  algorithm: TotpAlgorithm,
+  digits: TotpDigits,
+): Promise<string> {
+  return hotpWithKey(await importHmacKey(secret, HASH[algorithm]), counter, digits);
+}
+
 /** TOTP value (RFC 6238) for the time step that contains `at`. */
 export function totpAt(
   secret: Uint8Array,
   at: Date,
   algorithm: TotpAlgorithm,
   digits: TotpDigits,
-): string {
+): Promise<string> {
   return hotp(secret, timeStepAt(at), algorithm, digits);
 }
 
@@ -80,20 +96,26 @@ export function totpAt(
  * the work does not depend on where (or whether) the code matches. If several steps match,
  * the latest one is returned, so accepting it consumes the most.
  */
-export function matchTimeStep(input: {
+export async function matchTimeStep(input: {
   secret: Uint8Array;
   code: string;
   at: Date;
   driftSteps: number;
   algorithm: TotpAlgorithm;
   digits: TotpDigits;
-}): number | null {
+}): Promise<number | null> {
   const current = timeStepAt(input.at);
-  let matched: number | null = null;
+  const steps: number[] = [];
   for (let step = current - input.driftSteps; step <= current + input.driftSteps; step += 1) {
-    const candidate = hotp(input.secret, step, input.algorithm, input.digits);
-    if (digestsEqual(candidate, input.code)) matched = step;
+    counterMessage(step);
+    steps.push(step);
   }
+  const key = await importHmacKey(input.secret, HASH[input.algorithm]);
+  const candidates = await Promise.all(steps.map((step) => hotpWithKey(key, step, input.digits)));
+  let matched: number | null = null;
+  candidates.forEach((candidate, index) => {
+    if (digestsEqual(candidate, input.code)) matched = steps[index] ?? null;
+  });
   return matched;
 }
 
@@ -117,7 +139,7 @@ export function base32Encode(bytes: Uint8Array): string {
 }
 
 /** Decodes RFC 4648 base32 (case-insensitive, padding optional). Throws on other input. */
-export function base32Decode(text: string): Buffer {
+export function base32Decode(text: string): Uint8Array {
   const clean = text.toUpperCase().replace(/=+$/, "");
   let bits = 0;
   let value = 0;
@@ -132,7 +154,7 @@ export function base32Decode(text: string): Buffer {
       bits -= 8;
     }
   }
-  return Buffer.from(output);
+  return Uint8Array.from(output);
 }
 
 /**

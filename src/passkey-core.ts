@@ -1,6 +1,6 @@
-import { timingSafeEqual } from "node:crypto";
 import { addSeconds } from "./clock.js";
 import type { Context } from "./context.js";
+import { bytesEqual } from "./bytes.js";
 import { randomId, randomToken } from "./crypto.js";
 import type {
   AccountRecord,
@@ -15,10 +15,6 @@ import {
   type AuthenticationResponseJSON,
   type RelyingParty,
 } from "./webauthn.js";
-
-function timingSafeEqualBytes(a: Uint8Array, b: Uint8Array): boolean {
-  return a.byteLength === b.byteLength && timingSafeEqual(a, b);
-}
 
 export interface ChallengeBinding {
   accountId: string | null;
@@ -163,7 +159,7 @@ export function createPasskeyCore(ctx: Context): PasskeyCore {
       if (
         !current ||
         current.accountId !== credential.accountId ||
-        !timingSafeEqualBytes(current.publicKey, credential.publicKey)
+        !bytesEqual(current.publicKey, credential.publicKey)
       ) {
         return false;
       }

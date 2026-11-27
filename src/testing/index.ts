@@ -1,10 +1,17 @@
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHmac } from "node:crypto";
 import type { AuditEvent, AuditSink } from "../audit.js";
+import { bytesEqual, randomBytes, toBase64Url, utf8 } from "../bytes.js";
 import { addSeconds, type Clock } from "../clock.js";
 import type { MailSender } from "../context.js";
 import type { IdentityVerificationAdapter, VendorResult } from "../identity-verification.js";
 import { createAesGcmSealer, SealedSecretError, type SecretSealer } from "../sealer.js";
-import { base32Decode, totpAt, type TotpAlgorithm, type TotpDigits } from "../totp-core.js";
+import {
+  base32Decode,
+  timeStepAt,
+  truncateHotp,
+  type TotpAlgorithm,
+  type TotpDigits,
+} from "../totp-core.js";
 import type { AssuranceLevel } from "../storage/types.js";
 
 export {
@@ -56,7 +63,13 @@ export function generateTotpCode(input: {
   algorithm?: TotpAlgorithm;
   digits?: TotpDigits;
 }): string {
-  return totpAt(base32Decode(input.secret), input.at, input.algorithm ?? "SHA1", input.digits ?? 6);
+  const algorithm = input.algorithm ?? "SHA1";
+  const message = new Uint8Array(8);
+  new DataView(message.buffer).setBigUint64(0, BigInt(timeStepAt(input.at)));
+  const mac = createHmac(algorithm.toLowerCase(), base32Decode(input.secret))
+    .update(message)
+    .digest();
+  return truncateHotp(mac, input.digits ?? 6);
 }
 
 export interface FakeClock extends Clock {
@@ -150,7 +163,7 @@ export interface FakeIdentityVerificationAdapter extends IdentityVerificationAda
 export function createFakeIdentityVerificationAdapter(
   options: FakeIdentityVerificationOptions,
 ): FakeIdentityVerificationAdapter {
-  const secret = options.callbackSecret ?? randomBytes(32).toString("base64url");
+  const secret = options.callbackSecret ?? toBase64Url(randomBytes(32));
   const state = new Map<string, { outcome: FakeOutcome; personKey: string }>();
   let counter = 0;
 
@@ -181,9 +194,7 @@ export function createFakeIdentityVerificationAdapter(
       if (typeof vendorReference !== "string" || typeof signature !== "string") {
         return Promise.reject(new Error("malformed callback"));
       }
-      const expected = Buffer.from(sign(vendorReference));
-      const actual = Buffer.from(signature);
-      if (expected.byteLength !== actual.byteLength || !timingSafeEqual(expected, actual)) {
+      if (!bytesEqual(utf8(sign(vendorReference)), utf8(signature))) {
         return Promise.reject(new Error("callback signature invalid"));
       }
       return Promise.resolve({ vendorReference });

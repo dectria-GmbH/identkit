@@ -1,5 +1,5 @@
 import type { Context } from "./context.js";
-import { randomBytes } from "node:crypto";
+import { randomBytes, toBase64Url } from "./bytes.js";
 import { randomId } from "./crypto.js";
 import { normalizeEmail } from "./email.js";
 import { throttleKey as otpThrottleKey } from "./email-otp.js";
@@ -63,7 +63,7 @@ export function newAccountRecord(email: string, createdAt: Date): AccountRecord 
   return {
     id: randomId(),
     email,
-    webauthnUserId: randomBytes(32).toString("base64url"),
+    webauthnUserId: toBase64Url(randomBytes(32)),
     status: "active",
     createdAt,
     personKeyDigest: null,

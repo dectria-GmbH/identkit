@@ -1,4 +1,14 @@
-import { createHmac, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
+import {
+  bytesEqual,
+  hmac,
+  importHmacKey,
+  randomBytes,
+  randomInt,
+  toBase64Url,
+  toHex,
+  utf8,
+  type WebCryptoKey,
+} from "./bytes.js";
 
 /**
  * Domain separation labels for keyed hashes. A hash made for one purpose never matches
@@ -31,14 +41,14 @@ export function createHmacHasher(key: Uint8Array): SecretHasher {
   if (key.byteLength < MIN_HASH_KEY_BYTES) {
     throw new RangeError(`hash key must have at least ${MIN_HASH_KEY_BYTES} bytes`);
   }
-  const keyCopy = Buffer.from(key);
+  // Copy now, so a later change to `key` has no effect. The key is imported on the first
+  // digest, not here: some runtimes allow no crypto work while a module is loading.
+  const keyCopy = new Uint8Array(key);
+  let imported: Promise<WebCryptoKey> | undefined;
   return {
-    digest: (purpose, value) => {
-      const mac = createHmac("sha256", keyCopy);
-      mac.update(purpose, "utf8");
-      mac.update("\u0000", "utf8");
-      mac.update(value, "utf8");
-      return Promise.resolve(mac.digest("hex"));
+    digest: async (purpose, value) => {
+      imported ??= importHmacKey(keyCopy, "SHA-256");
+      return toHex(await hmac(await imported, utf8(`${purpose}\u0000${value}`)));
     },
   };
 }
@@ -47,11 +57,11 @@ export function createHmacHasher(key: Uint8Array): SecretHasher {
 export const TOKEN_BYTES = 32;
 
 export function randomToken(): string {
-  return randomBytes(TOKEN_BYTES).toString("base64url");
+  return toBase64Url(randomBytes(TOKEN_BYTES));
 }
 
 export function randomId(): string {
-  return randomBytes(16).toString("base64url");
+  return toBase64Url(randomBytes(16));
 }
 
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
@@ -72,12 +82,5 @@ export function randomNumericCode(): string {
 
 /** Constant-time comparison of two hex digests. Different lengths compare unequal. */
 export function digestsEqual(a: string, b: string): boolean {
-  const left = Buffer.from(a, "utf8");
-  const right = Buffer.from(b, "utf8");
-  if (left.byteLength !== right.byteLength) {
-    // Compare against itself so both branches do comparable work.
-    timingSafeEqual(left, left);
-    return false;
-  }
-  return timingSafeEqual(left, right);
+  return bytesEqual(utf8(a), utf8(b));
 }
