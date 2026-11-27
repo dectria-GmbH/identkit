@@ -25,10 +25,14 @@ export interface D1StoreOptions {
   throttleRetries?: number;
   /**
    * Set this only if `db` is a D1 session that you started with
-   * `env.DB.withSession("first-primary")`. Without it, `createD1Store` refuses a D1 session
-   * (an object with `getBookmark`). A session with another constraint can read from a read
-   * replica that lags behind the primary, so a revoked session, a disabled account or a new
-   * lock can read as not yet written. The plain binding (`env.DB`) needs no option.
+   * `env.DB.withSession("first-primary")` in the same request. Without it, `createD1Store`
+   * refuses a D1 session (an object with `getBookmark`). Only the first query of such a session
+   * goes to the primary; later queries can go to a read replica that is as recent as that first
+   * query. So start a new session and a new store in each request (each Worker invocation), and
+   * never keep either at module scope or reuse it in a later request: a reused session can read
+   * a replica that has not seen a revoked session, a disabled account or a new lock. A session
+   * with another constraint can read such a replica at once. The plain binding (`env.DB`) reads
+   * only from the primary and needs no option.
    */
   sessionConstraint?: "first-primary";
 }

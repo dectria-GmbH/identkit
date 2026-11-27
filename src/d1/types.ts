@@ -10,10 +10,12 @@ export interface D1PreparedStatementLike {
 }
 
 /**
- * Pass the plain binding (`env.DB`), which reads from the primary. A D1 session
+ * Pass the plain binding (`env.DB`), which reads only from the primary. A D1 session
  * (`env.DB.withSession(...)`) fits this type too, but `createD1Store` accepts one only with the
- * option `sessionConstraint: "first-primary"`: a session with another constraint or from a
- * bookmark can read from a lagging read replica.
+ * option `sessionConstraint: "first-primary"`, and only a session new in this request: a session
+ * with another constraint, from a bookmark, or reused from an earlier request can read from a
+ * lagging read replica. A wrapper around a session must forward `getBookmark`, or the store
+ * cannot detect the session.
  */
 export interface D1DatabaseLike {
   prepare(query: string): D1PreparedStatementLike;

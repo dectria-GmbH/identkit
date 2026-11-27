@@ -13,6 +13,7 @@ import {
   type D1DatabaseLike,
 } from "../../src/d1/index.js";
 import type { IdentkitStore, SessionRecord } from "../../src/storage/types.js";
+import { hashPayload } from "../../src/index.js";
 import { mfaPolicy, setup } from "../helpers.js";
 import { runStoreContract } from "../store-contract.js";
 import { runStoreFlows } from "../store-flows.js";
@@ -161,6 +162,55 @@ describe("d1", { timeout: 30_000 }, () => {
       const changed = { ...first, sql: "CREATE TABLE identkit_a (id TEXT);\n" };
       await expect(migrateIdentkitD1(db, { migrations: [changed] })).rejects.toThrow(
         /0001_a\.sql differs from the applied one/,
+      );
+    } finally {
+      await stop();
+    }
+  }, 60_000);
+
+  it("migrations: two statements on one line are refused before anything runs", async () => {
+    // D1 runs every statement of a prepared string, so the second one would run unchecked.
+    const { db, stop } = await startLocalD1();
+    try {
+      const twoOnOneLine = {
+        name: "0001_a.sql",
+        sql: "CREATE TABLE identkit_a (id TEXT); CREATE TABLE app_b (id TEXT);\n",
+      };
+      await expect(migrateIdentkitD1(db, { migrations: [twoOnOneLine] })).rejects.toThrow(
+        /0001_a\.sql has a statement with an inner ";"/,
+      );
+      expect(
+        await db
+          .prepare("SELECT name FROM sqlite_master WHERE name IN ('identkit_a', 'app_b')")
+          .all(),
+      ).toMatchObject({ results: [] });
+    } finally {
+      await stop();
+    }
+  }, 60_000);
+
+  it("migrations: a record table without checksum gets the column and its rows are refused", async () => {
+    const { db, stop } = await startLocalD1();
+    try {
+      // The shape that the runner before checksums created.
+      const oldShape =
+        "CREATE TABLE identkit_migrations (name TEXT NOT NULL PRIMARY KEY, applied_at INTEGER NOT NULL)";
+      await db.prepare(oldShape).run();
+      const first = { name: "0001_a.sql", sql: "CREATE TABLE identkit_a (id TEXT);\n" };
+      const second = { name: "0002_b.sql", sql: "CREATE TABLE identkit_b (id TEXT);\n" };
+      // An empty old table: the column is added and new records carry their checksum.
+      expect(await migrateIdentkitD1(db, { migrations: [first] })).toEqual(["0001_a.sql"]);
+      const row = await db
+        .prepare("SELECT checksum FROM identkit_migrations WHERE name = '0001_a.sql'")
+        .first();
+      expect(row?.["checksum"]).toMatch(/^[0-9a-f]{64}$/);
+      expect(await migrateIdentkitD1(db, { migrations: [first] })).toEqual([]);
+      // A row from the old runner has no checksum: refused with a clear message.
+      await db
+        .prepare("INSERT INTO identkit_migrations (name, applied_at) VALUES ('0002_b.sql', 0)")
+        .run();
+      await expect(migrateIdentkitD1(db, { migrations: [first, second] })).rejects.toThrow(
+        /0002_b\.sql was applied without a checksum/,
       );
     } finally {
       await stop();
@@ -356,36 +406,86 @@ describe("d1", { timeout: 30_000 }, () => {
     // Counts the queries of the heaviest calls that reserve a throttle, uncontended, and adds
     // the extra rounds that contention can cost (each lost round: 2 queries).
     const recorded = recordingD1(requireDb());
-    const t = setup({ store: createD1Store(recorded.db), policy: mfaPolicy });
-    const count = async (call: () => Promise<unknown>) => {
+    const t = setup({
+      store: createD1Store(recorded.db),
+      policy: { ...mfaPolicy, approvalEvidenceLevels: ["signature", "code-confirmation"] },
+    });
+    // Counts the queries of one call and checks that the call succeeded, so a refused call
+    // (fewer queries) cannot pass as a measurement.
+    const count = async <R extends { status: string }>(call: () => Promise<R>, status: string) => {
       recorded.calls.length = 0;
-      await call();
-      return recorded.calls.length;
+      const result = await call();
+      expect(result.status).toBe(status);
+      return { queries: recorded.calls.length, result };
     };
     const flow = await t.codeFor("d1-budget@example.org");
-    const signIn = await count(() => t.ik.emailSignIn.verifyCode(flow));
+    const signIn = await count(() => t.ik.emailSignIn.verifyCode(flow), "signed_in");
     const user = await t.signIn("d1-budget-3@example.org");
     const start = await t.ik.totp.startEnrolment(user.token);
     if (start.status !== "ok") throw new Error(start.reason);
-    const enrol = await count(() =>
-      t.ik.totp.confirmEnrolment(user.token, {
-        factorId: start.factorId,
-        code: t.totpCode(start.secret),
-      }),
+    const enrol = await count(
+      () =>
+        t.ik.totp.confirmEnrolment(user.token, {
+          factorId: start.factorId,
+          code: t.totpCode(start.secret),
+        }),
+      "enrolled",
     );
     t.clock.advanceSeconds(60);
     const pendingFlow = await t.codeFor("d1-budget-3@example.org");
     const pending = await t.ik.emailSignIn.verifyCode(pendingFlow);
     if (pending.status !== "second_factor_required") throw new Error(pending.status);
-    const second = await count(() =>
-      t.ik.totp.verifySecondFactor(pending.pendingToken, { code: t.totpCode(start.secret) }),
+    const second = await count(
+      () => t.ik.totp.verifySecondFactor(pending.pendingToken, { code: t.totpCode(start.secret) }),
+      "signed_in",
     );
     t.clock.advanceSeconds(60);
-    const stepUp = await count(() =>
-      t.ik.stepUp.verifyTotp(user.token, { code: t.totpCode(start.secret) }),
+    const stepUp = await count(
+      () => t.ik.stepUp.verifyTotp(user.token, { code: t.totpCode(start.secret) }),
+      "granted",
     );
-    // Measured 2026-11-27: sign-in 14, enrolment 17, second factor 12, step-up 11 queries.
-    const heaviest = Math.max(signIn, enrol, second, stepUp);
+    if (stepUp.result.status !== "granted") throw new Error(stepUp.result.status);
+    // A step-up issues a new session token.
+    const token = stepUp.result.token;
+    t.clock.advanceSeconds(60);
+    const payloadHash = hashPayload("d1-budget-approval");
+    const approval = await t.ik.approvals.start({
+      sessionToken: token,
+      payloadHash,
+      levels: ["code-confirmation"],
+    });
+    if (approval.status !== "ok" || approval.level !== "code-confirmation") {
+      throw new Error(`no code confirmation: ${approval.status}`);
+    }
+    const approve = await count(
+      () =>
+        t.ik.approvals.verify({
+          sessionToken: token,
+          payloadHash,
+          approvalId: approval.approvalId,
+          code: t.totpCode(start.secret),
+        }),
+      "approved",
+    );
+    const emailStepUp = await t.ik.stepUp.requestEmailCode(token);
+    if (emailStepUp.status !== "sent") throw new Error(emailStepUp.status);
+    const stepUpEmail = await count(
+      () =>
+        t.ik.stepUp.verifyEmailCode(token, {
+          flowId: emailStepUp.flowId,
+          code: t.mail.last()?.code ?? "",
+        }),
+      "granted",
+    );
+    const measured = Object.fromEntries(
+      Object.entries({ signIn, enrol, second, stepUp, approve, stepUpEmail }).map(([k, v]) => [
+        k,
+        v.queries,
+      ]),
+    );
+    // Measured 2026-11-27: sign-in 14, enrolment 17, second factor 12, TOTP step-up 11,
+    // approval by code confirmation 13, e-mail code step-up 10 queries.
+    const heaviest = Math.max(...Object.values(measured));
     expect(heaviest + 2 * (D1_DEFAULT_THROTTLE_RETRIES - 1)).toBeLessThanOrEqual(
       FREE_QUERIES_PER_INVOCATION,
     );

@@ -570,12 +570,25 @@ lockout can read as not yet set. So `createD1Store` refuses a D1 session (an obj
 `env.DB.withSession("first-primary")` and state that with the option:
 
 ```ts
+// Inside the fetch handler: a new session and a new store for each request.
 const db = env.DB.withSession("first-primary");
 const store = createD1Store(db, { sessionConstraint: "first-primary" });
 ```
 
+Only the first query of a `"first-primary"` session goes to the primary. Later queries of the
+session can go to a read replica that is as recent as that first query (Cloudflare,
+[D1 read replication](https://developers.cloudflare.com/d1/best-practices/read-replication/),
+read 2026-11-27). Inside one request this reads as a request that came a moment earlier. A
+session that lives longer does not: if you keep the session or the store at module scope, or
+pass it on to a later request, a revoked session can validate after the revocation. So start a
+new session and a new store in each request (each Worker invocation), as in the example.
+
 The store cannot read the constraint of a session, so the option is your statement. Never set it
-for a session with another constraint or from a bookmark.
+for a session with another constraint, from a bookmark, or from an earlier request. The store
+detects a session by its `getBookmark` method. Never wrap a session in a hand-written object
+(for logging or metrics) that drops `getBookmark` to pass this check: the store then takes the
+session as the plain binding. A wrapper must forward `getBookmark`, or wrap only the plain
+binding.
 
 Its schema lives in `migrations-d1/`, separate from the PostgreSQL files. Every table and index
 starts with `identkit_`, so the schema can share one D1 database with the tables of your
@@ -586,7 +599,9 @@ keeps its own record of applied files:
   a file system (the SQL ships as strings in `D1_MIGRATIONS`), runs each file as one `batch()`
   (one transaction), records it in `identkit_migrations` with a SHA-256 checksum of its SQL and
   skips applied files. If the SQL of an applied file changed, it throws. Concurrent runs apply
-  each file once.
+  each file once. It refuses a file with two statements on one line, because D1 would run both
+  unchecked. A record table from an earlier runner without checksums gets the column; a file
+  recorded there without a checksum is refused.
 - `wrangler d1 migrations apply`. Declare a second binding to the same database with its own
   migrations folder and table:
 
@@ -629,9 +644,13 @@ Workers Paid; a `batch()` counts as one query (Cloudflare,
 of `throttle.reserve` is at most two queries (a read and a conditional write), so one `reserve`
 makes at most `2 * throttleRetries` queries: 32 with the default. A test counts the queries of
 the identkit calls that reserve a throttle (e-mail code sign-in, TOTP enrolment, TOTP second
-factor, TOTP step-up) and checks that each stays within 50 even when `reserve` loses every round
-but the last. If the limit is hit anyway, the query throws and the attempt does not pass. On
-Workers Paid you can raise `throttleRetries`; on Workers Free keep the default or lower it.
+factor, TOTP step-up, e-mail code step-up, approval by code confirmation) and checks that each
+stays within 50 even when `reserve` loses every round but the last. The limit counts every query
+of the invocation, also the queries of your application and of other identkit calls in the same
+request (for example a `sessions.validate` in middleware). On Workers Free, the heaviest call
+under the worst contention leaves only a few queries for them. If the limit is hit anyway, the
+query throws and the attempt does not pass. On Workers Paid you can raise `throttleRetries`; on
+Workers Free keep the default or lower it.
 
 The purge rule under "Operator duties" applies to D1 too, with times in milliseconds, for
 example `window_start < ?1 AND (locked_until IS NULL OR locked_until < ?1)` with `?1` set to

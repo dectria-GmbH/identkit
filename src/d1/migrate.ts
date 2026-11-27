@@ -17,11 +17,53 @@ async function checksum(sql: string): Promise<string> {
 }
 
 function refuseChanged(name: string, recorded: unknown, expected: string): void {
+  if (recorded === null || recorded === undefined) {
+    throw new Error(
+      `migration ${name} was applied without a checksum (by an earlier runner): it cannot be ` +
+        "compared with the current SQL",
+    );
+  }
   if (recorded !== expected) {
     throw new Error(
       `migration ${name} differs from the applied one: a migration file must not change ` +
         "after it was applied",
     );
+  }
+}
+
+/**
+ * Splits a migration into statements, one per `;` at a line end. A statement that still holds a
+ * `;` (two statements on one line, or a trigger body) is refused: D1 would run every statement
+ * of the string, and the additive check in the tests sees only the first.
+ */
+function statementsOf(migration: D1Migration): string[] {
+  const statements = splitStatements(migration.sql);
+  for (const statement of statements) {
+    if (statement.includes(";")) {
+      throw new Error(
+        `migration ${migration.name} has a statement with an inner ";": put each statement on ` +
+          "its own line, ending with ;",
+      );
+    }
+  }
+  return statements;
+}
+
+/**
+ * Adds the `checksum` column to an `identkit_migrations` table that an earlier runner created
+ * without it. The column is nullable there; a row without a checksum is refused when it is read.
+ */
+async function addChecksumColumn(db: D1DatabaseLike): Promise<void> {
+  const hasChecksum = async () => {
+    const { results } = await db.prepare("PRAGMA table_info(identkit_migrations)").all();
+    return results.some((column) => column["name"] === "checksum");
+  };
+  if (await hasChecksum()) return;
+  try {
+    await db.prepare("ALTER TABLE identkit_migrations ADD COLUMN checksum TEXT").run();
+  } catch (error) {
+    // A concurrent run added it first.
+    if (!(await hasChecksum())) throw error;
   }
 }
 
@@ -41,8 +83,9 @@ export async function migrateIdentkitD1(
   const migrations = (options.migrations ?? D1_MIGRATIONS).toSorted((a, b) =>
     a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
   );
-  for (const { name } of migrations) {
-    if (!NAME.test(name)) throw new Error(`invalid migration name: ${name}`);
+  for (const migration of migrations) {
+    if (!NAME.test(migration.name)) throw new Error(`invalid migration name: ${migration.name}`);
+    statementsOf(migration);
   }
   await db
     .prepare(
@@ -53,6 +96,7 @@ export async function migrateIdentkitD1(
       )`,
     )
     .run();
+  await addChecksumColumn(db);
   const { results } = await db.prepare("SELECT name, checksum FROM identkit_migrations").all();
   const done = new Map(results.map((r) => [r["name"], r["checksum"]]));
   const applied: string[] = [];
@@ -69,7 +113,7 @@ export async function migrateIdentkitD1(
             "INSERT INTO identkit_migrations (name, checksum, applied_at) VALUES (?1, ?2, ?3)",
           )
           .bind(migration.name, sum, Date.now()),
-        ...splitStatements(migration.sql).map((statement) => db.prepare(statement)),
+        ...statementsOf(migration).map((statement) => db.prepare(statement)),
       ]);
     } catch (error) {
       const recorded = await db
