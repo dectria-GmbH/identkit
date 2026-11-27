@@ -18,7 +18,7 @@ import {
   createRecordingMailSender,
   createTestSealer,
 } from "../src/testing/index.js";
-import { emailFirstPolicy, testConfig } from "./helpers.js";
+import { emailFirstPolicy, setup, testConfig } from "./helpers.js";
 
 const DAY = 86_400;
 const TOKEN = /^pat_[A-Za-z0-9_-]{43}$/;
@@ -431,6 +431,11 @@ describe("api tokens", () => {
       { ...valid, name: "line\nbreak" },
       { ...valid, name: "tab\there" },
       { ...valid, name: "sep x" },
+      { ...valid, name: "a\u202Eb" },
+      { ...valid, name: "a\u2066b" },
+      { ...valid, name: "zero\u200Bwidth" },
+      { ...valid, name: "bom\uFEFF" },
+      { ...valid, name: "lone\uD800" },
       { ...valid, name: 7 },
       { ...valid, scopes: [] },
       { ...valid, scopes: ["admin", "admin"] },
@@ -800,5 +805,215 @@ describe("api tokens", () => {
     ]) {
       expect(parseBearerToken(value), String(value)).toBeNull();
     }
+  });
+});
+
+/** Import input without the token, valid for ten days from the fake clock's now. */
+function importInput(t: ReturnType<typeof tokenSetup>, accountId: string) {
+  return {
+    accountId,
+    name: "legacy",
+    scopes: ["read:items"],
+    expiresAt: new Date(t.clock.now().getTime() + 10 * DAY * 1000),
+  };
+}
+
+describe("api tokens: one token stored twice", () => {
+  const legacyOptions: ApiTokenOptions = { ...baseOptions, acceptLegacyDigests: true };
+
+  it("rule: import with the plaintext finds a legacy row of the same token (same account)", async () => {
+    const t = tokenSetup({ apiTokens: legacyOptions });
+    const accountId = await t.account();
+    const token = randomShaped();
+    const base = importInput(t, accountId);
+    const first = await t.ik.apiTokens.import({ ...base, sha256Digest: t.legacy(token) });
+    if (first.status !== "imported") throw new Error(first.status);
+    expect(await t.ik.apiTokens.import({ ...base, token })).toEqual({
+      status: "already_imported",
+      apiToken: first.apiToken,
+    });
+    expect(await t.ik.apiTokens.list(accountId)).toHaveLength(1);
+    await t.ik.apiTokens.revoke({ accountId, tokenId: first.apiToken.id });
+    // Probe P1 of the review: the keyed copy brought a revoked token back.
+    expect(await t.ik.apiTokens.import({ ...base, token })).toEqual({ status: "revoked" });
+    expect(await t.ik.apiTokens.verify(token)).toEqual({ status: "refused", reason: "revoked" });
+    // Also after the operator turned legacy digests off: the revoked row still counts.
+    const strict = t.build(baseOptions);
+    expect(await strict.apiTokens.import({ ...base, token })).toEqual({ status: "revoked" });
+    expect(await strict.apiTokens.verify(token)).toEqual({ status: "refused", reason: "unknown" });
+  });
+
+  it("rule: import with the plaintext finds a legacy row of the same token on another account", async () => {
+    const t = tokenSetup({ apiTokens: legacyOptions });
+    const a = await t.account();
+    const b = await t.account();
+    const token = randomShaped();
+    const first = await t.ik.apiTokens.import({
+      ...importInput(t, a),
+      sha256Digest: t.legacy(token),
+    });
+    expect(first.status).toBe("imported");
+    // Probe P1b of the review: the keyed copy on b made the token authenticate as a or b.
+    expect(await t.ik.apiTokens.import({ ...importInput(t, b), token })).toEqual({
+      status: "digest_taken",
+    });
+    expect(await t.ik.apiTokens.verify(token)).toMatchObject({ status: "valid", accountId: a });
+  });
+
+  it("rule: verify refuses a token that more than one row matches, in every state", async () => {
+    const t = tokenSetup({ apiTokens: legacyOptions });
+    const a = await t.account();
+    const b = await t.account();
+    const token = randomShaped();
+    // Keyed first, legacy second: import cannot see the keyed row without the plaintext.
+    const keyed = await t.ik.apiTokens.import({ ...importInput(t, b), token });
+    const weak = await t.ik.apiTokens.import({
+      ...importInput(t, a),
+      sha256Digest: t.legacy(token),
+    });
+    if (keyed.status !== "imported" || weak.status !== "imported") throw new Error("setup");
+    const ambiguous = { status: "refused", reason: "ambiguous" };
+    expect(await t.ik.apiTokens.verify(token)).toEqual(ambiguous);
+    expect(t.audit.ofType("api_token.used")).toEqual([]);
+    // One copy revoked: still refused, whichever one.
+    await t.ik.apiTokens.revoke({ accountId: b, tokenId: keyed.apiToken.id });
+    expect(await t.ik.apiTokens.verify(token)).toEqual(ambiguous);
+    // Without legacy digests, only the keyed row is read: it is revoked.
+    expect(await t.build(baseOptions).apiTokens.verify(token)).toEqual({
+      status: "refused",
+      reason: "revoked",
+    });
+
+    // Same account, other order of states: the legacy copy revoked, the keyed copy live.
+    const other = randomShaped();
+    const k2 = await t.ik.apiTokens.import({ ...importInput(t, a), token: other });
+    const l2 = await t.ik.apiTokens.import({
+      ...importInput(t, a),
+      sha256Digest: t.legacy(other),
+    });
+    if (k2.status !== "imported" || l2.status !== "imported") throw new Error("setup");
+    await t.ik.apiTokens.revoke({ accountId: a, tokenId: l2.apiToken.id });
+    expect(await t.ik.apiTokens.verify(other)).toEqual(ambiguous);
+  });
+});
+
+describe("api tokens: api_token.used is best effort", () => {
+  it("rule: a refused api_token.used does not fail verify; onAuditError gets the error once", async () => {
+    const calls: { error: unknown; event: AuditEvent }[] = [];
+    const t = tokenSetup({
+      apiTokens: {
+        ...baseOptions,
+        onAuditError: (error, event) => void calls.push({ error, event }),
+      },
+    });
+    const accountId = await t.account();
+    const { token, apiToken } = await t.token(accountId);
+    failSink(t.audit, "api_token.used");
+    expect(await t.ik.apiTokens.verify(token)).toMatchObject({ status: "valid", accountId });
+    expect(calls).toEqual([
+      {
+        error: new Error("sink down"),
+        event: { type: "api_token.used", at: t.clock.now(), accountId, tokenId: apiToken.id },
+      },
+    ]);
+    // lastUsedAt is written, so the next verify in the interval writes and emits nothing.
+    expect((await t.ik.apiTokens.list(accountId))[0]?.lastUsedAt).toEqual(t.clock.now());
+    expect((await t.ik.apiTokens.verify(token)).status).toBe("valid");
+    expect(calls).toHaveLength(1);
+    expect(t.audit.ofType("api_token.used")).toEqual([]);
+  });
+
+  it("rule: without onAuditError, or with one that throws, verify still returns valid", async () => {
+    const plain = tokenSetup({ apiTokens: { ...baseOptions, lastUsedIntervalSeconds: 0 } });
+    const { token } = await plain.token(await plain.account());
+    failSink(plain.audit, "api_token.used", 3);
+    for (let i = 0; i < 3; i += 1) {
+      expect((await plain.ik.apiTokens.verify(token)).status).toBe("valid");
+    }
+
+    const throwing = tokenSetup({
+      apiTokens: {
+        ...baseOptions,
+        onAuditError: () => Promise.reject(new Error("handler down")),
+      },
+    });
+    const second = await throwing.token(await throwing.account());
+    failSink(throwing.audit, "api_token.used");
+    expect((await throwing.ik.apiTokens.verify(second.token)).status).toBe("valid");
+  });
+
+  it("rule: onAuditError must be a function", () => {
+    expect(() =>
+      tokenSetup({ apiTokens: { ...baseOptions, onAuditError: "log" as unknown as () => void } }),
+    ).toThrow(InvalidArgumentError);
+  });
+});
+
+describe("api tokens: accounts.disable without a working token store", () => {
+  it("rule: sessions are revoked and the hook runs when the token revocation throws", async () => {
+    const memory = createMemoryStore();
+    const tokens = memory.apiTokens;
+    if (!tokens) throw new Error("memory store has apiTokens");
+    const store: IdentkitStore = {
+      ...memory,
+      apiTokens: {
+        ...tokens,
+        revokeAllForAccount: () => Promise.reject(new Error("no such table: identkit_api_tokens")),
+      },
+    };
+    const hookEvents: { accountId: string; revokedSessionIds: string[] }[] = [];
+    const t = setup({ store, onAllSessionsRevoked: (event) => void hookEvents.push(event) });
+    const session = await t.signIn("disable@example.org");
+    const accountId = session.account.id;
+    await expect(t.ik.accounts.disable(accountId)).rejects.toThrow(
+      "no such table: identkit_api_tokens",
+    );
+    expect(hookEvents).toHaveLength(1);
+    expect(hookEvents[0]).toMatchObject({ accountId, revokedSessionIds: [session.session.id] });
+    expect(t.audit.ofType("session.revoked")).toHaveLength(1);
+    expect(t.audit.ofType("account.disabled")).toHaveLength(1);
+    expect((await t.ik.accounts.get(accountId))?.status).toBe("disabled");
+  });
+});
+
+describe("api tokens: import dates", () => {
+  it("rule: import refuses createdAt or lastUsedAt in the future and lastUsedAt before createdAt", async () => {
+    const t = tokenSetup();
+    const accountId = await t.account();
+    const now = t.clock.now().getTime();
+    const base = {
+      accountId,
+      name: "legacy",
+      scopes: ["read:items"],
+      expiresAt: new Date(now + 10 * DAY * 1000),
+    };
+    const invalid = [
+      { createdAt: new Date(now + 1) },
+      { lastUsedAt: new Date(now + 1) },
+      { lastUsedAt: new Date(now + 365 * DAY * 1000) },
+      { createdAt: new Date(now - 2000), lastUsedAt: new Date(now - 2001) },
+    ];
+    for (const dates of invalid) {
+      await expect(
+        t.ik.apiTokens.import({ ...base, ...dates, token: randomShaped() }),
+        JSON.stringify(dates),
+      ).rejects.toBeInstanceOf(InvalidArgumentError);
+    }
+    expect(await t.ik.apiTokens.list(accountId)).toEqual([]);
+    // The edges are fine: both at now, or lastUsedAt equal to createdAt.
+    const edge = await t.ik.apiTokens.import({
+      ...base,
+      createdAt: new Date(now),
+      lastUsedAt: new Date(now),
+      token: randomShaped(),
+    });
+    expect(edge.status).toBe("imported");
+    // Without createdAt (default now), a past lastUsedAt is a date of the source system.
+    const noCreatedAt = await t.ik.apiTokens.import({
+      ...base,
+      lastUsedAt: new Date(now - DAY * 1000),
+      token: randomShaped(),
+    });
+    expect(noCreatedAt.status).toBe("imported");
   });
 });

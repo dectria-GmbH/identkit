@@ -256,4 +256,64 @@ export function runStoreFlows(name: string, store: () => IdentkitStore) {
     });
     expect(await t.ik.apiTokens.list(accountId)).toEqual([]);
   });
+
+  it(`flows: API tokens, one token in two forms on two accounts never verifies against ${name}`, async () => {
+    const t = setup({
+      store: store(),
+      apiTokens: { prefix: "pat_", allowedScopes: ["read", "write"], acceptLegacyDigests: true },
+    });
+    const tag = randomBytes(6).toString("hex");
+    const ids: string[] = [];
+    for (const who of ["a", "b"]) {
+      const created = await t.ik.accounts.create({
+        email: `flows-twice-${who}-${tag}@example.org`,
+      });
+      if (created.status !== "created") throw new Error(created.status);
+      ids.push(created.account.id);
+    }
+    const [a, b] = ids;
+    if (!a || !b) throw new Error("no accounts");
+    const base = {
+      name: "twice",
+      scopes: ["read"],
+      expiresAt: new Date(t.clock.now().getTime() + 86_400_000),
+    };
+
+    // Legacy first: the plaintext import finds the legacy row.
+    const first = `pat_${randomBytes(32).toString("base64url")}`;
+    expect(
+      (
+        await t.ik.apiTokens.import({
+          ...base,
+          accountId: a,
+          sha256Digest: createHash("sha256").update(first).digest("hex"),
+        })
+      ).status,
+    ).toBe("imported");
+    expect(await t.ik.apiTokens.import({ ...base, accountId: b, token: first })).toEqual({
+      status: "digest_taken",
+    });
+    expect(await t.ik.apiTokens.verify(first)).toMatchObject({ status: "valid", accountId: a });
+
+    // Keyed first: both rows stand, and verify refuses whatever order the store returns.
+    const second = `pat_${randomBytes(32).toString("base64url")}`;
+    expect((await t.ik.apiTokens.import({ ...base, accountId: b, token: second })).status).toBe(
+      "imported",
+    );
+    expect(
+      (
+        await t.ik.apiTokens.import({
+          ...base,
+          accountId: a,
+          sha256Digest: createHash("sha256").update(second).digest("hex"),
+        })
+      ).status,
+    ).toBe("imported");
+    const results = await Promise.all(
+      Array.from({ length: 5 }, () => t.ik.apiTokens.verify(second)),
+    );
+    for (const result of results) {
+      expect(result).toEqual({ status: "refused", reason: "ambiguous" });
+    }
+  });
 }

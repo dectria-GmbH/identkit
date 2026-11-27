@@ -102,6 +102,7 @@ export {
   apiTokenOptionsSchema,
   parseBearerToken,
   type ApiTokens,
+  type ApiTokenAuditErrorHandler,
   type ApiTokenOptions,
   type ApiTokenView,
   type ApiTokenRefusal,

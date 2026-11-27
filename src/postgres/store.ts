@@ -20,14 +20,22 @@ import type { IdentkitDatabase } from "./schema.js";
 type Row<T extends keyof IdentkitDatabase> = Selectable<IdentkitDatabase[T]>;
 
 const UNIQUE_VIOLATION = "23505";
+/** serialization_failure and deadlock_detected. */
+const LOST_RACE = new Set(["40001", "40P01"]);
+
+function sqlState(error: unknown): unknown {
+  return typeof error === "object" && error !== null && "code" in error
+    ? Reflect.get(error, "code")
+    : undefined;
+}
 
 function isUniqueViolation(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    Reflect.get(error, "code") === UNIQUE_VIOLATION
-  );
+  return sqlState(error) === UNIQUE_VIOLATION;
+}
+
+function isLostRace(error: unknown): boolean {
+  const code = sqlState(error);
+  return typeof code === "string" && LOST_RACE.has(code);
 }
 
 /** Checks a value read from the database against the allowed set. */
@@ -947,12 +955,15 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           .setIsolationLevel("read committed")
           .execute(async (trx) => {
             // The account row lock serializes inserts for one account, so the count and the
-            // insert below cannot interleave with another insert's.
+            // insert below cannot interleave with another insert's. FOR NO KEY UPDATE conflicts
+            // with itself, so it serializes token inserts as FOR UPDATE would, but not with the
+            // FOR KEY SHARE locks of foreign key checks, so inserts of sessions for the same
+            // account do not wait for it.
             await trx
               .selectFrom("identkit_accounts")
               .select("id")
               .where("id", "=", t.accountId)
-              .forUpdate()
+              .forNoKeyUpdate()
               .executeTakeFirst();
             const taken = await trx
               .selectFrom("identkit_api_tokens")
@@ -1017,17 +1028,25 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
         return rows.map(toApiToken);
       },
       async markUsed(id, at, notAfter) {
-        const row = await db
-          .updateTable("identkit_api_tokens")
-          .set({ last_used_at: at })
-          .where("id", "=", id)
-          .where("revoked_at", "is", null)
-          .where((eb) =>
-            eb.or([eb("last_used_at", "is", null), eb("last_used_at", "<=", notAfter)]),
-          )
-          .returning("id")
-          .executeTakeFirst();
-        return row !== undefined;
+        try {
+          const row = await db
+            .updateTable("identkit_api_tokens")
+            .set({ last_used_at: at })
+            .where("id", "=", id)
+            .where("revoked_at", "is", null)
+            .where((eb) =>
+              eb.or([eb("last_used_at", "is", null), eb("last_used_at", "<=", notAfter)]),
+            )
+            .returning("id")
+            .executeTakeFirst();
+          return row !== undefined;
+        } catch (error) {
+          // Under REPEATABLE READ or SERIALIZABLE, a concurrent verify that wrote first makes
+          // this UPDATE fail instead of match no row. Losing that race is the intended outcome:
+          // no write and no event, and the request still succeeds.
+          if (isLostRace(error)) return false;
+          throw error;
+        }
       },
       async revoke(id, accountId, at, reason) {
         const row = await db

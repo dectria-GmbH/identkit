@@ -146,12 +146,18 @@ export function createAccounts(
       const changed = record.status !== "disabled";
       const event = { type: "account.disabled", accountId } as const;
       await store.accounts.setStatus(accountId, "disabled");
-      // API tokens first: their revocation has no hook, so an error there leaves no revocation
-      // whose hook would need to run. `verify` refuses tokens of a disabled account anyway.
+      // API tokens first, but sessions and the hook do not depend on them: a store error there
+      // (for example a schema without the token table) must not leave the account's sessions
+      // live. That error goes up at the end; `verify` refuses tokens of a disabled account anyway.
       let tokenIds: string[] = [];
-      let revoked: Revocation;
+      let tokenFailure: { error: unknown } | null = null;
       try {
         tokenIds = await revokeAllApiTokens(ctx, accountId, "account_disabled");
+      } catch (error) {
+        tokenFailure = { error };
+      }
+      let revoked: Revocation;
+      try {
         revoked = await revokeAll(accountId);
       } catch (error) {
         // A retry finds the account disabled and these tokens revoked, and records neither:
@@ -163,8 +169,9 @@ export function createAccounts(
         throw error;
       }
       // Hook last: a throwing hook must not skip the audit events, nor a throwing sink the hook.
-      // A retry revokes and runs the hook again.
-      await finishThenRunHook(revoked, async () => {
+      // A retry revokes and runs the hook again. A token store error wins over a sink or hook
+      // error: a retry of `disable` repeats the token revocation, the hook and the events.
+      const finished = finishThenRunHook(revoked, async () => {
         let failure: { error: unknown } | null = null;
         try {
           if (changed) await ctx.emit(event);
@@ -178,6 +185,9 @@ export function createAccounts(
         }
         if (failure) throw failure.error;
       });
+      if (!tokenFailure) return finished;
+      await finished.catch(() => undefined);
+      throw tokenFailure.error;
     },
   };
 }

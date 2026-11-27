@@ -3,6 +3,7 @@ import { sha256, toHex, utf8 } from "./bytes.js";
 import { addSeconds } from "./clock.js";
 import type { Context } from "./context.js";
 import { digestsEqual, randomId, randomToken } from "./crypto.js";
+import type { AuditEvent } from "./audit.js";
 import { InvalidArgumentError, NotConfiguredError, OperationRolledBackError } from "./errors.js";
 import type {
   ApiTokenDigestAlgorithm,
@@ -16,8 +17,12 @@ const DAY_SECONDS = 86_400;
 const TOKEN_BODY = /^[A-Za-z0-9_-]{43}$/;
 const TOKEN_BODY_LENGTH = 43;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
-/** At most 64 characters, none of them a control character or a line or paragraph separator. */
-const NAME = /^[^\p{Cc}\p{Zl}\p{Zp}]{1,64}$/u;
+/**
+ * At most 64 characters. None of them is a control character, a format character (Cf: bidi
+ * controls such as U+202E, zero-width characters), a lone surrogate, or a line or paragraph
+ * separator: an admin UI must show the name as it reads.
+ */
+const NAME = /^[^\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]{1,64}$/u;
 
 const unique = (values: readonly unknown[]) => new Set(values).size === values.length;
 
@@ -57,8 +62,21 @@ export const apiTokenOptionsSchema = z
      * Such digests are weaker; turn this off once the imported tokens are rotated out.
      */
     acceptLegacyDigests: z.boolean().default(false),
+    /**
+     * Receives the error when the audit sink refuses `api_token.used`, with the event. `verify`
+     * still returns `valid`: that event is best effort. Without this option the error is
+     * dropped. `verify` awaits the call and drops what it throws; keep it quick.
+     */
+    onAuditError: z
+      .custom<ApiTokenAuditErrorHandler>((value) => typeof value === "function", {
+        message: "onAuditError must be a function",
+      })
+      .optional(),
   })
   .strict();
+
+/** See the option `onAuditError`. */
+export type ApiTokenAuditErrorHandler = (error: unknown, event: AuditEvent) => void | Promise<void>;
 
 export type ApiTokenOptions = z.input<typeof apiTokenOptionsSchema>;
 type ApiTokenSettings = z.output<typeof apiTokenOptionsSchema>;
@@ -89,11 +107,19 @@ export type CreateApiTokenResult =
 
 /**
  * `malformed`: not a string of the configured format; identkit made no digest and no read.
- * `unknown`: no token has this digest. `no_allowed_scope`: none of the token's scopes is in the
- * current `allowedScopes`.
+ * `unknown`: no token has this digest. `ambiguous`: more than one stored token matches (an
+ * import stored one token twice, as a legacy digest and as a keyed digest); identkit refuses
+ * rather than pick one. `no_allowed_scope`: none of the token's scopes is in the current
+ * `allowedScopes`.
  */
 export type ApiTokenRefusal =
-  "malformed" | "unknown" | "revoked" | "expired" | "account_disabled" | "no_allowed_scope";
+  | "malformed"
+  | "unknown"
+  | "ambiguous"
+  | "revoked"
+  | "expired"
+  | "account_disabled"
+  | "no_allowed_scope";
 
 export type VerifyApiTokenResult =
   | {
@@ -116,8 +142,9 @@ interface ImportBase {
   scopes: string[];
   /** Must be in the future and at most the longest `allowedExpiryDays` from now. */
   expiresAt: Date;
-  /** Default: now. */
+  /** Default: now. Must not be in the future. */
   createdAt?: Date;
+  /** Must not be in the future, nor before `createdAt` if that is given. */
   lastUsedAt?: Date | null;
 }
 
@@ -156,7 +183,10 @@ export interface ApiTokens {
     scopes: string[];
     expiresInDays: number;
   }): Promise<CreateApiTokenResult>;
-  /** Checks a token. One read, and at most one write for `lastUsedAt`. */
+  /**
+   * Checks a token. One read, and at most one write for `lastUsedAt`. A refused
+   * `api_token.used` does not fail it (see the option `onAuditError`).
+   */
   verify(token: string): Promise<VerifyApiTokenResult>;
   /** The tokens of the account that are not revoked, expired ones included, oldest first. */
   list(accountId: string): Promise<ApiTokenView[]>;
@@ -236,7 +266,9 @@ function requireDate(value: unknown, what: string): Date {
 
 function checkName(value: unknown): string {
   if (typeof value !== "string" || !NAME.test(value)) {
-    throw new InvalidArgumentError("name must have 1 to 64 characters and no control characters");
+    throw new InvalidArgumentError(
+      "name must have 1 to 64 characters and no control, format or separator characters",
+    );
   }
   return value;
 }
@@ -334,6 +366,23 @@ export function createApiTokens(ctx: Context, options: ApiTokenOptions): ApiToke
     }
   }
 
+  /**
+   * Records `api_token.used`, best effort: the one exception to the sink contract. The
+   * authentication decision does not depend on the event, and `lastUsedAt` is written already;
+   * a refusal must not fail every request that a token authenticates while the sink is down.
+   */
+  async function emitUsed(event: AuditEvent): Promise<void> {
+    try {
+      await ctx.emit(event);
+    } catch (error) {
+      try {
+        await settings.onAuditError?.(error, event);
+      } catch {
+        // Dropped: the handler is a report channel, not a gate.
+      }
+    }
+  }
+
   /** The account must exist and be active. */
   async function accountState(accountId: string) {
     const account = await ctx.store.accounts.findById(accountId);
@@ -396,12 +445,16 @@ export function createApiTokens(ctx: Context, options: ApiTokenOptions): ApiToke
       const found = await store.findByDigests(legacy === null ? [keyed] : [keyed, legacy]);
       // The read matched by digest; compare again in constant time, each row against the
       // digest of its own algorithm, so a row can match only the way it was stored.
-      const match = found.find(({ record }) => {
+      const matches = found.filter(({ record }) => {
         const algorithm: ApiTokenDigestAlgorithm = record.digestAlgorithm;
         if (algorithm === "hmac-sha256") return digestsEqual(record.digest, keyed);
         return legacy !== null && digestsEqual(record.digest, legacy);
       });
+      const [match, ...others] = matches;
       if (!match) return { status: "refused", reason: "unknown" };
+      // One token stored twice (a legacy and a keyed import): the rows can differ in account,
+      // scopes and state, and a store returns them in no defined order. Fail closed.
+      if (others.length > 0) return { status: "refused", reason: "ambiguous" };
       const { record, accountStatus } = match;
       const now = clock.now();
       if (record.revokedAt !== null) return { status: "refused", reason: "revoked" };
@@ -415,8 +468,9 @@ export function createApiTokens(ctx: Context, options: ApiTokenOptions): ApiToke
       const notAfter = addSeconds(now, -settings.lastUsedIntervalSeconds);
       if (record.lastUsedAt === null || record.lastUsedAt.getTime() <= notAfter.getTime()) {
         if (await store.markUsed(record.id, now, notAfter)) {
-          await ctx.emit({
+          await emitUsed({
             type: "api_token.used",
+            at: now,
             accountId: record.accountId,
             tokenId: record.id,
           });
@@ -472,6 +526,22 @@ export function createApiTokens(ctx: Context, options: ApiTokenOptions): ApiToke
         input.lastUsedAt === undefined || input.lastUsedAt === null
           ? null
           : requireDate(input.lastUsedAt, "lastUsedAt");
+      // A date in the future is a data error of the source system. A future lastUsedAt would
+      // also suppress every lastUsedAt write and api_token.used event until that date.
+      if (createdAt.getTime() > now.getTime()) {
+        throw new InvalidArgumentError("createdAt must not be in the future");
+      }
+      if (lastUsedAt !== null && lastUsedAt.getTime() > now.getTime()) {
+        throw new InvalidArgumentError("lastUsedAt must not be in the future");
+      }
+      // Only against a given createdAt: the default (now) is not a date of the source system.
+      if (
+        input.createdAt !== undefined &&
+        lastUsedAt !== null &&
+        lastUsedAt.getTime() < createdAt.getTime()
+      ) {
+        throw new InvalidArgumentError("lastUsedAt must not be before createdAt");
+      }
       if (expiresAt.getTime() > addSeconds(now, maxExpiryDays * DAY_SECONDS).getTime()) {
         throw new InvalidArgumentError(
           `expiresAt must be at most ${maxExpiryDays} days from now (allowedExpiryDays)`,
@@ -484,12 +554,18 @@ export function createApiTokens(ctx: Context, options: ApiTokenOptions): ApiToke
       }
       let digest: string;
       let digestAlgorithm: ApiTokenDigestAlgorithm;
+      // Every digest under which this token may be stored already. With the plaintext, that
+      // includes its legacy digest, also when acceptLegacyDigests is off now: a legacy row from
+      // an earlier import is the same token. With a legacy digest only, identkit cannot find a
+      // keyed row of the same token (no plaintext); `verify` then refuses it as `ambiguous`.
+      let sameToken: string[];
       if (hasToken) {
         if (!isTokenShaped(input.token)) {
           throw new InvalidArgumentError("token does not have the configured format");
         }
         digest = await keyedDigest(input.token);
         digestAlgorithm = "hmac-sha256";
+        sameToken = [digest, await legacyDigest(input.token)];
       } else {
         if (!settings.acceptLegacyDigests) {
           throw new NotConfiguredError("apiTokens.acceptLegacyDigests");
@@ -500,19 +576,24 @@ export function createApiTokens(ctx: Context, options: ApiTokenOptions): ApiToke
         }
         digest = hex;
         digestAlgorithm = "sha256";
+        sameToken = [digest];
       }
 
       const refused = await accountState(accountId);
       if (refused) return { status: refused };
       const settle = async (): Promise<ImportApiTokenResult | null> => {
-        const existing = (await store.findByDigests([digest])).find(
-          ({ record }) => record.digest === digest,
+        const existing = (await store.findByDigests(sameToken)).filter(({ record }) =>
+          sameToken.includes(record.digest),
         );
-        if (!existing) return null;
-        if (existing.record.accountId !== accountId) return { status: "digest_taken" };
-        return existing.record.revokedAt === null
-          ? { status: "already_imported", apiToken: toView(existing.record) }
-          : { status: "revoked" };
+        if (existing.length === 0) return null;
+        if (existing.some(({ record }) => record.accountId !== accountId)) {
+          return { status: "digest_taken" };
+        }
+        // A revoked copy keeps the token revoked, whatever the other copy says.
+        const live = existing.filter(({ record }) => record.revokedAt === null);
+        const [only] = live;
+        if (!only || live.length !== existing.length) return { status: "revoked" };
+        return { status: "already_imported", apiToken: toView(only.record) };
       };
       const before = await settle();
       if (before) return before;

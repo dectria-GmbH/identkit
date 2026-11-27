@@ -88,7 +88,9 @@ export interface AuditEvent {
 
 /**
  * Receives audit events. identkit awaits `emit`; if it throws, the calling operation
- * fails, so an operation never succeeds without its audit record.
+ * fails, so an operation never succeeds without its audit record. One exception:
+ * `api_token.used` is best effort, and `apiTokens.verify` still succeeds (see the option
+ * `apiTokens.onAuditError`).
  */
 export interface AuditSink {
   emit(event: AuditEvent): void | Promise<void>;
