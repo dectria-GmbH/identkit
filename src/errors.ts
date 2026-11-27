@@ -132,6 +132,15 @@ export class AllSessionsRevokedHookError extends IdentkitError {
  * no session, so `hookFailed` is false. If the delete fails, the store's error goes up instead
  * and the token stands (a created token is unusable then: its plaintext was never returned).
  *
+ * `oauth.token` throws it for a code exchange when the audit sink refused `oauth.grant_created`,
+ * or `oauth.grant_ended` of the grant that the exchange replaced: identkit deleted the new grant
+ * again, and `cause` holds the sink's error. One exception to the rule below: an exchange
+ * replaces the account's earlier grant of the same client, and that grant stays ended. It is not
+ * restored, so its client must connect again. Its `oauth.grant_ended` event (reason `replaced`)
+ * goes to the sink before `oauth.grant_created`; if the sink refused that event, the grant ended
+ * without its record. If the delete fails, the store's error goes up instead and the new grant
+ * stands, unusable (its tokens were never returned).
+ *
  * If you catch this error, the operation did not take effect. Any other error means that
  * identkit did not roll back: what it wrote before the error stands. After any other error from
  * `totp.confirmEnrolment` or `passkeys.finishRegistration`, check `totp.get` or `passkeys.list`.

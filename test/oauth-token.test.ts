@@ -279,6 +279,41 @@ describe("oauth token endpoint: code exchange", () => {
     await expect(client.exchange(code, verifier)).rejects.toThrow(OperationRolledBackError);
     expect(await ik.oauth.listGrants(accountId)).toEqual([]);
   });
+
+  it("a refused grant_created on a re-authorization records the replaced grant's end", async () => {
+    const { ik, client, accountId, audit } = await connected();
+    const first = await client.connect(accountId);
+    const [old] = await ik.oauth.listGrants(accountId);
+    const { code, verifier } = await client.authorize(accountId);
+    const emit = audit.emit.bind(audit);
+    audit.emit = (event) => {
+      if (event.type === "oauth.grant_created") throw new Error("sink down");
+      return emit(event);
+    };
+    await expect(client.exchange(code, verifier)).rejects.toThrow(OperationRolledBackError);
+    expect(await ik.oauth.validateAccessToken(first.accessToken)).toEqual({
+      status: "refused",
+      reason: "unknown",
+    });
+    expect(await ik.oauth.listGrants(accountId)).toEqual([]);
+    expect(audit.ofType("oauth.grant_ended")).toEqual([
+      expect.objectContaining({ grantId: old?.id, clientId: client.clientId, reason: "replaced" }),
+    ]);
+  });
+
+  it("a refused grant_ended of the replaced grant rolls the new grant back", async () => {
+    const { ik, client, accountId, audit } = await connected();
+    await client.connect(accountId);
+    const { code, verifier } = await client.authorize(accountId);
+    const emit = audit.emit.bind(audit);
+    audit.emit = (event) => {
+      if (event.type === "oauth.grant_ended") throw new Error("sink down");
+      return emit(event);
+    };
+    await expect(client.exchange(code, verifier)).rejects.toThrow(OperationRolledBackError);
+    expect(await ik.oauth.listGrants(accountId)).toEqual([]);
+    expect(audit.ofType("oauth.grant_created")).toHaveLength(1);
+  });
 });
 
 describe("oauth revocation and administration", () => {

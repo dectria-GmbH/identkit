@@ -354,6 +354,9 @@ export function createTokenEndpoint(internals: OAuthInternals) {
       );
     }
     try {
+      // The replaced grant (the account's earlier grant of this client) ended in the insert.
+      // Its event comes first, so it is recorded also if the new grant is rolled back.
+      if (inserted.replaced) await grantEnded(inserted.replaced, "replaced");
       await ctx.emit({
         type: "oauth.grant_created",
         accountId: grant.accountId,
@@ -362,12 +365,12 @@ export function createTokenEndpoint(internals: OAuthInternals) {
         scopes: [...grant.scopes],
       });
     } catch (error) {
-      // No grant stands without its audit record. If the delete fails, its error goes up and
-      // the grant stands, unusable: its tokens were never returned.
+      // No grant stands without its audit record. The replaced grant stays ended: its tokens
+      // are deleted and cannot come back. If the delete fails, its error goes up and the new
+      // grant stands, unusable: its tokens were never returned.
       await store.deleteGrant(grant.id, { clientId: client.id });
       throw new OperationRolledBackError(grant.accountId, { cause: error, hookFailed: false });
     }
-    if (inserted.replaced) await grantEnded(inserted.replaced, "replaced");
     await markUsed(client, now);
     return tokenResponse(access.token, access.record, refresh?.token ?? null, now);
   }
