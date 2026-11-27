@@ -60,8 +60,9 @@
     "test": "vitest run --maxWorkers=2",
     "test:postgres": "vitest run --maxWorkers=2 test/postgres",
     "check:runtime": "node scripts/check-runtime-imports.mjs",
+    "check:workerd": "node scripts/check-workerd.mjs",
     "prepublishOnly": "pnpm build",
-    "check": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test && pnpm build && pnpm check:runtime"
+    "check": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test && pnpm build && pnpm check:runtime && pnpm check:workerd"
   },
   "peerDependencies": {
     "kysely": ">=0.29.0 <0.30.0"
@@ -79,6 +80,7 @@
     "@types/node": "24.19.2",
     "@types/pg": "8.23.1",
     "kysely": "0.29.9",
+    "miniflare": "4.20260730.0",
     "oxlint": "1.94.0",
     "oxlint-tsgolint": "7.0.2007",
     "pg": "8.23.1",

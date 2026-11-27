@@ -26,7 +26,8 @@ pnpm add kysely pg
 - ESM only.
 - Root entry `identkit` and `identkit/testing`: Node.js 24 or later, or a runtime with the Web
   Crypto API (`globalThis.crypto`) such as Cloudflare Workers, also without `nodejs_compat`.
-  They import no Node built-in module; CI checks this with `pnpm check:runtime`.
+  They import no Node built-in module. CI checks this statically with `pnpm check:runtime` and
+  runs the built entries in workerd without `nodejs_compat` with `pnpm check:workerd`.
 - `identkit/postgres`: Node.js 24 or later, PostgreSQL 17 (the version the test suite runs
   against) and [Kysely](https://kysely.dev) 0.29 (optional peer dependency).
 

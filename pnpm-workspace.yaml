@@ -4,3 +4,9 @@ auditConfig:
   # arrays; untrusted input reaches zod only as a single string (the e-mail address).
   ignoreGhsas:
     - GHSA-mrhx-c7xc-m3w5
+
+# workerd (through miniflare, used by the runtime smoke test) has a postinstall that only
+# downloads its binary when the platform package is missing. The platform package installs as an
+# optional dependency, so the script does not need to run.
+allowBuilds:
+  workerd: false
