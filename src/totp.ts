@@ -16,7 +16,7 @@ import {
   type SessionInternals,
   type Sessions,
 } from "./sessions.js";
-import type { SessionRecord, TotpFactorRecord } from "./storage/types.js";
+import type { OAuthGrantRecord, SessionRecord, TotpFactorRecord } from "./storage/types.js";
 import { totpEnrolmentThrottleKey, totpThrottleKey } from "./throttle-keys.js";
 import {
   base32Encode,
@@ -433,14 +433,21 @@ export function createTotp(
       // ends.
       const remove = async () => store.totp.delete(factor.id, factor.accountId);
       const removeAll = async () => store.totp.deleteAllForAccount(factor.accountId);
-      // As `accounts.disable`: the status, then the account's API tokens and its OAuth grants,
-      // which it returns. A token or grant store error counts as a failed disable: an operator
-      // who enables the account again must know that its tokens or grants may still be live.
+      // As `accounts.disable`: the status, then the account's API tokens and its OAuth grants.
+      // A token or grant store error counts as a failed disable: an operator who enables the
+      // account again must know that its tokens or grants may still be live. What each attempt
+      // ended is kept across the retry: a retry after a grant store error finds the tokens
+      // revoked already, and their events must still be recorded.
+      const ended: { tokenIds: string[]; grants: OAuthGrantRecord[] } = {
+        tokenIds: [],
+        grants: [],
+      };
       const disable = async () => {
         await store.accounts.setStatus(factor.accountId, "disabled");
-        const tokenIds = await revokeAllApiTokens(ctx, factor.accountId, "account_disabled");
-        const grants = await endAllOAuthGrants(ctx, factor.accountId);
-        return { tokenIds, grants };
+        ended.tokenIds.push(
+          ...(await revokeAllApiTokens(ctx, factor.accountId, "account_disabled")),
+        );
+        ended.grants.push(...(await endAllOAuthGrants(ctx, factor.accountId)));
       };
       // Removes the factor and revokes every session of the account. Returns the revocation, or
       // null and the store's error if the revocation failed, for `finishRollback`. If the factor
@@ -453,10 +460,12 @@ export function createTotp(
         } catch (error) {
           // The factor may still be active with a secret that someone without the grant
           // knows: fail closed and disable the account until an operator looks at it.
-          const ended = await disable()
+          const disabled = await disable()
             .catch(disable)
-            .catch(() => null);
-          const disabled = ended !== null;
+            .then(
+              () => true,
+              () => false,
+            );
           await ctx
             .emit({
               type: "totp.enrolment_failed",
@@ -475,19 +484,17 @@ export function createTotp(
                 reason: "totp_cleanup",
               })
               .catch(() => undefined);
-            await emitApiTokensRevoked(
-              ctx,
-              factor.accountId,
-              ended.tokenIds,
-              "account_disabled",
-            ).catch(() => undefined);
-            await emitOAuthGrantsEnded(
-              ctx,
-              factor.accountId,
-              ended.grants,
-              "account_disabled",
-            ).catch(() => undefined);
           }
+          // Also after a failed disable: what an attempt ended stays ended.
+          await emitApiTokensRevoked(
+            ctx,
+            factor.accountId,
+            ended.tokenIds,
+            "account_disabled",
+          ).catch(() => undefined);
+          await emitOAuthGrantsEnded(ctx, factor.accountId, ended.grants, "account_disabled").catch(
+            () => undefined,
+          );
           cleanupFailure = { error };
         }
         // Always, also after a failed delete: every session of the account ends.

@@ -409,15 +409,27 @@ describe("TOTP enrolment", () => {
   });
 
   it("rule: a cleanup that disables the account also revokes its API tokens", async () => {
-    for (const tokenStoreFails of [false, true]) {
-      const label = tokenStoreFails ? "token store fails" : "token store works";
+    for (const label of ["token store works", "token store fails", "grant store fails once"]) {
+      const tokenStoreFails = label === "token store fails";
       const hooked = hookedTotpStore();
       const { inner, hooks } = hooked;
       const tokens = inner.apiTokens;
-      if (!tokens) throw new Error("memory store has apiTokens");
+      const grants = inner.oauth;
+      if (!tokens || !grants) throw new Error("memory store has apiTokens and oauth");
       let tokenFailures = 0;
+      let grantFailures = 0;
       const store: IdentkitStore = {
         ...hooked.store,
+        oauth: {
+          ...grants,
+          deleteGrantsForAccount: async (...args) => {
+            if (grantFailures > 0) {
+              grantFailures -= 1;
+              throw new Error("no such table: identkit_oauth_grants");
+            }
+            return grants.deleteGrantsForAccount(...args);
+          },
+        },
         apiTokens: {
           ...tokens,
           revokeAllForAccount: async (...args) => {
@@ -451,6 +463,7 @@ describe("TOTP enrolment", () => {
       };
       hooks.failTotpDelete = 3;
       tokenFailures = tokenStoreFails ? 2 : 0;
+      grantFailures = label === "grant store fails once" ? 1 : 0;
       await expect(
         t.ik.totp.confirmEnrolment(user.token, {
           factorId: start.factorId,
@@ -489,6 +502,8 @@ describe("TOTP enrolment", () => {
         label,
       ).toEqual([`${oauthClient.clientId} account_disabled`]);
       if (!tokenStoreFails) {
+        // Review a2 B r1 L4: also after a grant store error, the retry finds the tokens revoked
+        // already; their event comes from the first attempt.
         expect(
           t.audit.ofType("api_token.revoked").map((e) => `${e.tokenId} ${e.reason}`),
           label,

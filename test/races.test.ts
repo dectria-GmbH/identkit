@@ -405,15 +405,26 @@ describe("passkey registration races", () => {
   });
 
   it("a cleanup that disables the account also revokes its API tokens", async () => {
-    for (const tokenStoreFails of [false, true]) {
-      const label = tokenStoreFails ? "token store fails" : "token store works";
+    for (const label of ["token store works", "token store fails", "grant store fails once"]) {
+      const tokenStoreFails = label === "token store fails";
       const inner = createMemoryStore();
       const tokens = inner.apiTokens;
-      if (!tokens) throw new Error("memory store has apiTokens");
-      const fail = { delete: 0, tokens: 0 };
+      const grants = inner.oauth;
+      if (!tokens || !grants) throw new Error("memory store has apiTokens and oauth");
+      const fail = { delete: 0, tokens: 0, grants: 0 };
       let afterActivate: (() => Promise<void>) | null = null;
       const store: IdentkitStore = {
         ...inner,
+        oauth: {
+          ...grants,
+          deleteGrantsForAccount: async (...args) => {
+            if (fail.grants > 0) {
+              fail.grants -= 1;
+              throw new Error("no such table: identkit_oauth_grants");
+            }
+            return grants.deleteGrantsForAccount(...args);
+          },
+        },
         apiTokens: {
           ...tokens,
           revokeAllForAccount: async (...args) => {
@@ -467,6 +478,7 @@ describe("passkey registration races", () => {
         await t.ik.passkeys.revokeEnrollmentTokens(accountId);
         fail.delete = 2;
         fail.tokens = tokenStoreFails ? 2 : 0;
+        fail.grants = label === "grant store fails once" ? 1 : 0;
       };
       const error: unknown = await t.ik.passkeys
         .finishRegistration({ enrollmentToken: token }, t.authenticator.register(start.options))
@@ -506,6 +518,8 @@ describe("passkey registration races", () => {
         label,
       ).toEqual([`${oauthClient.clientId} account_disabled`]);
       if (!tokenStoreFails) {
+        // Review a2 B r1 L4: also after a grant store error, the retry finds the tokens revoked
+        // already; their event comes from the first attempt.
         expect(
           t.audit.ofType("api_token.revoked").map((e) => `${e.tokenId} ${e.reason}`),
           label,
