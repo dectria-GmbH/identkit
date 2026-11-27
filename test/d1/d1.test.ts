@@ -6,15 +6,25 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { addSeconds } from "../../src/clock.js";
 import {
   createD1Store,
+  D1_DEFAULT_THROTTLE_RETRIES,
   D1_MIGRATIONS,
   D1ThrottleContentionError,
   migrateIdentkitD1,
   type D1DatabaseLike,
 } from "../../src/d1/index.js";
-import type { IdentkitStore } from "../../src/storage/types.js";
+import type { IdentkitStore, SessionRecord } from "../../src/storage/types.js";
+import { mfaPolicy, setup } from "../helpers.js";
 import { runStoreContract } from "../store-contract.js";
 import { runStoreFlows } from "../store-flows.js";
 import { startLocalD1 } from "./local-d1.js";
+import { recordingD1 } from "./recording-d1.js";
+
+/**
+ * D1 limit on queries per Worker invocation, Workers Free plan. Source:
+ * https://developers.cloudflare.com/d1/platform/limits/ (read 2026-11-27: "1000 (Workers Paid)
+ * / 50 (Free)"; a `batch()` counts as one query).
+ */
+const FREE_QUERIES_PER_INVOCATION = 50;
 
 const T0 = new Date("2030-01-01T00:00:00.000Z");
 
@@ -30,6 +40,36 @@ function requireStore(): IdentkitStore {
   if (!store) throw new Error("store not initialised");
   return store;
 }
+
+function requireLocal(): NonNullable<typeof local> {
+  if (!local) throw new Error("database not initialised");
+  return local;
+}
+
+const accountAt = (id: string) => ({
+  id,
+  email: `${id}@example.org`,
+  webauthnUserId: `${id}-wu`,
+  status: "active" as const,
+  createdAt: T0,
+  personKeyDigest: null,
+  assuranceLevel: null,
+  identityVerifiedAt: null,
+});
+
+const sessionAt = (id: string, accountId: string): SessionRecord => ({
+  id,
+  accountId,
+  tokenDigest: `${id}-digest`,
+  state: "complete",
+  authMethods: ["email_otp"],
+  createdAt: T0,
+  lastSeenAt: T0,
+  absoluteExpiresAt: addSeconds(T0, 3600),
+  stepUp: null,
+  revokedAt: null,
+  revokeReason: null,
+});
 
 async function names(db: D1DatabaseLike): Promise<string[]> {
   const { results } = await db
@@ -228,5 +268,126 @@ describe("d1", { timeout: 30_000 }, () => {
     ]);
     const usable = await Promise.all(digests.map((d) => s.enrollment.consume(d, T0)));
     expect(usable.filter((r) => r !== null).length).toBeLessThanOrEqual(1);
+  });
+
+  it("enrollment: issue is exactly one batch, the revocation of earlier tokens first", async () => {
+    // Deterministic guard for the race above: a revocation can run between two separate
+    // statements, but not inside one batch.
+    const recorded = recordingD1(requireDb());
+    const s = createD1Store(recorded.db);
+    await s.accounts.insert(accountAt("d1-enrollment-batch"));
+    recorded.calls.length = 0;
+    await s.enrollment.issue({
+      tokenDigest: "d1-enr-batch",
+      accountId: "d1-enrollment-batch",
+      createdAt: T0,
+      expiresAt: addSeconds(T0, 600),
+      consumedAt: null,
+      revokedAt: null,
+    });
+    expect(recorded.calls).toHaveLength(1);
+    expect(recorded.calls[0]?.kind).toBe("batch");
+    expect(recorded.calls[0]?.queries.map((q) => q.split(" ").slice(0, 3).join(" "))).toEqual([
+      "UPDATE identkit_enrollment_tokens SET",
+      "INSERT INTO identkit_enrollment_tokens",
+    ]);
+  });
+
+  it("read replication: refuses a D1 session unless the operator states first-primary", async () => {
+    const { binding } = requireLocal();
+    expect(() => createD1Store(binding.withSession())).toThrow(TypeError);
+    expect(() => createD1Store(binding.withSession("first-unconstrained"))).toThrow(
+      /withSession\("first-primary"\)/,
+    );
+    expect(() => createD1Store(binding.withSession("first-primary"))).toThrow(TypeError);
+    // The plain binding needs no option.
+    expect(() => createD1Store(binding)).not.toThrow();
+
+    const s = createD1Store(binding.withSession("first-primary"), {
+      sessionConstraint: "first-primary",
+    });
+    await s.accounts.insert(accountAt("d1-replica-account"));
+    await s.sessions.insert(sessionAt("d1-replica-session", "d1-replica-account"));
+    expect(await s.sessions.revoke("d1-replica-session", T0, "sign_out")).toBe(true);
+    expect((await requireStore().sessions.findById("d1-replica-session"))?.revokedAt).toEqual(T0);
+  });
+
+  it("dates: an invalid Date throws and revokes nothing, as PostgreSQL refuses it", async () => {
+    const s = requireStore();
+    const invalid = new Date(Number.NaN);
+    await s.accounts.insert(accountAt("d1-nan-account"));
+    await s.sessions.insert(sessionAt("d1-nan-1", "d1-nan-account"));
+    await s.sessions.insert(sessionAt("d1-nan-2", "d1-nan-account"));
+    await expect(s.sessions.revoke("d1-nan-1", invalid, "sign_out")).rejects.toThrow(RangeError);
+    await expect(
+      s.sessions.revokeAllForAccount("d1-nan-account", invalid, "sign_out"),
+    ).rejects.toThrow(RangeError);
+    await expect(s.enrollment.revokeAllForAccount("d1-nan-account", invalid)).rejects.toThrow(
+      RangeError,
+    );
+    // Nothing was written: both sessions are still live, and a valid revoke still matches.
+    expect((await s.sessions.findById("d1-nan-1"))?.revokedAt).toBeNull();
+    expect((await s.sessions.findById("d1-nan-2"))?.revokedAt).toBeNull();
+    expect(await s.sessions.revoke("d1-nan-1", T0, "sign_out")).toBe(true);
+  });
+
+  it("throttle: the worst case of reserve is 2 queries per round, within the Free plan limit", async () => {
+    // Every write misses, as if a concurrent call won each round.
+    const recorded = recordingD1(requireDb(), {
+      missWrite: (query) =>
+        /^(UPDATE|INSERT INTO) identkit_throttles /.test(query) && query.includes("RETURNING"),
+    });
+    const s = createD1Store(recorded.db);
+    const rule = {
+      maxFailures: 3,
+      windowSeconds: 60,
+      maxConsecutiveFailures: 100,
+      lockSeconds: 60,
+      maxLockSeconds: 60,
+    };
+    await expect(s.throttle.reserve("d1-worst-case", T0, rule)).rejects.toThrow(
+      D1ThrottleContentionError,
+    );
+    expect(recorded.calls).toHaveLength(2 * D1_DEFAULT_THROTTLE_RETRIES);
+    expect(recorded.calls.length).toBeLessThanOrEqual(FREE_QUERIES_PER_INVOCATION);
+  });
+
+  it("throttle: a service call that reserves stays within the Free plan limit in the worst case", async () => {
+    // Counts the queries of the heaviest calls that reserve a throttle, uncontended, and adds
+    // the extra rounds that contention can cost (each lost round: 2 queries).
+    const recorded = recordingD1(requireDb());
+    const t = setup({ store: createD1Store(recorded.db), policy: mfaPolicy });
+    const count = async (call: () => Promise<unknown>) => {
+      recorded.calls.length = 0;
+      await call();
+      return recorded.calls.length;
+    };
+    const flow = await t.codeFor("d1-budget@example.org");
+    const signIn = await count(() => t.ik.emailSignIn.verifyCode(flow));
+    const user = await t.signIn("d1-budget-3@example.org");
+    const start = await t.ik.totp.startEnrolment(user.token);
+    if (start.status !== "ok") throw new Error(start.reason);
+    const enrol = await count(() =>
+      t.ik.totp.confirmEnrolment(user.token, {
+        factorId: start.factorId,
+        code: t.totpCode(start.secret),
+      }),
+    );
+    t.clock.advanceSeconds(60);
+    const pendingFlow = await t.codeFor("d1-budget-3@example.org");
+    const pending = await t.ik.emailSignIn.verifyCode(pendingFlow);
+    if (pending.status !== "second_factor_required") throw new Error(pending.status);
+    const second = await count(() =>
+      t.ik.totp.verifySecondFactor(pending.pendingToken, { code: t.totpCode(start.secret) }),
+    );
+    t.clock.advanceSeconds(60);
+    const stepUp = await count(() =>
+      t.ik.stepUp.verifyTotp(user.token, { code: t.totpCode(start.secret) }),
+    );
+    // Measured 2026-11-27: sign-in 14, enrolment 17, second factor 12, step-up 11 queries.
+    const heaviest = Math.max(signIn, enrol, second, stepUp);
+    expect(heaviest + 2 * (D1_DEFAULT_THROTTLE_RETRIES - 1)).toBeLessThanOrEqual(
+      FREE_QUERIES_PER_INVOCATION,
+    );
   });
 });

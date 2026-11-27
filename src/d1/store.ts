@@ -17,10 +17,24 @@ export interface D1StoreOptions {
   /**
    * How often `throttle.reserve` reads the state again after a concurrent call changed it
    * first. Each round, one of the competing calls wins, so this bounds the wait under load.
-   * When the rounds run out, `reserve` throws and the attempt does not pass. Default 32.
+   * When the rounds run out, `reserve` throws and the attempt does not pass. Each round is at
+   * most two D1 queries, so one `reserve` makes at most `2 * throttleRetries` queries. The
+   * default keeps that within the D1 limit of 50 queries per Worker invocation on the Workers
+   * Free plan, with room for the other queries of the call. Default 16.
    */
   throttleRetries?: number;
+  /**
+   * Set this only if `db` is a D1 session that you started with
+   * `env.DB.withSession("first-primary")`. Without it, `createD1Store` refuses a D1 session
+   * (an object with `getBookmark`). A session with another constraint can read from a read
+   * replica that lags behind the primary, so a revoked session, a disabled account or a new
+   * lock can read as not yet written. The plain binding (`env.DB`) needs no option.
+   */
+  sessionConstraint?: "first-primary";
 }
+
+/** The default of `D1StoreOptions.throttleRetries`. */
+export const D1_DEFAULT_THROTTLE_RETRIES = 16;
 
 /** `throttle.reserve` lost the race for a key more often than `throttleRetries` allows. */
 export class D1ThrottleContentionError extends Error {
@@ -70,8 +84,14 @@ function integerOrNull(value: unknown): number | null {
 }
 
 /** Times are stored as integer milliseconds since the epoch, so SQLite compares numbers. */
-const ms = (date: Date): number => date.getTime();
-const msOrNull = (date: Date | null): number | null => (date === null ? null : date.getTime());
+// An invalid Date has no time. D1 would bind it as NULL, so for example `revoked_at` would stay
+// NULL and the session stay live. PostgreSQL refuses an invalid Date, and so does this store.
+function ms(date: Date): number {
+  const time = date.getTime();
+  if (!Number.isFinite(time)) throw new RangeError("invalid date: the time is not finite");
+  return time;
+}
+const msOrNull = (date: Date | null): number | null => (date === null ? null : ms(date));
 const date = (value: unknown): Date => new Date(integer(value));
 const dateOrNull = (value: unknown): Date | null => (value === null ? null : date(value));
 
@@ -243,6 +263,10 @@ const sameThrottleState = (a: ThrottleState, b: ThrottleState): boolean =>
   a.lockCount === b.lockCount &&
   a.consecutiveFailures === b.consecutiveFailures;
 
+/** A D1 session from `withSession()` has `getBookmark`; the plain binding has not. */
+const isD1Session = (db: D1DatabaseLike): boolean =>
+  typeof Reflect.get(db, "getBookmark") === "function";
+
 const SESSION_COLUMNS =
   "id, account_id, token_digest, state, auth_methods, created_at, last_seen_at, " +
   "absolute_expires_at, step_up_method, step_up_at, revoked_at, revoke_reason";
@@ -262,9 +286,17 @@ const TOTP_COLUMNS =
  * guarded method names how its atomicity holds.
  */
 export function createD1Store(db: D1DatabaseLike, options: D1StoreOptions = {}): IdentkitStore {
-  const throttleRetries = options.throttleRetries ?? 32;
+  const throttleRetries = options.throttleRetries ?? D1_DEFAULT_THROTTLE_RETRIES;
   if (!Number.isSafeInteger(throttleRetries) || throttleRetries < 1) {
     throw new RangeError("throttleRetries must be a positive integer");
+  }
+  if (isD1Session(db) && options.sessionConstraint !== "first-primary") {
+    throw new TypeError(
+      "createD1Store got a D1 session. A session can read from a lagging read replica, so a " +
+        "revoked session or a disabled account can still read as active. Pass the plain " +
+        'binding (env.DB), or a session from env.DB.withSession("first-primary") together ' +
+        'with the option sessionConstraint: "first-primary".',
+    );
   }
   const one = (query: string, ...values: unknown[]) =>
     db

@@ -145,7 +145,8 @@ use the evidence.
 Subpath `identkit/postgres`: `createPostgresStore(db)`, `migrateIdentkit(db)`, `MIGRATIONS_DIR`.
 
 Subpath `identkit/d1`: `createD1Store(db, options?)`, `migrateIdentkitD1(db)`, `D1_MIGRATIONS`,
-`D1ThrottleContentionError` and the types `D1DatabaseLike`, `D1StoreOptions`, `D1Migration`.
+`D1_DEFAULT_THROTTLE_RETRIES`, `D1ThrottleContentionError` and the types `D1DatabaseLike`,
+`D1StoreOptions`, `D1Migration`.
 
 Subpath `identkit/testing`: `createFakeClock`, `createRecordingMailSender`,
 `createRecordingAuditSink`, `createFakeIdentityVerificationAdapter`,
@@ -560,6 +561,22 @@ import { createD1Store } from "identkit/d1";
 const identkit = createIdentkit({ ...options, store: createD1Store(env.DB) });
 ```
 
+Read replication: pass the plain binding `env.DB`, which reads from the primary database. A D1
+session from `env.DB.withSession()` can read from a read replica that lags behind the primary.
+With the default constraint `"first-unconstrained"`, or with a bookmark from an earlier request,
+a revoked session can still validate, a disabled account can still read as active, and a new
+lockout can read as not yet set. So `createD1Store` refuses a D1 session (an object with
+`getBookmark`) and throws a `TypeError`. If you want a session, start it with
+`env.DB.withSession("first-primary")` and state that with the option:
+
+```ts
+const db = env.DB.withSession("first-primary");
+const store = createD1Store(db, { sessionConstraint: "first-primary" });
+```
+
+The store cannot read the constraint of a session, so the option is your statement. Never set it
+for a session with another constraint or from a bookmark.
+
 Its schema lives in `migrations-d1/`, separate from the PostgreSQL files. Every table and index
 starts with `identkit_`, so the schema can share one D1 database with the tables of your
 application. Apply it in one of two ways, and do not mix them for one database, because each
@@ -602,8 +619,19 @@ conditional statement (`UPDATE ... WHERE <expected state> RETURNING`, an upsert,
 `DELETE ... RETURNING`), or one `batch()` (`enrollment.issue`). `throttle.reserve` reads the
 state, applies `applyThrottle`, and writes with a compare-and-set on every stored field; if a
 concurrent call changed the state first, it reads again. After `throttleRetries` lost rounds
-(default 32) it throws `D1ThrottleContentionError`, and the attempt does not pass. The store
-contract tests, with their concurrency cases, run against a local D1 (miniflare).
+(default 16, `D1_DEFAULT_THROTTLE_RETRIES`) it throws `D1ThrottleContentionError`, and the
+attempt does not pass. The store contract tests, with their concurrency cases, run against a
+local D1 (miniflare).
+
+Query limit: D1 allows 50 queries per Worker invocation on the Workers Free plan and 1000 on
+Workers Paid; a `batch()` counts as one query (Cloudflare,
+[D1 limits](https://developers.cloudflare.com/d1/platform/limits/), read 2026-11-27). Each round
+of `throttle.reserve` is at most two queries (a read and a conditional write), so one `reserve`
+makes at most `2 * throttleRetries` queries: 32 with the default. A test counts the queries of
+the identkit calls that reserve a throttle (e-mail code sign-in, TOTP enrolment, TOTP second
+factor, TOTP step-up) and checks that each stays within 50 even when `reserve` loses every round
+but the last. If the limit is hit anyway, the query throws and the attempt does not pass. On
+Workers Paid you can raise `throttleRetries`; on Workers Free keep the default or lower it.
 
 The purge rule under "Operator duties" applies to D1 too, with times in milliseconds, for
 example `window_start < ?1 AND (locked_until IS NULL OR locked_until < ?1)` with `?1` set to

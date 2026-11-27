@@ -9,6 +9,12 @@ export interface D1PreparedStatementLike {
   run(): Promise<unknown>;
 }
 
+/**
+ * Pass the plain binding (`env.DB`), which reads from the primary. A D1 session
+ * (`env.DB.withSession(...)`) fits this type too, but `createD1Store` accepts one only with the
+ * option `sessionConstraint: "first-primary"`: a session with another constraint or from a
+ * bookmark can read from a lagging read replica.
+ */
 export interface D1DatabaseLike {
   prepare(query: string): D1PreparedStatementLike;
   /** Runs the statements in order as one transaction. A failed statement rolls back all. */
