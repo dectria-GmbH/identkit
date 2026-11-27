@@ -3,6 +3,7 @@ import type { Context } from "./context.js";
 import { randomBytes, toBase64Url } from "./bytes.js";
 import { randomId } from "./crypto.js";
 import { normalizeEmail } from "./email.js";
+import { AllSessionsRevokedHookError } from "./errors.js";
 import { throttleKey as otpThrottleKey } from "./email-otp.js";
 import { totpEnrolmentThrottleKey, totpThrottleKey } from "./throttle-keys.js";
 import { finishThenRunHook, type Revocation } from "./sessions.js";
@@ -169,8 +170,13 @@ export function createAccounts(
         throw error;
       }
       // Hook last: a throwing hook must not skip the audit events, nor a throwing sink the hook.
-      // A retry revokes and runs the hook again. A token store error wins over a sink or hook
-      // error: a retry of `disable` repeats the token revocation, the hook and the events.
+      // Which error goes up: the hook's, then the sink's, then the token store's. Only a failed
+      // hook leaves something live, and a refused event is lost for good: a retry of `disable`
+      // repeats the token revocation, its `api_token.revoked` events and the hook, but records
+      // neither `account.disabled` (the account is disabled already) nor `session.revoked` (the
+      // sessions are revoked already). A failed token revocation is safe, because `verify`
+      // refuses tokens of a disabled account; the thrown error carries it as
+      // `tokenRevocationError`.
       const finished = finishThenRunHook(revoked, async () => {
         let failure: { error: unknown } | null = null;
         try {
@@ -186,8 +192,35 @@ export function createAccounts(
         if (failure) throw failure.error;
       });
       if (!tokenFailure) return finished;
-      await finished.catch(() => undefined);
+      try {
+        await finished;
+      } catch (error) {
+        throw withTokenRevocationError(error, tokenFailure.error);
+      }
       throw tokenFailure.error;
     },
   };
+}
+
+/**
+ * Attaches the token store's error to the error that `disable` throws instead of it: the hook's
+ * `AllSessionsRevokedHookError` (as a field), or the audit sink's error (as a property set on
+ * the error object, if it is an object that takes one).
+ */
+function withTokenRevocationError(error: unknown, tokenRevocationError: unknown): unknown {
+  if (error instanceof AllSessionsRevokedHookError) {
+    return new AllSessionsRevokedHookError(error.accountId, error.exceptSessionId, {
+      cause: error.cause,
+      auditError: error.auditError,
+      tokenRevocationError,
+    });
+  }
+  if (typeof error === "object" && error !== null && Object.isExtensible(error)) {
+    Object.defineProperty(error, "tokenRevocationError", {
+      value: tokenRevocationError,
+      configurable: true,
+      writable: true,
+    });
+  }
+  return error;
 }

@@ -1,6 +1,7 @@
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
+  AllSessionsRevokedHookError,
   createHmacHasher,
   createIdentkit,
   createMemoryStore,
@@ -436,6 +437,15 @@ describe("api tokens", () => {
       { ...valid, name: "zero\u200Bwidth" },
       { ...valid, name: "bom\uFEFF" },
       { ...valid, name: "lone\uD800" },
+      // Review r2 N2: names that show nothing.
+      { ...valid, name: " " },
+      { ...valid, name: "\u00A0" },
+      { ...valid, name: "\u3164" },
+      { ...valid, name: "\u2800" },
+      { ...valid, name: "\u034F" },
+      { ...valid, name: "\u115F\u1160" },
+      { ...valid, name: "\uFFA0" },
+      { ...valid, name: " \u3000\u2800 " },
       { ...valid, name: 7 },
       { ...valid, scopes: [] },
       { ...valid, scopes: ["admin", "admin"] },
@@ -457,7 +467,11 @@ describe("api tokens", () => {
     }
     // 64 characters, also outside ASCII, are fine.
     expect((await t.token(accountId, { name: "ä".repeat(64) })).apiToken.name).toBe("ä".repeat(64));
-    expect(await t.ik.apiTokens.list(accountId)).toHaveLength(1);
+    // Blanks between visible characters are fine.
+    expect((await t.token(accountId, { name: "build\u00A0bot" })).apiToken.name).toBe(
+      "build\u00A0bot",
+    );
+    expect(await t.ik.apiTokens.list(accountId)).toHaveLength(2);
   });
 
   it("rule: verify returns only scopes the operator still allows, and refuses a token with none", async () => {
@@ -878,11 +892,8 @@ describe("api tokens: one token stored twice", () => {
     // One copy revoked: still refused, whichever one.
     await t.ik.apiTokens.revoke({ accountId: b, tokenId: keyed.apiToken.id });
     expect(await t.ik.apiTokens.verify(token)).toEqual(ambiguous);
-    // Without legacy digests, only the keyed row is read: it is revoked.
-    expect(await t.build(baseOptions).apiTokens.verify(token)).toEqual({
-      status: "refused",
-      reason: "revoked",
-    });
+    // Without legacy digests the legacy copy still counts: the token stays ambiguous.
+    expect(await t.build(baseOptions).apiTokens.verify(token)).toEqual(ambiguous);
 
     // Same account, other order of states: the legacy copy revoked, the keyed copy live.
     const other = randomShaped();
@@ -894,6 +905,49 @@ describe("api tokens: one token stored twice", () => {
     if (k2.status !== "imported" || l2.status !== "imported") throw new Error("setup");
     await t.ik.apiTokens.revoke({ accountId: a, tokenId: l2.apiToken.id });
     expect(await t.ik.apiTokens.verify(other)).toEqual(ambiguous);
+  });
+
+  it("rule: with acceptLegacyDigests off, a second copy still refuses the token", async () => {
+    const t = tokenSetup({ apiTokens: legacyOptions });
+    const strict = t.build(baseOptions);
+    const a = await t.account();
+    const b = await t.account();
+    const ambiguous = { status: "refused", reason: "ambiguous" };
+
+    // Review r2 L2: the owner revoked the legacy copy of a leaked token, the operator turned
+    // legacy digests off, and the live keyed copy verified again.
+    const leaked = randomShaped();
+    const keyed = await t.ik.apiTokens.import({ ...importInput(t, a), token: leaked });
+    const weak = await t.ik.apiTokens.import({
+      ...importInput(t, a),
+      sha256Digest: t.legacy(leaked),
+    });
+    if (keyed.status !== "imported" || weak.status !== "imported") throw new Error("setup");
+    await t.ik.apiTokens.revoke({ accountId: a, tokenId: weak.apiToken.id });
+    expect(await strict.apiTokens.verify(leaked)).toEqual(ambiguous);
+
+    // The keyed copy on a, a live legacy copy on b: no account wins.
+    const shared = randomShaped();
+    expect((await t.ik.apiTokens.import({ ...importInput(t, a), token: shared })).status).toBe(
+      "imported",
+    );
+    const onB = await t.ik.apiTokens.import({
+      ...importInput(t, b),
+      sha256Digest: t.legacy(shared),
+    });
+    expect(onB.status).toBe("imported");
+    expect(await strict.apiTokens.verify(shared)).toEqual(ambiguous);
+    expect(t.audit.ofType("api_token.used")).toEqual([]);
+
+    // A legacy copy alone still needs the option.
+    const lone = randomShaped();
+    const loneImport = await t.ik.apiTokens.import({
+      ...importInput(t, b),
+      sha256Digest: t.legacy(lone),
+    });
+    expect(loneImport.status).toBe("imported");
+    expect(await strict.apiTokens.verify(lone)).toEqual({ status: "refused", reason: "unknown" });
+    expect((await t.ik.apiTokens.verify(lone)).status).toBe("valid");
   });
 });
 
@@ -949,18 +1003,38 @@ describe("api tokens: api_token.used is best effort", () => {
   });
 });
 
+/** A memory store whose token revocation throws while `broken.on` is true. */
+function brokenTokenStore() {
+  const memory = createMemoryStore();
+  const tokens = memory.apiTokens;
+  if (!tokens) throw new Error("memory store has apiTokens");
+  const broken = { on: true };
+  const store: IdentkitStore = {
+    ...memory,
+    apiTokens: {
+      ...tokens,
+      revokeAllForAccount: (...args) =>
+        broken.on
+          ? Promise.reject(new Error("no such table: identkit_api_tokens"))
+          : tokens.revokeAllForAccount(...args),
+    },
+  };
+  return { store, broken };
+}
+
+/** The error a promise rejects with; fails if it resolves. */
+async function rejection(promise: Promise<unknown>): Promise<unknown> {
+  try {
+    await promise;
+  } catch (error) {
+    return error;
+  }
+  throw new Error("expected a rejection");
+}
+
 describe("api tokens: accounts.disable without a working token store", () => {
   it("rule: sessions are revoked and the hook runs when the token revocation throws", async () => {
-    const memory = createMemoryStore();
-    const tokens = memory.apiTokens;
-    if (!tokens) throw new Error("memory store has apiTokens");
-    const store: IdentkitStore = {
-      ...memory,
-      apiTokens: {
-        ...tokens,
-        revokeAllForAccount: () => Promise.reject(new Error("no such table: identkit_api_tokens")),
-      },
-    };
+    const { store } = brokenTokenStore();
     const hookEvents: { accountId: string; revokedSessionIds: string[] }[] = [];
     const t = setup({ store, onAllSessionsRevoked: (event) => void hookEvents.push(event) });
     const session = await t.signIn("disable@example.org");
@@ -973,6 +1047,69 @@ describe("api tokens: accounts.disable without a working token store", () => {
     expect(t.audit.ofType("session.revoked")).toHaveLength(1);
     expect(t.audit.ofType("account.disabled")).toHaveLength(1);
     expect((await t.ik.accounts.get(accountId))?.status).toBe("disabled");
+  });
+
+  it("rule: a failed hook wins over the token store error, which it carries", async () => {
+    const { store } = brokenTokenStore();
+    let hookRuns = 0;
+    const t = setup({
+      store,
+      onAllSessionsRevoked: () => {
+        hookRuns += 1;
+        throw new Error("hook down");
+      },
+    });
+    const accountId = (await t.signIn("hook@example.org")).account.id;
+    const error = await rejection(t.ik.accounts.disable(accountId));
+    // Review r2 L1: the token error went up and the hook failure was dropped.
+    expect(error).toBeInstanceOf(AllSessionsRevokedHookError);
+    const hookError = error as AllSessionsRevokedHookError;
+    expect(hookError.cause).toEqual(new Error("hook down"));
+    expect(hookError.auditError).toBeUndefined();
+    expect(hookError.tokenRevocationError).toEqual(new Error("no such table: identkit_api_tokens"));
+    expect(hookError.revokeAllOptions).toEqual({});
+    expect(hookRuns).toBe(1);
+    expect(t.audit.ofType("account.disabled")).toHaveLength(1);
+    expect(t.audit.ofType("session.revoked")).toHaveLength(1);
+  });
+
+  it("rule: a refused audit event wins over the token store error, which it carries", async () => {
+    for (const type of ["account.disabled", "session.revoked"] as const) {
+      const { store, broken } = brokenTokenStore();
+      let hookRuns = 0;
+      const t = setup({ store, onAllSessionsRevoked: () => void (hookRuns += 1) });
+      const accountId = (await t.signIn(`sink-${type}@example.org`)).account.id;
+      failSink(t.audit, type);
+      const error = await rejection(t.ik.accounts.disable(accountId));
+      // Review r2 L1: the token error went up and the refused event went unnoticed.
+      expect(error, type).toEqual(new Error("sink down"));
+      expect((error as { tokenRevocationError?: unknown }).tokenRevocationError, type).toEqual(
+        new Error("no such table: identkit_api_tokens"),
+      );
+      expect(hookRuns, type).toBe(1);
+      // A retry once the store works runs the hook again, but cannot record the lost event.
+      broken.on = false;
+      await t.ik.accounts.disable(accountId);
+      expect(hookRuns, type).toBe(2);
+      expect(t.audit.ofType(type), type).toHaveLength(0);
+    }
+  });
+
+  it("rule: hook, sink and token store all fail: the hook error carries both others", async () => {
+    const { store } = brokenTokenStore();
+    const t = setup({
+      store,
+      onAllSessionsRevoked: () => {
+        throw new Error("hook down");
+      },
+    });
+    const accountId = (await t.signIn("all@example.org")).account.id;
+    failSink(t.audit, "account.disabled");
+    const error = await rejection(t.ik.accounts.disable(accountId));
+    expect(error).toBeInstanceOf(AllSessionsRevokedHookError);
+    const hookError = error as AllSessionsRevokedHookError;
+    expect(hookError.auditError).toEqual(new Error("sink down"));
+    expect(hookError.tokenRevocationError).toEqual(new Error("no such table: identkit_api_tokens"));
   });
 });
 

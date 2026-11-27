@@ -78,12 +78,19 @@ export class AllSessionsRevokedHookError extends IdentkitError {
    * the throttle store's error from the reset after a successful enrolment.
    */
   readonly auditError: unknown;
+  /**
+   * Set only by `accounts.disable`: the store's error on the revocation of the account's API
+   * tokens, else undefined. The hook error wins over it, because only the hook leaves something
+   * live (`verify` refuses tokens of a disabled account). Call `accounts.disable` again to
+   * revoke the tokens.
+   */
+  readonly tokenRevocationError: unknown;
 
   constructor(
     readonly accountId: string,
     /** The session that stayed live, or null. */
     readonly exceptSessionId: string | null,
-    options?: ErrorOptions & { auditError?: unknown },
+    options?: ErrorOptions & { auditError?: unknown; tokenRevocationError?: unknown },
   ) {
     super(
       "all_sessions_revoked_hook_failed",
@@ -92,6 +99,7 @@ export class AllSessionsRevokedHookError extends IdentkitError {
     );
     this.revokeAllOptions = exceptSessionId === null ? {} : { exceptSessionId };
     this.auditError = options?.auditError;
+    this.tokenRevocationError = options?.tokenRevocationError;
   }
 }
 

@@ -23,6 +23,12 @@ const SHA256_HEX = /^[0-9a-f]{64}$/;
  * separator: an admin UI must show the name as it reads.
  */
 const NAME = /^[^\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]{1,64}$/u;
+/**
+ * Characters that show nothing: white space and space separators (U+00A0 among them), the
+ * combining grapheme joiner U+034F, the Hangul fillers U+115F, U+1160, U+3164 and U+FFA0, and
+ * the blank braille pattern U+2800. A name needs at least one character outside this set.
+ */
+const BLANK = /[\p{White_Space}\p{Z}\u034F\u115F\u1160\u2800\u3164\uFFA0]/gu;
 
 const unique = (values: readonly unknown[]) => new Set(values).size === values.length;
 
@@ -265,9 +271,9 @@ function requireDate(value: unknown, what: string): Date {
 }
 
 function checkName(value: unknown): string {
-  if (typeof value !== "string" || !NAME.test(value)) {
+  if (typeof value !== "string" || !NAME.test(value) || value.replace(BLANK, "") === "") {
     throw new InvalidArgumentError(
-      "name must have 1 to 64 characters and no control, format or separator characters",
+      "name must have 1 to 64 characters, not all blank, and no control, format or separator characters",
     );
   }
   return value;
@@ -441,14 +447,17 @@ export function createApiTokens(ctx: Context, options: ApiTokenOptions): ApiToke
     async verify(token) {
       if (!isTokenShaped(token)) return { status: "refused", reason: "malformed" };
       const keyed = await keyedDigest(token);
-      const legacy = settings.acceptLegacyDigests ? await legacyDigest(token) : null;
-      const found = await store.findByDigests(legacy === null ? [keyed] : [keyed, legacy]);
+      // Read the legacy digest also when legacy digests are off: a second copy of the token
+      // must refuse it in either setting, or turning the option off revives the keyed copy
+      // while its legacy copy is revoked or belongs to another account.
+      const legacy = await legacyDigest(token);
+      const found = await store.findByDigests([keyed, legacy]);
       // The read matched by digest; compare again in constant time, each row against the
       // digest of its own algorithm, so a row can match only the way it was stored.
       const matches = found.filter(({ record }) => {
         const algorithm: ApiTokenDigestAlgorithm = record.digestAlgorithm;
         if (algorithm === "hmac-sha256") return digestsEqual(record.digest, keyed);
-        return legacy !== null && digestsEqual(record.digest, legacy);
+        return digestsEqual(record.digest, legacy);
       });
       const [match, ...others] = matches;
       if (!match) return { status: "refused", reason: "unknown" };
@@ -456,6 +465,10 @@ export function createApiTokens(ctx: Context, options: ApiTokenOptions): ApiToke
       // scopes and state, and a store returns them in no defined order. Fail closed.
       if (others.length > 0) return { status: "refused", reason: "ambiguous" };
       const { record, accountStatus } = match;
+      // A lone legacy row counts only while the operator accepts legacy digests.
+      if (record.digestAlgorithm === "sha256" && !settings.acceptLegacyDigests) {
+        return { status: "refused", reason: "unknown" };
+      }
       const now = clock.now();
       if (record.revokedAt !== null) return { status: "refused", reason: "revoked" };
       if (now.getTime() >= record.expiresAt.getTime()) {

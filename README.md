@@ -835,7 +835,9 @@ Rules:
 
 - `create` takes a name (1 to 64 characters; no control characters, no format characters such as
   bidi controls and zero-width characters, no lone surrogates and no line or paragraph
-  separators, so a list shows the name as it reads), scopes (a non-empty set from
+  separators, so a list shows the name as it reads; and not blank: at least one character other
+  than white space, U+00A0 and the invisible fillers U+034F, U+115F, U+1160, U+2800, U+3164 and
+  U+FFA0), scopes (a non-empty set from
   `allowedScopes`, stored in the given order) and `expiresInDays` (one of `allowedExpiryDays`).
   Invalid input throws `InvalidArgumentError`. It returns `limit_reached` if the account has
   `maxActiveTokensPerAccount` active tokens (not revoked and not expired). Every store enforces
@@ -845,7 +847,9 @@ Rules:
   of the account, and compares the stored digest again in constant time. It refuses `unknown`,
   `revoked`, `expired` (at `expiresAt` and after) and `account_disabled`. If more than one stored
   token matches (one token imported twice, see "Import"), it refuses `ambiguous`, whatever the
-  state, account or scopes of the copies: it never picks one.
+  state, account or scopes of the copies: it never picks one. It looks for the legacy digest of
+  the token also when `acceptLegacyDigests` is off, so a second copy refuses the token in either
+  setting; a legacy copy alone verifies only while the option is on.
 - `verify` returns the account id, the token id, `expiresAt` and the stored scopes that
   `allowedScopes` still lists, in stored order. If you remove a scope from `allowedScopes`,
   tokens lose it at once (fewer rights, never more). A token with no listed scope left is
@@ -859,10 +863,10 @@ Rules:
 - A revocation takes effect for every verify that starts after it. identkit does not delete rows:
   `list` shows tokens that are not revoked, expired ones included.
 - Measured with `pnpm check:workerd` on 2026-11-27 (memory store, so without database time):
-  `apiTokens.verify` takes 0.0067 ms wall time per call in workerd and 0.0195 ms CPU time per call
-  on Node; `sessions.validate` took 0.0093 ms and 0.0262 ms in the same run. With
-  `acceptLegacyDigests` a verify also computes a SHA-256; a separate Node run measured 0.0366 ms
-  CPU time per call for a legacy token and 0.0275 ms for a keyed one. Workers Free allows 10 ms
+  `apiTokens.verify` takes 0.0102 ms wall time per call in workerd and 0.0335 ms CPU time per call
+  on Node; `sessions.validate` took 0.0105 ms and 0.0291 ms in the same run. Every verify computes
+  the keyed HMAC and the unkeyed SHA-256 of the token (to find a legacy copy, see "Import"); the
+  figures include both. Workers Free allows 10 ms
   CPU time per HTTP request (Cloudflare,
   [Workers limits](https://developers.cloudflare.com/workers/platform/limits/), read 2026-11-27).
 
@@ -872,8 +876,16 @@ Accounts and sessions:
   the option `apiTokens` is not set, if the store has `apiTokens`. And `verify` refuses a token
   whose account is not active, also one that a parallel `create` stored after the revocation.
   If the token revocation throws (for example on a schema without the token table),
-  `accounts.disable` still revokes the sessions, records its events and runs
-  `onAllSessionsRevoked`, then throws the store's error. The writes stand; call it again.
+  `accounts.disable` still revokes the sessions, offers its events to the sink and runs
+  `onAllSessionsRevoked`. Then it throws the store's error, unless the hook or the sink failed
+  too: the hook's `AllSessionsRevokedHookError` wins, then the sink's error, because a failed
+  hook leaves your application's sessions live and a refused event is lost, while the tokens
+  stay unusable. The thrown error then carries the store's error as `tokenRevocationError` (a
+  field of `AllSessionsRevokedHookError`; on a sink error, a property identkit sets if the error
+  is an object). The writes stand; call `accounts.disable` again once the store works. That call
+  revokes the remaining tokens, records their `api_token.revoked` events and runs the hook again.
+  It does not record `account.disabled` or `session.revoked` again, also not when the sink
+  refused them the first time.
 - Tokens are separate from sessions. `sessions.revokeAll`, a passkey or TOTP change and
   `oidc.removeLink` do not revoke tokens, and `onAllSessionsRevoked` is not called for tokens.
   Call `apiTokens.revokeAll(accountId)` where a sign-out everywhere must also end tokens, for
@@ -937,10 +949,12 @@ Import:
   `digest_taken` for a token that an earlier import stored as a legacy digest. A revoked copy
   keeps the token revoked. The other direction has a limit: an import with `sha256Digest` cannot
   find a keyed row of the same token, because the HMAC needs the plaintext. If you import one
-  token in both forms in that order, `verify` refuses it as `ambiguous` while
-  `acceptLegacyDigests` is on. Revoke the legacy copy (`legacyDigest: true` in `list`) and turn
-  `acceptLegacyDigests` off, or import each token in one form only. To move a legacy token to
-  the HMAC, the owner creates a new token; identkit does not replace a stored digest.
+  token in both forms in that order (or both at once), `verify` refuses it as `ambiguous`,
+  whether `acceptLegacyDigests` is on or off, and revoking one copy does not change that: both
+  rows stay. Import each token in one form only. A token stored twice stays unusable; its owner
+  creates a new one. The two copies can sit on different accounts, and `list(accountId)` shows
+  only the copies of that account (`legacyDigest: true` marks a legacy copy). To move a legacy
+  token to the HMAC, the owner creates a new token; identkit does not replace a stored digest.
 
 ## Identity verification port
 
