@@ -55,3 +55,29 @@ export class PasskeyCleanupError extends IdentkitError {
     );
   }
 }
+
+/**
+ * The option `onAllSessionsRevoked` threw. identkit finished its own work before it called the
+ * hook: the identkit sessions are revoked, and the calling operation's writes and audit events
+ * are complete. To re-run the hook, call
+ * `sessions.revokeAll(error.accountId, error.revokeAllOptions)`; that call is idempotent.
+ * `cause` holds the hook's error.
+ */
+export class AllSessionsRevokedHookError extends IdentkitError {
+  /** The options for `sessions.revokeAll` that re-run the hook for the same sessions. */
+  readonly revokeAllOptions: { exceptSessionId?: string };
+
+  constructor(
+    readonly accountId: string,
+    /** The session that stayed live, or null. */
+    readonly exceptSessionId: string | null,
+    options?: ErrorOptions,
+  ) {
+    super(
+      "all_sessions_revoked_hook_failed",
+      "onAllSessionsRevoked failed after the revocation; call sessions.revokeAll again",
+      options,
+    );
+    this.revokeAllOptions = exceptSessionId === null ? {} : { exceptSessionId };
+  }
+}

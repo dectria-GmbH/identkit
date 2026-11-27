@@ -5,6 +5,7 @@ import {
   type GoogleProviderOptions,
   type MicrosoftProviderOptions,
   type OidcOptions,
+  type AllSessionsRevokedHook,
   type SignInPolicy,
 } from "../src/index.js";
 import type { OidcFetch } from "../src/oidc-jwks.js";
@@ -67,6 +68,7 @@ export interface OidcSetupOptions {
   privilegedEmails?: string[];
   oidcConfig?: Partial<typeof testOidcConfig>;
   sharedFetchLog?: string[];
+  onAllSessionsRevoked?: AllSessionsRevokedHook;
 }
 
 export async function oidcSetup(options: OidcSetupOptions = {}) {
@@ -119,6 +121,7 @@ export async function oidcSetup(options: OidcSetupOptions = {}) {
   const t = setup({
     ...(options.store ? { store: options.store } : {}),
     ...(options.privilegedEmails ? { privilegedEmails: options.privilegedEmails } : {}),
+    ...(options.onAllSessionsRevoked ? { onAllSessionsRevoked: options.onAllSessionsRevoked } : {}),
     policy: options.policy ?? oidcPolicy,
     config: { ...testConfig, oidc: { ...testOidcConfig, ...options.oidcConfig } },
     oidc: {

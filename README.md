@@ -341,8 +341,16 @@ Sessions:
   `accounts.disable`, a passkey change, a TOTP change or `oidc.removeLink` calls it, and also
   when no session was live. `event` holds `accountId`, `exceptSessionId` (the session that stayed,
   or null) and `revokedSessionIds`. Use it to end sessions your application keeps itself, for
-  example with a per-account version. It runs after the revocation and its audit events; if it
-  throws, the call fails, the identkit sessions stay revoked, and a retry calls it again.
+  example with a per-account version. It runs last: after the revocation and after the calling
+  operation's own writes and audit events (the disable, the new or removed passkey, the TOTP
+  change, the removed link). If it throws, the call throws `AllSessionsRevokedHookError`, and
+  everything identkit does is done: the identkit sessions stay revoked and the audit events are
+  written. Some calls cannot be repeated (a finished passkey registration or TOTP enrolment, a
+  `totp.remove` whose factor is gone), so re-run the hook with
+  `sessions.revokeAll(error.accountId, error.revokeAllOptions)`.
+  `revokeAll` is idempotent and calls the hook also when no session was live. Make the hook
+  idempotent too. If an operation fails for another reason and rolls back (a failed passkey
+  registration or TOTP enrolment), the hook runs best effort and the original error goes up.
 
 Passkeys:
 

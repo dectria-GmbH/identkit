@@ -48,6 +48,7 @@ export {
 export type { AuditEvent, AuditEventType, AuditSink } from "./audit.js";
 export type { MailSender, OtpMailPurpose } from "./context.js";
 export {
+  AllSessionsRevokedHookError,
   IdentkitError,
   InvalidArgumentError,
   MethodNotAllowedError,

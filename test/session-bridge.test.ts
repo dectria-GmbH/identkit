@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { parseConfig, type AllSessionsRevokedEvent } from "../src/index.js";
+import {
+  AllSessionsRevokedHookError,
+  parseConfig,
+  type AllSessionsRevokedEvent,
+} from "../src/index.js";
 import { setup, testConfig } from "./helpers.js";
 
 const TWELVE_HOURS = 43_200;
@@ -95,7 +99,10 @@ describe("session bridge", () => {
       },
     });
     const a = await t.signIn("person@example.org");
-    await expect(t.ik.sessions.revokeAll(a.account.id)).rejects.toThrow("application store down");
+    const error: unknown = await t.ik.sessions.revokeAll(a.account.id).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(AllSessionsRevokedHookError);
+    expect(error).toMatchObject({ accountId: a.account.id, exceptSessionId: null });
+    expect((error as Error).cause).toEqual(new Error("application store down"));
     expect(await t.ik.sessions.validate(a.token)).toBeNull();
     expect(t.audit.ofType("session.revoked")).toHaveLength(1);
     fail = false;

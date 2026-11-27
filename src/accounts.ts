@@ -74,7 +74,7 @@ export function newAccountRecord(email: string, createdAt: Date): AccountRecord 
 
 export function createAccounts(
   ctx: Context,
-  revokeAll: (accountId: string) => Promise<number>,
+  revokeAll: (accountId: string) => Promise<{ count: number; runHook: () => Promise<void> }>,
 ): Accounts {
   const { store, clock, hasher } = ctx;
 
@@ -136,8 +136,10 @@ export function createAccounts(
       const record = await store.accounts.findById(accountId);
       if (!record) return;
       await store.accounts.setStatus(accountId, "disabled");
-      await revokeAll(accountId);
+      const { runHook } = await revokeAll(accountId);
       await ctx.emit({ type: "account.disabled", accountId });
+      // Last: a throwing hook must not skip the audit event. A retry reaches it again.
+      await runHook();
     },
   };
 }

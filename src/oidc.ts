@@ -31,7 +31,7 @@ import {
   type ProviderInternals,
 } from "./oidc-providers.js";
 import type { SecretSealer } from "./sealer.js";
-import type { IssuedSession, SessionInternals, Sessions } from "./sessions.js";
+import type { IssuedSession, SessionInternals } from "./sessions.js";
 import type {
   AccountRecord,
   IdentkitStore,
@@ -184,7 +184,8 @@ export interface Oidc {
   listLinks(accountId: string): Promise<OidcLinkView[]>;
   /**
    * Administrative: removes a link and revokes every session of the account. Returns false if
-   * the account has no link with this id.
+   * the account has no link with this id; it revokes the sessions also then, so a retry after a
+   * failed revocation or session hook completes it. Takes bare ids; trusts its caller.
    */
   removeLink(accountId: string, linkId: string): Promise<boolean>;
 }
@@ -329,12 +330,7 @@ function importIdentity(input: OidcImportInput): Omit<ProviderIdentity, "address
   throw new InvalidArgumentError("provider must be microsoft, google or oidc");
 }
 
-export function createOidc(
-  ctx: Context,
-  internals: SessionInternals,
-  sessions: Sessions,
-  options: OidcOptions,
-): Oidc {
+export function createOidc(ctx: Context, internals: SessionInternals, options: OidcOptions): Oidc {
   checkOidcOptions(ctx, options);
   const { store, clock, hasher } = ctx;
   // Checked above; repeated for the type.
@@ -765,16 +761,25 @@ export function createOidc(
 
     async removeLink(accountId, linkId) {
       const found = (await linkStore.listByAccount(accountId)).find((l) => l.id === linkId);
-      if (!found || !(await linkStore.delete(linkId, accountId))) return false;
-      // Sessions first, so a failing audit sink cannot leave sessions of the removed subject.
-      await sessions.revokeAll(accountId);
-      await ctx.emit({
-        type: "oidc.link_removed",
-        accountId,
-        linkId,
-        provider: found.provider,
-      });
-      return true;
+      const removed = found ? await linkStore.delete(linkId, accountId) : false;
+      const removedEvent = found
+        ? ({ type: "oidc.link_removed", accountId, linkId, provider: found.provider } as const)
+        : null;
+      // Sessions before the audit event, so a failing sink cannot leave sessions of the removed
+      // subject. Always, also when the link is gone: a retry must still reach the revocation
+      // and the session hook.
+      let runHook: () => Promise<void>;
+      try {
+        ({ runHook } = await internals.revokeAllDeferringHook(accountId));
+      } catch (error) {
+        // A retry finds no link and cannot record the removal any more.
+        if (removed && removedEvent) await ctx.emit(removedEvent).catch(() => undefined);
+        throw error;
+      }
+      if (removed && removedEvent) await ctx.emit(removedEvent);
+      // Last: a throwing hook must not skip the audit event.
+      await runHook();
+      return removed;
     },
   };
 }

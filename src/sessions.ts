@@ -2,6 +2,7 @@ import { addSeconds } from "./clock.js";
 import type { AuthMethod, StepUpMethod } from "./config.js";
 import type { Context } from "./context.js";
 import { isTokenShaped, randomId, randomToken } from "./crypto.js";
+import { AllSessionsRevokedHookError } from "./errors.js";
 import type { SessionRecord, SessionState, StepUpRecord } from "./storage/types.js";
 
 /** What a consumer sees of a valid session. Never contains the token. */
@@ -40,8 +41,9 @@ export interface Sessions {
   /**
    * Administrative: revokes all sessions of an account, for example on sign-out everywhere.
    * Takes a bare id. Do not pass client input without your own check. Calls the option
-   * `onAllSessionsRevoked` after the revocation; if the hook throws, this call throws, and the
-   * sessions stay revoked.
+   * `onAllSessionsRevoked` after the revocation and its audit events, also when no session was
+   * live. If the hook throws, this call throws `AllSessionsRevokedHookError` and the sessions
+   * stay revoked. The call is idempotent: call it again to re-run the hook.
    */
   revokeAll(accountId: string, options?: { exceptSessionId?: string }): Promise<number>;
 }
@@ -67,6 +69,16 @@ export interface SessionInternals {
     reason: string,
   ): Promise<IssuedSession | null>;
   view(record: SessionRecord): SessionView;
+  /**
+   * Revokes like `sessions.revokeAll` but does not call the hook. The caller finishes its own
+   * writes and audit events first and then calls `runHook`, so a throwing hook cannot leave
+   * identkit's state half-written or skip an audit event. `runHook` throws
+   * `AllSessionsRevokedHookError`.
+   */
+  revokeAllDeferringHook(
+    accountId: string,
+    options?: { exceptSessionId?: string },
+  ): Promise<{ count: number; runHook: () => Promise<void> }>;
 }
 
 /** What `onAllSessionsRevoked` receives after `sessions.revokeAll`. */
@@ -276,27 +288,40 @@ export function createSessions(
     },
 
     async revokeAll(accountId, options) {
-      const ids = await store.sessions.revokeAllForAccount(
-        accountId,
-        clock.now(),
-        "revoked_all",
-        options?.exceptSessionId,
-      );
-      for (const sessionId of ids) {
-        await ctx.emit({ type: "session.revoked", accountId, sessionId, reason: "revoked_all" });
-      }
-      // After the revocation and its audit events. Called also when no session was live, so a
-      // retry after a failed hook or audit sink reaches the hook.
-      if (onAllSessionsRevoked) {
-        await onAllSessionsRevoked({
-          accountId,
-          exceptSessionId: options?.exceptSessionId ?? null,
-          revokedSessionIds: [...ids],
-        });
-      }
-      return ids.length;
+      const { count, runHook } = await revokeAllDeferringHook(accountId, options);
+      await runHook();
+      return count;
     },
   };
 
-  return { sessions, internals: { create, load, loadById, elevate, view } };
+  async function revokeAllDeferringHook(
+    accountId: string,
+    options?: { exceptSessionId?: string },
+  ): Promise<{ count: number; runHook: () => Promise<void> }> {
+    const ids = await store.sessions.revokeAllForAccount(
+      accountId,
+      clock.now(),
+      "revoked_all",
+      options?.exceptSessionId,
+    );
+    for (const sessionId of ids) {
+      await ctx.emit({ type: "session.revoked", accountId, sessionId, reason: "revoked_all" });
+    }
+    const exceptSessionId = options?.exceptSessionId ?? null;
+    // Called also when no session was live, so a repeated `revokeAll` re-runs the hook.
+    const runHook = async () => {
+      if (!onAllSessionsRevoked) return;
+      try {
+        await onAllSessionsRevoked({ accountId, exceptSessionId, revokedSessionIds: [...ids] });
+      } catch (error) {
+        throw new AllSessionsRevokedHookError(accountId, exceptSessionId, { cause: error });
+      }
+    };
+    return { count: ids.length, runHook };
+  }
+
+  return {
+    sessions,
+    internals: { create, load, loadById, elevate, view, revokeAllDeferringHook },
+  };
 }

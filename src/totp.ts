@@ -422,7 +422,12 @@ export function createTotp(
       const remove = async () => store.totp.delete(factor.id, factor.accountId);
       const removeAll = async () => store.totp.deleteAllForAccount(factor.accountId);
       const disable = async () => store.accounts.setStatus(factor.accountId, "disabled");
-      const undo = async () => {
+      // Returns the session hook, so the caller runs it after its own audit event. If `undo`
+      // fails, it runs the hook best effort and throws its first failure: neither a later store
+      // error nor the hook may replace it.
+      const undo = async (): Promise<() => Promise<void>> => {
+        let failed = false;
+        let failure: unknown;
         try {
           await remove().catch(remove).catch(removeAll);
         } catch (error) {
@@ -453,17 +458,36 @@ export function createTotp(
               })
               .catch(() => undefined);
           }
-          throw error;
-        } finally {
-          await sessions.revokeAll(factor.accountId);
+          failed = true;
+          failure = error;
         }
+        // Always, also after a failed delete: every session of the account ends.
+        let revoked: { runHook: () => Promise<void> } | null = null;
+        try {
+          revoked = await internals.revokeAllDeferringHook(factor.accountId);
+        } catch (error) {
+          if (!failed) {
+            failed = true;
+            failure = error;
+          }
+        }
+        if (failed || !revoked) {
+          await revoked?.runHook().catch(() => undefined);
+          throw failure;
+        }
+        return revoked.runHook;
       };
+      // For the error paths: the original error goes up, so the hook runs best effort.
+      const undoKeepingError = async () =>
+        undo()
+          .then((runHook) => runHook())
+          .catch(() => undefined);
       // The confirming code's step is recorded, so it cannot sign in or step up afterwards.
       let activated: boolean;
       try {
         activated = await store.totp.activate(factor.id, factor.accountId, step, now);
       } catch (error) {
-        await undo().catch(() => undefined);
+        await undoKeepingError();
         throw error;
       }
       if (!activated) {
@@ -478,23 +502,27 @@ export function createTotp(
           ? await grantHolds(live, factor.id)
           : { status: "denied", reason: "no_session" };
       } catch (error) {
-        await undo().catch(() => undefined);
+        await undoKeepingError();
         throw error;
       }
       if (outcome !== true) {
-        await undo();
+        const runHook = await undo();
         await enrolmentFailed(record.accountId, "grant_changed", factor.id);
+        // Last: a throwing hook must not skip the audit event.
+        await runHook();
         return outcome;
       }
       // Revoke first: if the audit sink fails afterwards, no other session survives. If the
       // revocation fails, the factor goes and every session ends, as for any other error.
       let revokedSessions: number;
+      let runHook: () => Promise<void>;
       try {
-        revokedSessions = await sessions.revokeAll(factor.accountId, {
-          exceptSessionId: record.id,
-        });
+        ({ count: revokedSessions, runHook } = await internals.revokeAllDeferringHook(
+          factor.accountId,
+          { exceptSessionId: record.id },
+        ));
       } catch (error) {
-        await undo().catch(() => undefined);
+        await undoKeepingError();
         throw error;
       }
       // Only now: a store error here must not skip the check and the revocation above.
@@ -505,6 +533,9 @@ export function createTotp(
         sessionId: record.id,
         factorId: factor.id,
       });
+      // Last: the factor is active and recorded. A throwing hook surfaces as
+      // `AllSessionsRevokedHookError`, which names how to re-run it.
+      await runHook();
       return { status: "enrolled", factorId: factor.id, revokedSessions };
     },
 
@@ -568,14 +599,17 @@ export function createTotp(
       // Revoke first: if the audit sink fails afterwards, no other session survives. One
       // retry: a retried `remove` would answer `not_found` and not reach the revocation.
       const revokeOthers = async () =>
-        sessions.revokeAll(record.accountId, { exceptSessionId: record.id });
-      await revokeOthers().catch(revokeOthers);
+        internals.revokeAllDeferringHook(record.accountId, { exceptSessionId: record.id });
+      const { runHook } = await revokeOthers().catch(revokeOthers);
       await ctx.emit({
         type: "totp.removed",
         accountId: record.accountId,
         sessionId: record.id,
         factorId: factor.id,
       });
+      // Last: the factor is gone and recorded. A retried `remove` answers `not_found`, so a
+      // throwing hook surfaces as `AllSessionsRevokedHookError`, which names how to re-run it.
+      await runHook();
       return { status: "removed" };
     },
 
@@ -584,15 +618,18 @@ export function createTotp(
       // Pending factors too: an enrolment confirmed at this moment must not survive.
       const deleted = await store.totp.deleteAllForAccount(accountId);
       // Always, also without a factor: a retry after a failed revocation must still end them.
-      await sessions.revokeAll(accountId);
-      if (deleted === 0) return false;
-      await ctx.emit({
-        type: "totp.removed",
-        accountId,
-        ...(factor ? { factorId: factor.id } : {}),
-        reason: "administrative",
-      });
-      return true;
+      const { runHook } = await internals.revokeAllDeferringHook(accountId);
+      if (deleted > 0) {
+        await ctx.emit({
+          type: "totp.removed",
+          accountId,
+          ...(factor ? { factorId: factor.id } : {}),
+          reason: "administrative",
+        });
+      }
+      // Last: a throwing hook must not skip the audit event. A retry reaches it again.
+      await runHook();
+      return deleted > 0;
     },
 
     async reseal(accountId) {
