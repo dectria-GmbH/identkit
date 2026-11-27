@@ -32,14 +32,21 @@ function failSinkOnce(audit: RecordingAuditSink, type: string) {
 
 /** Legacy tokens of an earlier system: a table of token -> what its verifier returns. */
 function legacySystem() {
-  const access = new Map<string, { grantId: string; audience: string; expiresAt: Date }>();
+  const access = new Map<
+    string,
+    { grantId: string; audience: string; expiresAt: Date; scopes?: string[] }
+  >();
   const refresh = new Map<string, { grantId: string; generation: number; expiresAt: Date }>();
   const verifyAccessToken = vi.fn(async (token: string) => access.get(token) ?? null);
   const verifyRefreshToken = vi.fn(async (token: string) => refresh.get(token) ?? null);
   return { access, refresh, verifyAccessToken, verifyRefreshToken };
 }
 
-function importSetup(oauth: Partial<OAuthOptions> = {}, store?: IdentkitStore) {
+function importSetup(
+  oauth: Partial<OAuthOptions> = {},
+  store?: IdentkitStore,
+  apiTokens?: { prefix: string; allowedScopes: string[] },
+) {
   const legacy = legacySystem();
   const setup = oauthSetup({
     oauth: {
@@ -51,6 +58,7 @@ function importSetup(oauth: Partial<OAuthOptions> = {}, store?: IdentkitStore) {
       ...oauth,
     },
     ...(store ? { store } : {}),
+    ...(apiTokens ? { apiTokens } : {}),
   });
   return { ...setup, legacy };
 }
@@ -691,6 +699,83 @@ describe("oauth legacy access tokens", () => {
     expect(await refusal(g.accessToken)).toMatchObject({ reason: "unknown" });
   });
 
+  it("refuses an audience other than the grant's resource, also a configured one (review a2 B r1 L1)", async () => {
+    const t = importSetup();
+    const g = await importedGrant(t);
+    // ISSUER is the second configured resource; the grant was imported for RESOURCE.
+    t.legacy.access.set("second-resource", {
+      grantId: g.grantId,
+      audience: ISSUER,
+      expiresAt: new Date(t.clock.now().getTime() + 1000),
+    });
+    expect(await t.ik.oauth.validateAccessToken("second-resource")).toEqual({
+      status: "refused",
+      reason: "wrong_resource",
+    });
+    expect(await t.ik.oauth.validateAccessToken("second-resource", { resource: ISSUER })).toEqual({
+      status: "refused",
+      reason: "wrong_resource",
+    });
+    // The control: the grant's own resource passes.
+    expect(
+      (await t.ik.oauth.validateAccessToken(g.accessToken, { resource: RESOURCE })).status,
+    ).toBe("valid");
+  });
+
+  it("never shows a verifier a token with the API token prefix (review a2 B r1 L2)", async () => {
+    const t = importSetup({}, undefined, { prefix: "pat_", allowedScopes: ["read"] });
+    const g = await importedGrant(t);
+    const apiToken = `pat_${"A".repeat(43)}`;
+    expect(await t.ik.oauth.validateAccessToken(apiToken)).toEqual({
+      status: "refused",
+      reason: "malformed",
+    });
+    await t.ik.oauth.revoke({
+      form: new URLSearchParams({ token: apiToken, client_id: g.clientId }),
+      authorization: null,
+    });
+    const refreshed = await t.ik.oauth.token({
+      form: refreshForm(g.clientId, `pat_${"B".repeat(43)}`),
+      authorization: null,
+    });
+    expect(refreshed.body).toMatchObject({ error: "invalid_grant" });
+    expect(t.legacy.verifyAccessToken).not.toHaveBeenCalled();
+    expect(t.legacy.verifyRefreshToken).not.toHaveBeenCalled();
+    // The control: a token without any identkit prefix reaches the verifier.
+    await t.ik.oauth.validateAccessToken("legacy-unknown");
+    expect(t.legacy.verifyAccessToken).toHaveBeenCalledWith("legacy-unknown");
+  });
+
+  it("narrows the scopes to those the legacy token names, never wider (review a2 B r1 L3)", async () => {
+    const t = importSetup();
+    const g = await importedGrant(t, { scopes: ["mcp:read", "mcp:events"] });
+    const expiresAt = new Date(t.clock.now().getTime() + 1000);
+    const validate = async (scopes: string[]) => {
+      t.legacy.access.set("narrowed", {
+        grantId: g.grantId,
+        audience: RESOURCE,
+        expiresAt,
+        scopes,
+      });
+      return t.ik.oauth.validateAccessToken("narrowed");
+    };
+    expect(await validate(["mcp:events"])).toMatchObject({
+      status: "valid",
+      scopes: ["mcp:events"],
+    });
+    // A scope beyond the grant is dropped.
+    expect(await validate(["mcp:read", "admin"])).toMatchObject({
+      status: "valid",
+      scopes: ["mcp:read"],
+    });
+    expect(await validate(["admin"])).toEqual({ status: "refused", reason: "no_allowed_scope" });
+    expect(await validate([])).toEqual({ status: "refused", reason: "no_allowed_scope" });
+    // Without scopes the token carries the grant's.
+    expect(await t.ik.oauth.validateAccessToken(g.accessToken)).toMatchObject({
+      scopes: ["mcp:read", "mcp:events"],
+    });
+  });
+
   it("fails closed when the verifier throws or returns another shape", async () => {
     const t = importSetup();
     t.legacy.verifyAccessToken.mockRejectedValueOnce(new Error("key fetch failed"));
@@ -699,6 +784,8 @@ describe("oauth legacy access tokens", () => {
       undefined,
       {},
       { grantId: "g", audience: RESOURCE, expiresAt: "soon" },
+      { grantId: "g", audience: RESOURCE, expiresAt: new Date(), scopes: "mcp:read" },
+      { grantId: "g", audience: RESOURCE, expiresAt: new Date(), scopes: [1] },
       true,
     ]) {
       t.legacy.verifyAccessToken.mockResolvedValueOnce(shape as never);
@@ -811,6 +898,42 @@ describe("oauth legacy refresh tokens", () => {
       );
     }
     expect(await t.ik.oauth.listGrants(g.accountId)).toHaveLength(1);
+  });
+
+  it("ends the grant for a token one generation below whose digest is not the previous one (review a2 B r1 N4)", async () => {
+    const t = importSetup();
+    const g = await importedGrant(t);
+    // A legacy rotation: the grant is at generation 4 now, its previous digest the legacy token's.
+    const rotated = await t.ik.oauth.token({
+      form: refreshForm(g.clientId, g.refreshToken),
+      authorization: null,
+    });
+    expect(rotated.httpStatus).toBe(200);
+    t.clock.advanceSeconds(5);
+    // Within the grace, generation 3 as the previous token, but another token: a copy of an
+    // earlier generation 3 token cannot be the one just rotated.
+    t.legacy.refresh.set("other-gen-3", {
+      grantId: g.grantId,
+      generation: 3,
+      expiresAt: new Date(t.clock.now().getTime() + DAY),
+    });
+    const result = await t.ik.oauth.token({
+      form: refreshForm(g.clientId, "other-gen-3"),
+      authorization: null,
+    });
+    expect(result.body).toMatchObject({ error: "invalid_grant" });
+    expect(await t.ik.oauth.listGrants(g.accountId)).toEqual([]);
+    expect(t.audit.ofType("oauth.grant_ended").map((e) => e.reason)).toEqual(["refresh_reuse"]);
+    // The control: the token just rotated, within the grace, keeps the grant.
+    const h = await importedGrant(t);
+    await t.ik.oauth.token({ form: refreshForm(h.clientId, h.refreshToken), authorization: null });
+    t.clock.advanceSeconds(5);
+    const raced = await t.ik.oauth.token({
+      form: refreshForm(h.clientId, h.refreshToken),
+      authorization: null,
+    });
+    expect(raced.body).toMatchObject({ error: "invalid_grant" });
+    expect(await t.ik.oauth.listGrants(h.accountId)).toHaveLength(1);
   });
 
   it("does not take a token as current when the verifier's generation disagrees with the grant", async () => {

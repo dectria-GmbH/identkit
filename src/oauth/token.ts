@@ -105,23 +105,39 @@ const earlier = (a: Date, b: Date) => (a.getTime() <= b.getTime() ? a : b);
 const validDate = (value: unknown): value is Date =>
   value instanceof Date && !Number.isNaN(value.getTime());
 
+/** A checked result of `legacy.verifyAccessToken`. `scopes` is null if the verifier sent none. */
+interface LegacyAccess {
+  grantId: string;
+  audience: string;
+  expiresAt: Date;
+  scopes: string[] | null;
+}
+
 /** The result of `legacy.verifyAccessToken`, checked. Another shape throws `TypeError`. */
-function legacyAccessResult(
-  value: unknown,
-): { grantId: string; audience: string; expiresAt: Date } | null {
+function legacyAccessResult(value: unknown): LegacyAccess | null {
   if (value === null) return null;
+  const scopes: unknown = isRecord(value) ? value["scopes"] : undefined;
   if (
     !isRecord(value) ||
     typeof value["grantId"] !== "string" ||
     value["grantId"] === "" ||
     typeof value["audience"] !== "string" ||
-    !validDate(value["expiresAt"])
+    !validDate(value["expiresAt"]) ||
+    !(
+      scopes === undefined ||
+      (Array.isArray(scopes) && scopes.every((scope) => typeof scope === "string"))
+    )
   ) {
     throw new TypeError(
-      "oauth.legacy.verifyAccessToken must return { grantId, audience, expiresAt } or null",
+      "oauth.legacy.verifyAccessToken must return { grantId, audience, expiresAt, scopes? } or null",
     );
   }
-  return { grantId: value["grantId"], audience: value["audience"], expiresAt: value["expiresAt"] };
+  return {
+    grantId: value["grantId"],
+    audience: value["audience"],
+    expiresAt: value["expiresAt"],
+    scopes: scopes === undefined ? null : [...scopes],
+  };
 }
 
 /** The result of `legacy.verifyRefreshToken`, checked. Another shape throws `TypeError`. */
@@ -180,11 +196,16 @@ export function createTokenEndpoint(internals: OAuthInternals) {
   const { ctx, settings, store } = internals;
   const { hasher, clock } = ctx;
   const knownScopes = new Set(settings.knownScopes);
-  const ownPrefixes = Object.values(settings.prefixes);
+  // The API token prefix too: a resource route may try an OAuth access token first and an API
+  // token next, and a verifier must never see the secret of an API token.
+  const ownPrefixes = [
+    ...Object.values(settings.prefixes),
+    ...(internals.apiTokenPrefix === null ? [] : [internals.apiTokenPrefix]),
+  ];
 
   /**
    * True if a verifier of the option `legacy` may see the token: a string of a sane length that
-   * starts with no identkit prefix, before `legacy.until`.
+   * starts with no identkit prefix (OAuth or API token), before `legacy.until`.
    */
   function legacyCandidate(token: unknown): token is string {
     const until = settings.legacy?.until;
@@ -626,7 +647,7 @@ export function createTokenEndpoint(internals: OAuthInternals) {
 
   /** The rest of `validateAccessToken` for a token that a legacy verifier returned. */
   async function validateLegacy(
-    verified: { grantId: string; audience: string; expiresAt: Date } | null,
+    verified: LegacyAccess | null,
     wanted: string | undefined,
   ): Promise<ValidateAccessTokenResult> {
     if (!verified) return { status: "refused", reason: "unknown" };
@@ -637,14 +658,20 @@ export function createTokenEndpoint(internals: OAuthInternals) {
     const { grant, accountStatus } = lookup;
     if (now >= grant.expiresAt.getTime()) return { status: "refused", reason: "grant_expired" };
     if (accountStatus !== "active") return { status: "refused", reason: "account_disabled" };
+    // As for identkit tokens: the grant's resource, which the import stored. A verifier that names
+    // another audience (another configured resource, or a bug) gets no access to it.
     if (
-      !settings.resources.includes(verified.audience) ||
-      (wanted !== undefined && verified.audience !== wanted)
+      verified.audience !== grant.resource ||
+      !settings.resources.includes(grant.resource) ||
+      (wanted !== undefined && grant.resource !== wanted)
     ) {
       return { status: "refused", reason: "wrong_resource" };
     }
-    // A legacy token has no scopes of its own here: the grant's, as the import stored them.
-    const scopes = grant.scopes.filter((s) => knownScopes.has(s));
+    // The grant's scopes, as the import stored them, narrowed to the token's own scopes if the
+    // verifier names them: a token narrowed at a refresh never gets more after the move.
+    const scopes = grant.scopes.filter(
+      (s) => knownScopes.has(s) && (verified.scopes === null || verified.scopes.includes(s)),
+    );
     if (scopes.length === 0) return { status: "refused", reason: "no_allowed_scope" };
     return {
       status: "valid",
@@ -652,7 +679,7 @@ export function createTokenEndpoint(internals: OAuthInternals) {
       clientId: grant.clientId,
       grantId: grant.id,
       scopes,
-      resource: verified.audience,
+      resource: grant.resource,
       expiresAt: earlier(verified.expiresAt, grant.expiresAt),
     };
   }

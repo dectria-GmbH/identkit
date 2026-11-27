@@ -13,6 +13,8 @@ export interface OAuthInternals {
   settings: OAuthSettings;
   store: OAuthStore;
   sealer: SecretSealer;
+  /** The prefix of personal API tokens, if that option is set. */
+  apiTokenPrefix: string | null;
 }
 
 /** The raw parameters of a request: `URLSearchParams` lets identkit refuse duplicates. */

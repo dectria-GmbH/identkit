@@ -214,11 +214,12 @@ export const oauthOptionsSchema = z
     /**
      * Checks tokens of an earlier system for grants imported with `oauth.importGrant`, so that
      * connected clients keep working after a move to identkit. identkit calls a verifier only
-     * for a token that starts with none of its own prefixes, and only before `until`. The
-     * verifier checks its own signature and expiry and returns what the token names, or null
-     * to refuse; identkit then checks the grant, the account, the audience and the client as
-     * for its own tokens. A verifier that throws fails the call; a result of another shape
-     * throws `TypeError`.
+     * for a token that starts with none of its own prefixes (OAuth and `apiTokens.prefix`), and
+     * only before `until`. The verifier checks its own signature and expiry and returns what the
+     * token names, or null for a token it does not recognise (also one of the other kind: a
+     * revocation tries the refresh verifier first, then the access verifier); identkit then
+     * checks the grant, the account, the audience and the client as for its own tokens. A
+     * verifier that throws fails the call; a result of another shape throws `TypeError`.
      */
     legacy: z
       .object({
@@ -325,12 +326,13 @@ export interface OAuthAdmitRequest {
 export type OAuthAdmitHook = (request: OAuthAdmitRequest) => boolean | Promise<boolean>;
 
 /**
- * See the option `legacy`. `audience` is the resource the token is for; it must be one of the
- * option `resources`.
+ * See the option `legacy`. `audience` must be the imported grant's `resource`. `scopes` are the
+ * token's own scopes, if the earlier system narrowed them: identkit then grants only the scopes
+ * that the token and the grant both hold, never more than the grant.
  */
 export type OAuthLegacyAccessTokenVerifier = (
   token: string,
-) => Promise<{ grantId: string; audience: string; expiresAt: Date } | null>;
+) => Promise<{ grantId: string; audience: string; expiresAt: Date; scopes?: string[] } | null>;
 
 /**
  * See the option `legacy`. `generation` is the grant generation that issued the token: equal to

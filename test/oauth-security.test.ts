@@ -753,7 +753,7 @@ describe("oauth security review list", () => {
     verifyAccessToken.mockResolvedValueOnce({ grantId: "g-legacy" } as never);
     await expect(ik.oauth.validateAccessToken("legacy-access")).rejects.toThrow(
       new TypeError(
-        "oauth.legacy.verifyAccessToken must return { grantId, audience, expiresAt } or null",
+        "oauth.legacy.verifyAccessToken must return { grantId, audience, expiresAt, scopes? } or null",
       ),
     );
 

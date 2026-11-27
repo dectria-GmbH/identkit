@@ -249,7 +249,13 @@ export function createOAuth(
   ) {
     throw new InvalidArgumentError("oauth: prefixes must not overlap apiTokens.prefix");
   }
-  const internals: OAuthInternals = { ctx, settings, store, sealer: ctx.sealer };
+  const internals: OAuthInternals = {
+    ctx,
+    settings,
+    store,
+    sealer: ctx.sealer,
+    apiTokenPrefix,
+  };
 
   return {
     metadata: createMetadata(settings),
