@@ -55,8 +55,9 @@ export interface IdentkitOptions {
    * revocation, the calling operation's own writes and its audit events. It runs also when the
    * audit sink throws on those events; the sink's first error then goes up after it. If it
    * throws, the calling operation throws `AllSessionsRevokedHookError` (with the sink's error as
-   * `auditError`, if any); everything identkit does is done by then. That error does not mean
-   * success: `rolledBack` is true if the operation rolled back. Re-run the hook with
+   * `auditError`, if any); everything identkit does is done by then and the operation's writes
+   * stand. An operation that identkit rolled back throws `OperationRolledBackError` instead,
+   * with `hookFailed` true. Re-run the hook with
    * `sessions.revokeAll(error.accountId, error.revokeAllOptions)`. Make it idempotent.
    */
   onAllSessionsRevoked?: AllSessionsRevokedHook;

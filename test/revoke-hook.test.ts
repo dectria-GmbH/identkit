@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   AllSessionsRevokedHookError,
   createMemoryStore,
+  OperationRolledBackError,
+  SessionsNotRevokedError,
   type AllSessionsRevokedEvent,
   type AuditEventType,
 } from "../src/index.js";
@@ -34,6 +36,23 @@ function expectHookError(error: unknown, accountId: string, exceptSessionId: str
   expect(error).toMatchObject({ accountId, exceptSessionId });
   expect((error as Error).cause).toEqual(new Error("application store down"));
 }
+
+/** Asserts the error of an operation that identkit rolled back. */
+function expectRolledBack(
+  error: unknown,
+  expected: { accountId: string; cause: unknown; hookFailed: boolean },
+) {
+  expect(error).toBeInstanceOf(OperationRolledBackError);
+  expect(error).not.toBeInstanceOf(AllSessionsRevokedHookError);
+  const rolledBack = error as OperationRolledBackError;
+  expect(rolledBack.accountId).toBe(expected.accountId);
+  expect(rolledBack.cause).toEqual(expected.cause);
+  expect(rolledBack.hookFailed).toBe(expected.hookFailed);
+  expect(rolledBack.revokeAllOptions).toEqual({});
+}
+
+const hookDown = new Error("application store down");
+const sinkDown = new Error("sink down");
 
 /** Makes the audit sink throw once, on the next event of `type`. */
 function failSinkOnce(audit: RecordingAuditSink, type: AuditEventType) {
@@ -179,7 +198,7 @@ describe("revoke-all hook failures", () => {
     expect(state.calls).toHaveLength(before + 1);
   });
 
-  it("rule: hook last - a TOTP enrolment that loses its grant records grant_changed before a failing hook", async () => {
+  it("rule: hook last - a TOTP enrolment that loses its grant records grant_changed before a failing hook and reports the rollback", async () => {
     const { state, hook } = toggledHook();
     const { inner, store, hooks } = hookedTotpStore();
     const t = setup({ store, onAllSessionsRevoked: hook });
@@ -190,15 +209,14 @@ describe("revoke-all hook failures", () => {
       await inner.sessions.revoke(user.session.id, t.clock.now(), "test");
     };
     state.failing = true;
-    expectHookError(
+    expectRolledBack(
       await caught(
         t.ik.totp.confirmEnrolment(user.token, {
           factorId: start.factorId,
           code: t.totpCode(start.secret),
         }),
       ),
-      user.account.id,
-      null,
+      { accountId: user.account.id, cause: hookDown, hookFailed: true },
     );
     expect(t.audit.ofType("totp.enrolment_failed")).toEqual([
       expect.objectContaining({ reason: "grant_changed" }),
@@ -287,12 +305,15 @@ describe("revoke-all hook with a failing audit sink", () => {
     };
     failSinkOnce(t.audit, "totp.enrolment_failed");
     const before = state.calls.length;
-    await expect(
-      t.ik.totp.confirmEnrolment(user.token, {
-        factorId: start.factorId,
-        code: t.totpCode(start.secret),
-      }),
-    ).rejects.toThrow("sink down");
+    expectRolledBack(
+      await caught(
+        t.ik.totp.confirmEnrolment(user.token, {
+          factorId: start.factorId,
+          code: t.totpCode(start.secret),
+        }),
+      ),
+      { accountId: user.account.id, cause: sinkDown, hookFailed: false },
+    );
     expect(state.calls.slice(before)).toEqual([
       expect.objectContaining({ accountId: user.account.id, exceptSessionId: null }),
     ]);
@@ -371,12 +392,15 @@ describe("revoke-all hook with a failing audit sink", () => {
     };
     failSinkOnce(t.audit, "passkey.registration_failed");
     const before = state.calls.length;
-    await expect(
-      t.ik.passkeys.finishRegistration(
-        { enrollmentToken: token },
-        t.authenticator.register(start.options),
+    expectRolledBack(
+      await caught(
+        t.ik.passkeys.finishRegistration(
+          { enrollmentToken: token },
+          t.authenticator.register(start.options),
+        ),
       ),
-    ).rejects.toThrow("sink down");
+      { accountId: created.account.id, cause: sinkDown, hookFailed: false },
+    );
     expect(state.calls.slice(before)).toEqual([
       expect.objectContaining({ accountId: created.account.id, exceptSessionId: null }),
     ]);
@@ -424,15 +448,15 @@ describe("revoke-all hook with a failing audit sink", () => {
 /** Asserts a hook error with the sink's error as `auditError`. */
 function expectHookErrorWithSink(
   error: unknown,
-  expected: { accountId: string; revokeAllOptions: object; rolledBack: boolean },
+  expected: { accountId: string; revokeAllOptions: object },
 ) {
   expect(error).toBeInstanceOf(AllSessionsRevokedHookError);
+  expect(error).not.toBeInstanceOf(OperationRolledBackError);
   const hookError = error as AllSessionsRevokedHookError;
-  expect(hookError.cause).toEqual(new Error("application store down"));
+  expect(hookError.cause).toEqual(hookDown);
   expect(hookError.accountId).toBe(expected.accountId);
   expect(hookError.revokeAllOptions).toEqual(expected.revokeAllOptions);
-  expect(hookError.rolledBack).toBe(expected.rolledBack);
-  expect(hookError.auditError).toEqual(new Error("sink down"));
+  expect(hookError.auditError).toEqual(sinkDown);
 }
 
 /** A store whose next passkey activation commits and then throws, as a lost reply would. */
@@ -499,7 +523,7 @@ async function passkeyGrantChanges(hook: (event: AllSessionsRevokedEvent) => voi
 describe("a sink that refuses session.revoked inside an operation", () => {
   // Rollbacks: the caller never gets a hook error that reads as "done".
 
-  it("rule: rollback keeps its error - a TOTP enrolment that fails after the activation throws the original error, also when sink and hook fail", async () => {
+  it("rule: rollback is marked - a TOTP enrolment that fails after the activation throws OperationRolledBackError with the original error, also when sink and hook fail", async () => {
     const { state, hook } = toggledHook();
     const { inner, store, hooks } = hookedTotpStore();
     const t = setup({ store, onAllSessionsRevoked: hook });
@@ -517,18 +541,21 @@ describe("a sink that refuses session.revoked inside an operation", () => {
         code: t.totpCode(start.secret),
       }),
     );
-    expect(error).not.toBeInstanceOf(AllSessionsRevokedHookError);
-    expect(error).toEqual(new Error("connection lost"));
+    expectRolledBack(error, {
+      accountId: user.account.id,
+      cause: new Error("connection lost"),
+      hookFailed: true,
+    });
     expect(await inner.totp.findActive(user.account.id)).toBeNull();
     expect(await t.ik.sessions.validate(user.token)).toBeNull();
     expect(await t.ik.sessions.validate(other.token)).toBeNull();
-    // The hook ran once, best effort, for the full revocation of the rollback.
+    // The hook ran once, for the full revocation of the rollback.
     expect(state.calls.slice(before)).toEqual([
       expect.objectContaining({ accountId: user.account.id, exceptSessionId: null }),
     ]);
   });
 
-  it("rule: rollback keeps its error - a passkey registration that fails at the activation throws the original error, also when sink and hook fail", async () => {
+  it("rule: rollback is marked - a passkey registration that fails at the activation throws OperationRolledBackError with the original error, also when sink and hook fail", async () => {
     const { state, hook } = toggledHook();
     const { inner, store, state: activation } = activationLosesReply();
     const t = setup({ store, onAllSessionsRevoked: hook });
@@ -542,15 +569,18 @@ describe("a sink that refuses session.revoked inside an operation", () => {
     const error = await caught(
       t.ik.passkeys.finishRegistration({ sessionToken: a.token }, response),
     );
-    expect(error).not.toBeInstanceOf(AllSessionsRevokedHookError);
-    expect(error).toEqual(new Error("connection lost"));
+    expectRolledBack(error, {
+      accountId: a.account.id,
+      cause: new Error("connection lost"),
+      hookFailed: true,
+    });
     expect(await inner.credentials.listByAccount(a.account.id)).toEqual([]);
     expect(await t.ik.sessions.validate(a.token)).toBeNull();
     // The sessions were revoked: no cleanup failure is recorded.
     expect(t.audit.ofType("passkey.registration_failed")).toEqual([]);
   });
 
-  it("rule: rollback is marked - a TOTP enrolment that loses its grant reports rolledBack when sink and hook fail", async () => {
+  it("rule: rollback is marked - a TOTP enrolment that loses its grant throws OperationRolledBackError when sink and hook fail", async () => {
     const { state, hook } = toggledHook();
     const { inner, store, hooks } = hookedTotpStore();
     const t = setup({ store, onAllSessionsRevoked: hook });
@@ -569,11 +599,8 @@ describe("a sink that refuses session.revoked inside an operation", () => {
         code: t.totpCode(start.secret),
       }),
     );
-    expectHookErrorWithSink(error, {
-      accountId: user.account.id,
-      revokeAllOptions: {},
-      rolledBack: true,
-    });
+    // The first error is the sink's; the hook still needs a re-run.
+    expectRolledBack(error, { accountId: user.account.id, cause: sinkDown, hookFailed: true });
     expect(t.audit.ofType("totp.enrolment_failed")).toEqual([
       expect.objectContaining({ reason: "grant_changed" }),
     ]);
@@ -581,7 +608,7 @@ describe("a sink that refuses session.revoked inside an operation", () => {
     expect(await t.ik.sessions.validate(other.token)).toBeNull();
   });
 
-  it("rule: rollback is marked - a TOTP enrolment that loses its grant throws the sink error when only the sink fails", async () => {
+  it("rule: rollback is marked - a TOTP enrolment that loses its grant throws OperationRolledBackError when only the sink fails", async () => {
     const { state, hook } = toggledHook();
     const { inner, store, hooks } = hookedTotpStore();
     const t = setup({ store, onAllSessionsRevoked: hook });
@@ -594,12 +621,16 @@ describe("a sink that refuses session.revoked inside an operation", () => {
     };
     failSinkOnce(t.audit, "session.revoked");
     const before = state.calls.length;
-    await expect(
-      t.ik.totp.confirmEnrolment(user.token, {
-        factorId: start.factorId,
-        code: t.totpCode(start.secret),
-      }),
-    ).rejects.toThrow("sink down");
+    expectRolledBack(
+      await caught(
+        t.ik.totp.confirmEnrolment(user.token, {
+          factorId: start.factorId,
+          code: t.totpCode(start.secret),
+        }),
+      ),
+      { accountId: user.account.id, cause: sinkDown, hookFailed: false },
+    );
+    expect(await inner.totp.findActive(user.account.id)).toBeNull();
     expect(state.calls.slice(before)).toEqual([
       expect.objectContaining({ accountId: user.account.id, exceptSessionId: null }),
     ]);
@@ -608,7 +639,7 @@ describe("a sink that refuses session.revoked inside an operation", () => {
     ]);
   });
 
-  it("rule: rollback is marked - a TOTP enrolment that loses its grant reports rolledBack when only the hook fails", async () => {
+  it("rule: rollback is marked - a TOTP enrolment that loses its grant throws OperationRolledBackError when only the hook fails", async () => {
     const { state, hook } = toggledHook();
     const { inner, store, hooks } = hookedTotpStore();
     const t = setup({ store, onAllSessionsRevoked: hook });
@@ -625,17 +656,16 @@ describe("a sink that refuses session.revoked inside an operation", () => {
         code: t.totpCode(start.secret),
       }),
     );
-    expect(error).toBeInstanceOf(AllSessionsRevokedHookError);
-    expect(error).toMatchObject({ rolledBack: true, revokeAllOptions: {}, auditError: undefined });
+    expectRolledBack(error, { accountId: user.account.id, cause: hookDown, hookFailed: true });
   });
 
-  it("rule: rollback is marked - a passkey registration that loses its grant reports rolledBack when sink and hook fail", async () => {
+  it("rule: rollback is marked - a passkey registration that loses its grant throws OperationRolledBackError when sink and hook fail", async () => {
     const { state, hook } = toggledHook();
     const { t, inner, accountId, live, finish } = await passkeyGrantChanges(hook);
     failSinkOnce(t.audit, "session.revoked");
     state.failing = true;
     const error = await caught(finish());
-    expectHookErrorWithSink(error, { accountId, revokeAllOptions: {}, rolledBack: true });
+    expectRolledBack(error, { accountId, cause: sinkDown, hookFailed: true });
     // The grant change is recorded; the sessions were revoked, so no cleanup failure is.
     expect(t.audit.ofType("passkey.registration_failed").map((e) => e.reason)).toEqual([
       "grant_changed",
@@ -644,12 +674,13 @@ describe("a sink that refuses session.revoked inside an operation", () => {
     expect(await t.ik.sessions.validate(live.token)).toBeNull();
   });
 
-  it("rule: rollback is marked - a passkey registration that loses its grant throws the sink error when only the sink fails", async () => {
+  it("rule: rollback is marked - a passkey registration that loses its grant throws OperationRolledBackError when only the sink fails", async () => {
     const { state, hook } = toggledHook();
-    const { t, accountId, finish } = await passkeyGrantChanges(hook);
+    const { t, inner, accountId, finish } = await passkeyGrantChanges(hook);
     failSinkOnce(t.audit, "session.revoked");
     const before = state.calls.length;
-    await expect(finish()).rejects.toThrow("sink down");
+    expectRolledBack(await caught(finish()), { accountId, cause: sinkDown, hookFailed: false });
+    expect(await inner.credentials.listByAccount(accountId)).toEqual([]);
     expect(state.calls.slice(before)).toEqual([
       expect.objectContaining({ accountId, exceptSessionId: null }),
     ]);
@@ -658,13 +689,22 @@ describe("a sink that refuses session.revoked inside an operation", () => {
     ]);
   });
 
-  it("rule: rollback is marked - a successful operation reports rolledBack false", async () => {
-    const { state, hook } = toggledHook();
-    const t = setup({ onAllSessionsRevoked: hook });
+  it("rule: rollback is marked - a TOTP enrolment that stands throws the plain sink error, never OperationRolledBackError", async () => {
+    const t = setup({ onAllSessionsRevoked: () => undefined });
     const a = await t.signIn("person@example.org");
-    state.failing = true;
-    const error = await caught(t.ik.accounts.disable(a.account.id));
-    expect(error).toMatchObject({ rolledBack: false });
+    await signInAgain(t, "person@example.org");
+    const start = await t.ik.totp.startEnrolment(a.token);
+    if (start.status !== "ok") throw new Error(start.reason);
+    failSinkOnce(t.audit, "session.revoked");
+    const error = await caught(
+      t.ik.totp.confirmEnrolment(a.token, {
+        factorId: start.factorId,
+        code: t.totpCode(start.secret),
+      }),
+    );
+    expect(error).not.toBeInstanceOf(OperationRolledBackError);
+    expect(error).toEqual(sinkDown);
+    expect(await t.ik.totp.get(a.account.id)).not.toBeNull();
   });
 
   // Success paths: the operation stands and its own event is still offered to the sink.
@@ -715,7 +755,6 @@ describe("a sink that refuses session.revoked inside an operation", () => {
     expectHookErrorWithSink(error, {
       accountId: a.account.id,
       revokeAllOptions: { exceptSessionId: a.session.id },
-      rolledBack: false,
     });
     expect(t.audit.ofType("totp.enrolled")).toHaveLength(1);
     expect(await t.ik.totp.get(a.account.id)).not.toBeNull();
@@ -803,7 +842,6 @@ describe("a sink that refuses session.revoked inside an operation", () => {
     expectHookErrorWithSink(error, {
       accountId: a.account.id,
       revokeAllOptions: { exceptSessionId: a.session.id },
-      rolledBack: false,
     });
     // One revocation, one hook call: no retry after the sink error.
     expect(state.calls.slice(before)).toHaveLength(1);
@@ -820,8 +858,45 @@ describe("a store that fails the session revocation of an operation that cannot 
     const granted = await t.ik.stepUp.verifyTotp(a.token, { code: t.totpCode(secret) });
     if (granted.status !== "granted") throw new Error(granted.status);
     hooks.failRevokeAll = 2;
-    await expect(t.ik.totp.remove(granted.token)).rejects.toThrow("store unavailable");
+    const error = await caught(t.ik.totp.remove(granted.token));
+    expect(error).toBeInstanceOf(SessionsNotRevokedError);
+    expect((error as Error).cause).toEqual(new Error("store unavailable"));
     expect(t.audit.ofType("totp.removed")).toHaveLength(1);
+  });
+
+  it("rule: no dead end - after SessionsNotRevokedError from totp.remove, revokeAll finishes the revocation", async () => {
+    const { state, hook } = toggledHook();
+    const { store, hooks } = hookedTotpStore();
+    const t = setup({ store, onAllSessionsRevoked: hook });
+    const a = await t.signIn("person@example.org");
+    const { secret } = await t.enrolTotp(a.token);
+    const other = await signInAgain(t, "person@example.org");
+    t.clock.advanceSeconds(STEP);
+    const granted = await t.ik.stepUp.verifyTotp(a.token, { code: t.totpCode(secret) });
+    if (granted.status !== "granted") throw new Error(granted.status);
+    hooks.failRevokeAll = 2;
+    const before = state.calls.length;
+    const error = await caught(t.ik.totp.remove(granted.token));
+    expect(error).toBeInstanceOf(SessionsNotRevokedError);
+    const { accountId, revokeAllOptions } = error as SessionsNotRevokedError;
+    expect(revokeAllOptions).toEqual({ exceptSessionId: a.session.id });
+    expect(state.calls.slice(before)).toEqual([]);
+    expect(await t.ik.sessions.validate(other.token)).not.toBeNull();
+    // A retried remove is a dead end; the error's revokeAll call is not.
+    expect(await t.ik.totp.remove(granted.token)).toEqual({
+      status: "denied",
+      reason: "not_found",
+    });
+    expect(await t.ik.sessions.revokeAll(accountId, revokeAllOptions)).toBe(1);
+    expect(await t.ik.sessions.validate(other.token)).toBeNull();
+    expect(await t.ik.sessions.validate(granted.token)).not.toBeNull();
+    expect(state.calls.slice(before)).toEqual([
+      {
+        accountId: a.account.id,
+        exceptSessionId: a.session.id,
+        revokedSessionIds: [other.session.id],
+      },
+    ]);
   });
 
   it("rule: event not lost - totp.revoke records totp.removed once across a retry", async () => {
@@ -836,18 +911,33 @@ describe("a store that fails the session revocation of an operation that cannot 
     expect(t.audit.ofType("totp.removed")).toHaveLength(1);
   });
 
-  it("rule: event not lost - a passkey registration records passkey.registered", async () => {
-    const { store, hooks } = hookedTotpStore();
-    const t = setup({ store });
+  it("rule: rollback is marked - a passkey registration rolls back like a TOTP enrolment", async () => {
+    const { state, hook } = toggledHook();
+    const { inner, store, hooks } = hookedTotpStore();
+    const t = setup({ store, onAllSessionsRevoked: hook });
     const a = await t.signIn("person@example.org");
+    const other = await signInAgain(t, "person@example.org");
     const start = await t.ik.passkeys.startRegistration({ sessionToken: a.token });
     if (start.status !== "ok") throw new Error(start.reason);
     const response = t.authenticator.register(start.options);
     hooks.failRevokeAll = 1;
-    await expect(
+    const before = state.calls.length;
+    const error = await caught(
       t.ik.passkeys.finishRegistration({ sessionToken: a.token }, response),
-    ).rejects.toThrow("store unavailable");
-    expect(t.audit.ofType("passkey.registered")).toHaveLength(1);
+    );
+    expectRolledBack(error, {
+      accountId: a.account.id,
+      cause: new Error("store unavailable"),
+      hookFailed: false,
+    });
+    expect(t.audit.ofType("passkey.registered")).toEqual([]);
+    expect(await inner.credentials.listByAccount(a.account.id)).toEqual([]);
+    // The rollback's own revocation ends every session, the enrolling one too.
+    expect(await t.ik.sessions.validate(other.token)).toBeNull();
+    expect(await t.ik.sessions.validate(a.token)).toBeNull();
+    expect(state.calls.slice(before)).toEqual([
+      expect.objectContaining({ accountId: a.account.id, exceptSessionId: null }),
+    ]);
   });
 });
 
@@ -873,5 +963,160 @@ describe("a throttle store that fails after a successful TOTP enrolment", () => 
     );
     expect(t.audit.ofType("totp.enrolled")).toHaveLength(1);
     expect(await t.ik.totp.get(a.account.id)).not.toBeNull();
+  });
+});
+
+describe("the error class tells whether an operation took effect", () => {
+  it("rule: rollback is marked - a TOTP enrolment whose rollback cannot revoke the sessions throws OperationRolledBackError with hookFailed", async () => {
+    const { state, hook } = toggledHook();
+    const { inner, store, hooks } = hookedTotpStore();
+    const t = setup({ store, onAllSessionsRevoked: hook });
+    const user = await t.signIn("person@example.org");
+    const other = await signInAgain(t, "person@example.org");
+    const start = await t.ik.totp.startEnrolment(user.token);
+    if (start.status !== "ok") throw new Error(start.reason);
+    hooks.beforeActivate = async () => {
+      await inner.sessions.revoke(user.session.id, t.clock.now(), "test");
+    };
+    hooks.failRevokeAll = 1;
+    const before = state.calls.length;
+    const error = await caught(
+      t.ik.totp.confirmEnrolment(user.token, {
+        factorId: start.factorId,
+        code: t.totpCode(start.secret),
+      }),
+    );
+    expectRolledBack(error, {
+      accountId: user.account.id,
+      cause: new Error("store unavailable"),
+      hookFailed: true,
+    });
+    expect(await inner.totp.findActive(user.account.id)).toBeNull();
+    expect(t.audit.ofType("totp.enrolment_failed")).toEqual([
+      expect.objectContaining({ reason: "grant_changed" }),
+    ]);
+    expect(state.calls.slice(before)).toEqual([]);
+    expect(await t.ik.sessions.validate(other.token)).not.toBeNull();
+    // The error names the call that finishes the revocation and runs the hook.
+    const { accountId, revokeAllOptions } = error as OperationRolledBackError;
+    await t.ik.sessions.revokeAll(accountId, revokeAllOptions);
+    expect(await t.ik.sessions.validate(other.token)).toBeNull();
+    expect(state.calls.slice(before)).toEqual([
+      expect.objectContaining({ accountId: user.account.id, exceptSessionId: null }),
+    ]);
+  });
+
+  it("rule: rollback is marked - a TOTP enrolment whose revocation of the other sessions fails throws OperationRolledBackError", async () => {
+    const { state, hook } = toggledHook();
+    const { inner, store, hooks } = hookedTotpStore();
+    const t = setup({ store, onAllSessionsRevoked: hook });
+    const a = await t.signIn("person@example.org");
+    const other = await signInAgain(t, "person@example.org");
+    const start = await t.ik.totp.startEnrolment(a.token);
+    if (start.status !== "ok") throw new Error(start.reason);
+    hooks.failRevokeAll = 1;
+    const error = await caught(
+      t.ik.totp.confirmEnrolment(a.token, {
+        factorId: start.factorId,
+        code: t.totpCode(start.secret),
+      }),
+    );
+    expectRolledBack(error, {
+      accountId: a.account.id,
+      cause: new Error("store unavailable"),
+      hookFailed: false,
+    });
+    expect(await inner.totp.findActive(a.account.id)).toBeNull();
+    expect(t.audit.ofType("totp.enrolled")).toEqual([]);
+    expect(await t.ik.sessions.validate(other.token)).toBeNull();
+    expect(await t.ik.sessions.validate(a.token)).toBeNull();
+    expect(state.calls).toHaveLength(1);
+  });
+
+  it("rule: rollback is marked - a passkey registration that loses its grant before the activation throws OperationRolledBackError when the sink fails", async () => {
+    const inner = createMemoryStore();
+    let afterInsert: (() => Promise<void>) | null = null;
+    const store: IdentkitStore = {
+      ...inner,
+      credentials: {
+        ...inner.credentials,
+        insert: async (...args) => {
+          const result = await inner.credentials.insert(...args);
+          const run = afterInsert;
+          afterInsert = null;
+          if (run) await run();
+          return result;
+        },
+      },
+    };
+    const t = setup({
+      store,
+      policy: { ...emailFirstPolicy, createAccountOnFirstSignIn: false },
+      onAllSessionsRevoked: () => undefined,
+    });
+    const created = await t.ik.accounts.create({ email: "staff@example.org" });
+    if (created.status !== "created") throw new Error("not created");
+    const { token } = await t.ik.passkeys.issueEnrollmentToken(created.account.id);
+    const start = await t.ik.passkeys.startRegistration({ enrollmentToken: token });
+    if (start.status !== "ok") throw new Error(start.reason);
+    afterInsert = async () => {
+      await t.ik.passkeys.revokeEnrollmentTokens(created.account.id);
+    };
+    failSinkOnce(t.audit, "passkey.registration_failed");
+    const error = await caught(
+      t.ik.passkeys.finishRegistration(
+        { enrollmentToken: token },
+        t.authenticator.register(start.options),
+      ),
+    );
+    expectRolledBack(error, { accountId: created.account.id, cause: sinkDown, hookFailed: false });
+    expect(await inner.credentials.listByAccount(created.account.id)).toEqual([]);
+  });
+
+  it("rule: first error - the sink error on totp.enrolled wins over a later throttle reset error", async () => {
+    const { store, hooks } = hookedTotpStore();
+    const t = setup({ store, onAllSessionsRevoked: () => undefined });
+    const a = await t.signIn("person@example.org");
+    const start = await t.ik.totp.startEnrolment(a.token);
+    if (start.status !== "ok") throw new Error(start.reason);
+    hooks.failThrottleReset = 1;
+    failSinkOnce(t.audit, "totp.enrolled");
+    const error = await caught(
+      t.ik.totp.confirmEnrolment(a.token, {
+        factorId: start.factorId,
+        code: t.totpCode(start.secret),
+      }),
+    );
+    expect(error).toEqual(sinkDown);
+    // The reset was attempted after the refused event.
+    expect(hooks.failThrottleReset).toBe(0);
+    expect(await t.ik.totp.get(a.account.id)).not.toBeNull();
+  });
+});
+
+describe("a retried accounts.disable", () => {
+  it("rule: no duplicate event - a retry after a session.revoked sink error does not record account.disabled again", async () => {
+    const { state, hook } = toggledHook();
+    const t = setup({ onAllSessionsRevoked: hook });
+    const a = await t.signIn("person@example.org");
+    failSinkOnce(t.audit, "session.revoked");
+    await expect(t.ik.accounts.disable(a.account.id)).rejects.toThrow("sink down");
+    expect(t.audit.ofType("account.disabled")).toHaveLength(1);
+    await t.ik.accounts.disable(a.account.id);
+    expect(t.audit.ofType("account.disabled")).toHaveLength(1);
+    // The retry still runs the hook.
+    expect(state.calls).toHaveLength(2);
+  });
+
+  it("rule: event not lost - a store error on the revocation records account.disabled once across a retry", async () => {
+    const { store, hooks } = hookedTotpStore();
+    const t = setup({ store });
+    const a = await t.signIn("person@example.org");
+    hooks.failRevokeAll = 1;
+    await expect(t.ik.accounts.disable(a.account.id)).rejects.toThrow("store unavailable");
+    expect(t.audit.ofType("account.disabled")).toHaveLength(1);
+    expect(await t.ik.sessions.validate(a.token)).toBeNull();
+    await t.ik.accounts.disable(a.account.id);
+    expect(t.audit.ofType("account.disabled")).toHaveLength(1);
   });
 });

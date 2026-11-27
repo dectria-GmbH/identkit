@@ -32,7 +32,10 @@ export interface Accounts {
   create(input: { email: string }): Promise<CreateAccountResult>;
   get(accountId: string): Promise<AccountView | null>;
   findByEmail(email: string): Promise<AccountView | null>;
-  /** Disables the account and revokes all its sessions. */
+  /**
+   * Disables the account and revokes all its sessions. Records `account.disabled` only if the
+   * account was not disabled yet, so a retry after an error does not record it twice.
+   */
   disable(accountId: string): Promise<void>;
   /**
    * Lifts the failure locks of the account: e-mail codes of its address (sign-in and step-up)
@@ -136,11 +139,24 @@ export function createAccounts(
     async disable(accountId) {
       const record = await store.accounts.findById(accountId);
       if (!record) return;
+      // Only the call that changes the status records it, so a retry after an error does not
+      // record the disable twice.
+      const changed = record.status !== "disabled";
+      const event = { type: "account.disabled", accountId } as const;
       await store.accounts.setStatus(accountId, "disabled");
-      const revoked = await revokeAll(accountId);
+      let revoked: Revocation;
+      try {
+        revoked = await revokeAll(accountId);
+      } catch (error) {
+        // A retry finds the account disabled and does not record it: record it now.
+        if (changed) await ctx.emit(event).catch(() => undefined);
+        throw error;
+      }
       // Hook last: a throwing hook must not skip the audit event, nor a throwing sink the hook.
-      // A retry reaches both again.
-      await finishThenRunHook(revoked, () => ctx.emit({ type: "account.disabled", accountId }));
+      // A retry revokes and runs the hook again.
+      await finishThenRunHook(revoked, async () => {
+        if (changed) await ctx.emit(event);
+      });
     },
   };
 }

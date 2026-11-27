@@ -53,7 +53,9 @@ export {
   InvalidArgumentError,
   MethodNotAllowedError,
   NotConfiguredError,
+  OperationRolledBackError,
   PasskeyCleanupError,
+  SessionsNotRevokedError,
 } from "./errors.js";
 export { NodeCryptoUnavailableError } from "./node-crypto.js";
 export { normalizeEmail, InvalidEmailError } from "./email.js";

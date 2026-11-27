@@ -3,7 +3,12 @@
  * A wrapped store runs the concurrent change at the exact point where it would hurt.
  */
 import { describe, expect, it } from "vitest";
-import { createMemoryStore, hashPayload, PasskeyCleanupError } from "../src/index.js";
+import {
+  createMemoryStore,
+  hashPayload,
+  OperationRolledBackError,
+  PasskeyCleanupError,
+} from "../src/index.js";
 import type { IdentkitStore, SessionRecord } from "../src/storage/types.js";
 import { emailFirstPolicy, setup, testConfig } from "./helpers.js";
 
@@ -278,9 +283,11 @@ describe("passkey registration races", () => {
       };
       return Promise.resolve();
     };
-    await expect(
-      t.ik.passkeys.finishRegistration({ sessionToken: user.token }, response),
-    ).rejects.toThrow("audit sink down");
+    const rolledBack = await t.ik.passkeys
+      .finishRegistration({ sessionToken: user.token }, response)
+      .catch((error: unknown) => error);
+    expect(rolledBack).toBeInstanceOf(OperationRolledBackError);
+    expect((rolledBack as Error).cause).toEqual(new Error("audit sink down"));
     expect(await inner.credentials.listByAccount(user.account.id)).toHaveLength(0);
     expect(await liveSessions(inner, user.account.id, t.clock.now())).toBe(0);
   });
@@ -311,9 +318,11 @@ describe("passkey registration races", () => {
     const start = await t.ik.passkeys.startRegistration({ sessionToken: user.token });
     if (start.status !== "ok") throw new Error("denied");
     const response = t.authenticator.register(start.options);
-    await expect(
-      t.ik.passkeys.finishRegistration({ sessionToken: user.token }, response),
-    ).rejects.toThrow("connection lost");
+    const rolledBack = await t.ik.passkeys
+      .finishRegistration({ sessionToken: user.token }, response)
+      .catch((error: unknown) => error);
+    expect(rolledBack).toBeInstanceOf(OperationRolledBackError);
+    expect((rolledBack as Error).cause).toEqual(new Error("connection lost"));
     expect(await inner.credentials.listByAccount(user.account.id)).toHaveLength(0);
     expect(await liveSessions(inner, user.account.id, t.clock.now())).toBe(0);
   });
@@ -529,12 +538,11 @@ describe("passkey registration races", () => {
       await t.ik.passkeys.revokeEnrollmentTokens(created.account.id);
       revokeFailures = 1;
     };
-    await expect(
-      t.ik.passkeys.finishRegistration(
-        { enrollmentToken: token },
-        t.authenticator.register(start.options),
-      ),
-    ).rejects.toThrow("store unavailable");
+    const rolledBack = await t.ik.passkeys
+      .finishRegistration({ enrollmentToken: token }, t.authenticator.register(start.options))
+      .catch((error: unknown) => error);
+    expect(rolledBack).toBeInstanceOf(OperationRolledBackError);
+    expect((rolledBack as Error).cause).toEqual(new Error("store unavailable"));
     expect(await inner.credentials.listByAccount(created.account.id)).toHaveLength(0);
     expect(t.audit.ofType("passkey.registration_failed").map((e) => e.reason)).toContain(
       "cleanup_failed",

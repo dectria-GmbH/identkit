@@ -2,7 +2,7 @@ import { addSeconds } from "./clock.js";
 import type { AuthMethod, StepUpMethod } from "./config.js";
 import type { Context } from "./context.js";
 import { isTokenShaped, randomId, randomToken } from "./crypto.js";
-import { AllSessionsRevokedHookError } from "./errors.js";
+import { AllSessionsRevokedHookError, OperationRolledBackError } from "./errors.js";
 import type { SessionRecord, SessionState, StepUpRecord } from "./storage/types.js";
 
 /** What a consumer sees of a valid session. Never contains the token. */
@@ -77,13 +77,12 @@ export interface SessionInternals {
    * caller's events, so a throwing audit sink cannot skip the hook or the caller's events.
    * Throws only when the store revocation throws. If the sink throws on a `session.revoked`
    * event, the other events are still emitted and the first sink error is returned as
-   * `auditFailure`; `finishThenRunHook` throws it after the hook. `rolledBack` marks the
-   * revocation of a rollback, so a hook failure tells the caller that the operation did not
-   * take effect.
+   * `auditFailure`; `finishThenRunHook` throws it after the hook. A rollback uses
+   * `finishRollback` instead.
    */
   revokeAllDeferringHook(
     accountId: string,
-    options?: { exceptSessionId?: string; rolledBack?: boolean },
+    options?: { exceptSessionId?: string },
   ): Promise<Revocation>;
 }
 
@@ -133,6 +132,41 @@ export async function finishThenRunHook(
   }
   await revocation.runHook({ auditError: failure.error });
   throw failure.error;
+}
+
+/**
+ * Finishes an operation that identkit rolled back. `revocation` is the rollback's revocation of
+ * every session, or null if the store failed on it. `failure` is the first error so far: the
+ * error that caused the rollback, or the store's error on the revocation. Runs `events` (the
+ * rollback's own audit events) and then the hook, each also after an earlier failure. Returns
+ * null if nothing failed, so the caller can return its `denied` outcome. Otherwise it returns
+ * `OperationRolledBackError` with the first error as `cause`, for the caller to throw: the
+ * caller can tell that the operation did not take effect, and `hookFailed` says whether the
+ * hook still needs to run.
+ */
+export async function finishRollback(
+  accountId: string,
+  revocation: Revocation | null,
+  failure: { error: unknown } | null,
+  events: () => Promise<void> = async () => undefined,
+): Promise<OperationRolledBackError | null> {
+  let first = failure ?? revocation?.auditFailure ?? null;
+  try {
+    await events();
+  } catch (error) {
+    first ??= { error };
+  }
+  // Without a revocation the hook never ran: `sessions.revokeAll` must finish it.
+  let hookFailed = revocation === null;
+  if (revocation) {
+    try {
+      await revocation.runHook();
+    } catch (error) {
+      hookFailed = true;
+      first ??= { error: error instanceof AllSessionsRevokedHookError ? error.cause : error };
+    }
+  }
+  return first ? new OperationRolledBackError(accountId, { cause: first.error, hookFailed }) : null;
 }
 
 /** What `onAllSessionsRevoked` receives after `sessions.revokeAll`. */
@@ -355,7 +389,7 @@ export function createSessions(
 
   async function revokeAllDeferringHook(
     accountId: string,
-    options?: { exceptSessionId?: string; rolledBack?: boolean },
+    options?: { exceptSessionId?: string },
   ): Promise<Revocation> {
     const ids = await store.sessions.revokeAllForAccount(
       accountId,
@@ -372,7 +406,6 @@ export function createSessions(
       } catch (error) {
         throw new AllSessionsRevokedHookError(accountId, exceptSessionId, {
           cause: error,
-          rolledBack: options?.rolledBack === true,
           ...(hookOptions ? { auditError: hookOptions.auditError } : {}),
         });
       }

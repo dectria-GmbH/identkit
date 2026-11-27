@@ -5,6 +5,7 @@ import {
   createMemoryStore,
   MethodNotAllowedError,
   NotConfiguredError,
+  OperationRolledBackError,
   SealedSecretError,
   type SecretSealer,
 } from "../src/index.js";
@@ -238,12 +239,14 @@ describe("TOTP enrolment", () => {
     const start = await t.ik.totp.startEnrolment(a.token);
     if (start.status !== "ok") throw new Error("denied");
     hooks.failRevokeAll = 1;
-    await expect(
-      t.ik.totp.confirmEnrolment(a.token, {
+    const rolledBack = await t.ik.totp
+      .confirmEnrolment(a.token, {
         factorId: start.factorId,
         code: t.totpCode(start.secret),
-      }),
-    ).rejects.toThrow("store unavailable");
+      })
+      .catch((error: unknown) => error);
+    expect(rolledBack).toBeInstanceOf(OperationRolledBackError);
+    expect((rolledBack as Error).cause).toEqual(new Error("store unavailable"));
     expect(await inner.totp.findActive(a.account.id)).toBeNull();
     expect(await t.ik.sessions.validate(b.token)).toBeNull();
     expect(await t.ik.sessions.validate(a.token)).toBeNull();
@@ -412,12 +415,14 @@ describe("TOTP enrolment", () => {
       await inner.sessions.revoke(user.session.id, t.clock.now(), "test");
     };
     hooks.activateThrowsAfterCommit = true;
-    await expect(
-      t.ik.totp.confirmEnrolment(user.token, {
+    const rolledBack = await t.ik.totp
+      .confirmEnrolment(user.token, {
         factorId: start.factorId,
         code: t.totpCode(start.secret),
-      }),
-    ).rejects.toThrow("connection lost");
+      })
+      .catch((error: unknown) => error);
+    expect(rolledBack).toBeInstanceOf(OperationRolledBackError);
+    expect((rolledBack as Error).cause).toEqual(new Error("connection lost"));
     expect(await inner.totp.findActive(user.account.id)).toBeNull();
   });
 
