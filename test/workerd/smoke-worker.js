@@ -1,7 +1,8 @@
 // Smoke test that runs inside workerd without nodejs_compat. scripts/check-workerd.mjs bundles
 // it with the built `dist` entries and calls it. Passkey ceremonies need an authenticator: the
 // AUTHENTICATOR service binding runs the software authenticator on Node, because that test tool
-// signs with node:crypto. Everything identkit does runs here.
+// signs with node:crypto. Everything identkit does runs here. The DB binding is a local D1
+// database for the `identkit/d1` checks.
 import {
   approvalChallengeAsync,
   checkApprovalEvidence,
@@ -13,6 +14,7 @@ import {
   hashPayloadAsync,
   NodeCryptoUnavailableError,
 } from "../../dist/index.js";
+import { createD1Store, D1_MIGRATIONS, migrateIdentkitD1 } from "../../dist/d1/index.js";
 import {
   createFakeClock,
   createFakeIdentityVerificationAdapter,
@@ -44,10 +46,9 @@ function check(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-function setup() {
+function setup(store = createMemoryStore()) {
   const clock = createFakeClock();
   const mail = createRecordingMailSender();
-  const store = createMemoryStore();
   const policy = { current: basePolicy };
   const ik = createIdentkit({
     config,
@@ -189,6 +190,31 @@ const checks = {
       },
     });
     check(evidence.status === "verified", `evidence: ${evidence.status}`);
+  },
+
+  async d1SignInAndRevoke(env) {
+    const applied = await migrateIdentkitD1(env.DB);
+    check(applied.length === D1_MIGRATIONS.length, `applied ${applied.length} migrations`);
+    check((await migrateIdentkitD1(env.DB)).length === 0, "second run applied migrations");
+    const t = setup(createD1Store(env.DB));
+    const result = await t.signIn("d1-person@example.org");
+    check(result.status === "signed_in", `d1 sign-in: ${result.status}`);
+    const view = await t.ik.sessions.validate(result.token);
+    check(view?.accountId === result.account.id, "d1 session does not validate");
+    await t.ik.sessions.revoke(result.token);
+    check((await t.ik.sessions.validate(result.token)) === null, "d1 session survives revoke");
+  },
+
+  d1RefusesReplicaSession(env) {
+    check(typeof env.DB.withSession === "function", "D1 binding has no withSession");
+    let refused = false;
+    try {
+      createD1Store(env.DB.withSession());
+    } catch (error) {
+      refused = error instanceof TypeError;
+    }
+    check(refused, "an unconstrained D1 session was accepted");
+    createD1Store(env.DB.withSession("first-primary"), { sessionConstraint: "first-primary" });
   },
 
   async fakeIdentityCallback() {

@@ -118,7 +118,7 @@ export function runStoreFlows(name: string, store: () => IdentkitStore) {
     expect(approvals.filter((a) => a.status === "approved")).toHaveLength(1);
   });
 
-  it(`flows: session timeouts and revocation against ${name}`, async () => {
+  it(`flows: session idle timeout against ${name}`, async () => {
     const t = setup({ store: store() });
     const { token } = await t.signIn("flows-session@example.org");
     t.clock.advanceSeconds(testConfig.sessions.idleTimeoutSeconds - 1);
