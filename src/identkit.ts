@@ -16,7 +16,7 @@ import { createPasskeyCore } from "./passkey-core.js";
 import { createPasskeys, type Passkeys } from "./passkeys.js";
 import { NotConfiguredError } from "./errors.js";
 import type { SecretSealer } from "./sealer.js";
-import { createSessions, type Sessions } from "./sessions.js";
+import { createSessions, type AllSessionsRevokedHook, type Sessions } from "./sessions.js";
 import { createStepUp, type StepUp } from "./step-up.js";
 import type { IdentkitStore } from "./storage/types.js";
 import { createTotp, createTotpEngine, type Totp } from "./totp.js";
@@ -47,6 +47,13 @@ export interface IdentkitOptions {
   sealer?: SecretSealer;
   clock?: Clock;
   identityVerification?: IdentityVerificationAdapter;
+  /**
+   * Called after every `sessions.revokeAll`, also when accounts, passkeys or TOTP call it (for
+   * example on a disable, a new passkey or a TOTP removal), and also when no session was live.
+   * Use it to end sessions that your application keeps itself. It runs after the revocation
+   * and its audit events; if it throws, the calling operation fails, and a retry calls it again.
+   */
+  onAllSessionsRevoked?: AllSessionsRevokedHook;
 }
 
 export interface Identkit {
@@ -102,7 +109,11 @@ export function createIdentkit(options: IdentkitOptions): Identkit {
   };
 
   const otp = createOtpEngine(ctx);
-  const { sessions, internals } = createSessions(ctx);
+  const onAllSessionsRevoked = options.onAllSessionsRevoked ?? null;
+  if (onAllSessionsRevoked !== null && typeof onAllSessionsRevoked !== "function") {
+    throw new TypeError("onAllSessionsRevoked must be a function");
+  }
+  const { sessions, internals } = createSessions(ctx, onAllSessionsRevoked);
   const core = createPasskeyCore(ctx);
   const totpEngine = createTotpEngine(ctx);
 

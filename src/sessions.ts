@@ -39,7 +39,9 @@ export interface Sessions {
   revokeById(sessionId: string, reason?: string): Promise<boolean>;
   /**
    * Administrative: revokes all sessions of an account, for example on sign-out everywhere.
-   * Takes a bare id. Do not pass client input without your own check.
+   * Takes a bare id. Do not pass client input without your own check. Calls the option
+   * `onAllSessionsRevoked` after the revocation; if the hook throws, this call throws, and the
+   * sessions stay revoked.
    */
   revokeAll(accountId: string, options?: { exceptSessionId?: string }): Promise<number>;
 }
@@ -67,7 +69,22 @@ export interface SessionInternals {
   view(record: SessionRecord): SessionView;
 }
 
-export function createSessions(ctx: Context): { sessions: Sessions; internals: SessionInternals } {
+/** What `onAllSessionsRevoked` receives after `sessions.revokeAll`. */
+export interface AllSessionsRevokedEvent {
+  accountId: string;
+  /** The session that stayed live, or null if every session of the account ended. */
+  exceptSessionId: string | null;
+  /** Sessions this call revoked. Empty if none was live, for example on a retry. */
+  revokedSessionIds: string[];
+}
+
+/** Called after every `sessions.revokeAll`, also when it is called from another service. */
+export type AllSessionsRevokedHook = (event: AllSessionsRevokedEvent) => void | Promise<void>;
+
+export function createSessions(
+  ctx: Context,
+  onAllSessionsRevoked: AllSessionsRevokedHook | null = null,
+): { sessions: Sessions; internals: SessionInternals } {
   const { config, store, hasher, clock } = ctx;
 
   const digestOf = (token: string) => hasher.digest("session-token", token);
@@ -267,6 +284,15 @@ export function createSessions(ctx: Context): { sessions: Sessions; internals: S
       );
       for (const sessionId of ids) {
         await ctx.emit({ type: "session.revoked", accountId, sessionId, reason: "revoked_all" });
+      }
+      // After the revocation and its audit events. Called also when no session was live, so a
+      // retry after a failed hook or audit sink reaches the hook.
+      if (onAllSessionsRevoked) {
+        await onAllSessionsRevoked({
+          accountId,
+          exceptSessionId: options?.exceptSessionId ?? null,
+          revokedSessionIds: [...ids],
+        });
       }
       return ids.length;
     },

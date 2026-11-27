@@ -3,6 +3,7 @@ import {
   createHmacHasher,
   createIdentkit,
   createMemoryStore,
+  type AllSessionsRevokedHook,
   type SignInPolicy,
 } from "../src/index.js";
 import type { SecretSealer } from "../src/sealer.js";
@@ -73,8 +74,9 @@ export interface SetupOptions {
   counterStep?: number;
   /** Accounts the consumer marks as privileged, by e-mail address. */
   privilegedEmails?: string[];
-  config?: typeof testConfig;
+  config?: object;
   sealer?: SecretSealer;
+  onAllSessionsRevoked?: AllSessionsRevokedHook;
 }
 
 export function setup(options: SetupOptions = {}) {
@@ -99,6 +101,7 @@ export function setup(options: SetupOptions = {}) {
     clock,
     policy: () => policy.current,
     identityVerification: idv,
+    ...(options.onAllSessionsRevoked ? { onAllSessionsRevoked: options.onAllSessionsRevoked } : {}),
   });
   const authenticator = createSoftwareAuthenticator({
     origin: ORIGIN,

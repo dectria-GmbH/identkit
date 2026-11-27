@@ -68,7 +68,14 @@ export type {
   SecondFactorStart,
 } from "./passkeys.js";
 export type { StepUp, StepUpResult } from "./step-up.js";
-export type { Sessions, SessionView, IssuedSession, StepUpCheck } from "./sessions.js";
+export type {
+  Sessions,
+  SessionView,
+  IssuedSession,
+  StepUpCheck,
+  AllSessionsRevokedEvent,
+  AllSessionsRevokedHook,
+} from "./sessions.js";
 export {
   approvalChallenge,
   approvalChallengeAsync,
