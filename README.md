@@ -490,8 +490,8 @@ TOTP:
   (with an `account.disabled` event, an `api_token.revoked` event per token and an
   `oauth.grant_ended` event per grant) or, if the disable failed too,
   `cleanup_failed_disable_failed`: the account may still be active, or its API tokens or OAuth
-  grants may not be ended. On the error paths no grant may have been lost; the account is disabled all
-  the same. An operator removes the factor with `totp.revoke(accountId)` and enables the account
+  grants may not be ended. On the error paths no enrolment grant may have been lost; the account
+  is disabled all the same. An operator removes the factor with `totp.revoke(accountId)` and enables the account
   again in the store; identkit has no call to enable an account. After
   `cleanup_failed_disable_failed`, the operator first calls `accounts.disable(accountId)` until
   it succeeds; otherwise the account's API tokens and OAuth grants can come back into use.
@@ -1223,8 +1223,10 @@ Administrative calls take bare ids and trust their caller: `listGrants(accountId
 and clients by `clientRetention`: never used (no approval, exchange or refresh) and older than
 `unusedDays`, or last used more than `idleDays` ago. It never deletes a client that holds a live
 grant or code. An approval writes the client's last use (at most twice a day) before the code,
-so a client in the middle of a flow is never unused or idle. Run `purge` on a schedule, for
-example daily.
+so from the approval on a client in the middle of a flow is never unused or idle. Before it,
+between `authorize.begin` and `approve`, `purge` can delete an old client; `approve` then
+answers `invalid_ticket`, and the client starts again. Run `purge` on a schedule, for example
+daily. A purged imported client gets a tombstone (see "Import and legacy tokens").
 
 Audit and errors:
 
@@ -1277,7 +1279,11 @@ secret? | secretSha256? })` keeps the id (visible ASCII, 1 to 128 characters). R
   and grant types follow the registration rules. A confidential client needs exactly one of
   `secret` (the plaintext; identkit stores its HMAC) and `secretSha256` (hex of the unkeyed
   SHA-256; needs `acceptLegacyClientSecrets: true`, else `NotConfiguredError`). Results:
-  `imported`, `already_imported` (same id and data), `id_taken`.
+  `imported`, `already_imported` (same id and data), `id_taken`, `revoked` (an imported client
+  with this id was deleted by `deleteClient` or `purge`; it stays deleted). It is an
+  administrative call: it applies the redirect URI rules of registration, not
+  `registration.allowedAuthMethods`, so you can import a public client also where registration
+  allows only confidential ones.
 - With `acceptLegacyClientSecrets`, a SHA-256 secret authenticates, and on its first successful
   use identkit replaces it with the HMAC by compare-and-set (best effort: a failed write goes to
   `onStoreError`, and the next use tries again). This differs from API tokens on purpose: client
@@ -1291,19 +1297,38 @@ refreshedAt?, refreshExpiresAt, refreshSha256 })` keeps the grant id, because th
   `refreshSha256` is the unkeyed SHA-256 hex of the current refresh token, whose generation is
   `generation`. It never replaces a grant. Results: `imported`, `already_imported`, `id_taken`,
   `account_client_taken`, `limit_reached`, `expired`, `no_account`, `account_disabled`,
-  `no_client`. Imported rows show `legacyDigest: true` (clients) and `source: "import"`.
+  `no_client`, `revoked` (an imported grant with this id ended; it stays ended). Imported rows
+  show `legacyDigest: true` (clients) and `source: "import"`.
+- Tombstones: when an imported grant or client ends through identkit (revocation, a replacing
+  exchange, a reused refresh token, expiry, an account disable, `deleteClient`, `purge`), the
+  store keeps its kind and id in `identkit_oauth_import_tombstones`, in the same
+  transaction as the delete. A later import of that id answers `revoked`, so an ended grant
+  never comes back with the earlier system's refresh token, which a thief may hold. A delete of
+  rows directly in the database writes no tombstone. A rolled-back import (a refused audit event)
+  writes none either, so the retry imports. identkit never deletes tombstones in this release;
+  the rows are small.
+- Run the import before the switch. A re-run is safe: it answers `already_imported` for what
+  stands, `revoked` for what ended since, and imports only what is new.
 - `legacy.verifyAccessToken(token)` and `legacy.verifyRefreshToken(token)` check the earlier
-  system's own tokens: its signature and expiry. They return `{ grantId, audience, expiresAt }`
-  or `{ grantId, generation, expiresAt }`, or null to refuse. identkit calls them only for a
-  token of at most 4096 characters that starts with none of its prefixes, and only before
+  system's own tokens: its signature and expiry. They return `{ grantId, audience, expiresAt,
+scopes? }` or `{ grantId, generation, expiresAt }`, or null to refuse. identkit calls them only
+  for a token of at most 4096 characters that starts with none of its prefixes (the OAuth
+  prefixes and `apiTokens.prefix`, so a verifier never sees an API token), and only before
   `legacy.until`; set `until` to the latest legacy refresh expiry, so the path ends by itself.
   Then identkit checks the rest as for its own tokens: the grant exists, was imported (a legacy
   token never reaches a grant that identkit created), is live, the account is active, the
-  audience is one of `resources` (and the one asked for), and at refresh the client is the
-  grant's. A legacy refresh with the grant's generation and stored SHA-256 rotates into an
-  identkit refresh token. One generation below within the grace is `invalid_grant` and keeps the
-  grant; anything else ends it (`refresh_reuse`). A verifier that throws fails the call; a result
-  of another shape throws `TypeError`. Revocation accepts legacy tokens too.
+  audience is the grant's `resource` (and the one asked for), and at refresh the client is the
+  grant's. A legacy access token carries the grant's scopes; if the verifier returns `scopes`
+  (the earlier system narrowed the token at a refresh), only the scopes in both lists, never
+  more than the grant. A legacy refresh with the grant's generation and stored SHA-256 rotates
+  into an identkit refresh token. One generation below within the grace is `invalid_grant` and
+  keeps the grant, if it is the token just rotated (its SHA-256 is the previous digest); any
+  other token of that grant and client ends it (`refresh_reuse`). A verifier result of null, a
+  grant that was not imported and a token of another client end nothing. A verifier that throws
+  fails the call; a result of another shape throws `TypeError`. Revocation accepts legacy tokens
+  too: it tries the refresh verifier, then the access verifier, so each verifier must return
+  null, not throw, for a token it does not recognise, also one of the other kind. Otherwise
+  every revocation of a legacy access token fails.
 - Codes and consent tickets in flight are not imported: a client in the middle of a flow at the
   switch gets `invalid_grant` or `invalid_ticket` and starts again. Switch at low traffic.
 - The unkeyed SHA-256 of a client secret or refresh token lets a database reader test guesses
@@ -1413,11 +1438,13 @@ every `accounts.disable` disables the account, revokes its sessions and runs
 `onAllSessionsRevoked`, and then throws the database error, until the migration runs.
 
 Migration `0006_oauth.sql` (D1: `0004_oauth.sql`) adds the tables `identkit_oauth_clients`,
-`identkit_oauth_grants`, `identkit_oauth_access_tokens`, `identkit_oauth_codes` and
-`identkit_oauth_registration_counts`. It changes nothing else, so the previous release runs on
-the new schema, and a rollback of the code needs no schema rollback. Grants are deleted when they
-end, not marked; the foreign keys remove their access tokens, and an account or client delete
-removes its grants and codes. The unique index `identkit_oauth_grants_account_client_idx` holds
+`identkit_oauth_grants`, `identkit_oauth_access_tokens`, `identkit_oauth_codes`,
+`identkit_oauth_registration_counts` and `identkit_oauth_import_tombstones`. It changes nothing
+else, so the previous release runs on the new schema, and a rollback of the code needs no schema
+rollback. Grants are deleted when they end, not marked; the foreign keys remove their access
+tokens, and an account or client delete removes its grants and codes. An ended imported grant or
+client leaves a row in `identkit_oauth_import_tombstones` (see "Import and legacy tokens");
+identkit never deletes those rows. The unique index `identkit_oauth_grants_account_client_idx` holds
 one grant per account and client; a later release may replace it.
 
 Upgrade note: apply `0006_oauth.sql` (D1: `0004_oauth.sql`) before you deploy this release, also
@@ -1611,8 +1638,8 @@ identkit leaves these to the consumer:
   IPv4 address or the IPv6 /64) so the per-address limit applies.
 - OAuth: set a static `issuer` (your public URL) in production, never one from the request.
   Cap request bodies before you read them. To move from an earlier system, import clients and
-  grants at low traffic, set `legacy.until` to the latest legacy refresh expiry, and remove the
-  verifiers after it.
+  grants before the switch, at low traffic (a re-run is safe), set `legacy.until` to the latest
+  legacy refresh expiry, and remove the verifiers after it.
 - Treat audit events as personal data where the payload is. Approval events carry
   `payloadHash`, a plain SHA-256 of the approved payload. If the payload has low entropy (for
   example an account number and an amount), a reader of the audit log can find it by trying
