@@ -14,7 +14,7 @@ import {
   migrateIdentkit,
   type IdentkitDatabase,
 } from "../../src/postgres/index.js";
-import type { IdentkitStore } from "../../src/storage/types.js";
+import type { IdentkitStore, OidcLinkRecord } from "../../src/storage/types.js";
 import { setup } from "../helpers.js";
 import { runStoreContract } from "../store-contract.js";
 import { runStoreFlows } from "../store-flows.js";
@@ -46,6 +46,7 @@ describe.skipIf(!url)("postgresql", () => {
       "0001_initial.sql",
       "0002_totp.sql",
       "0003_lockout_and_enrollment_revocation.sql",
+      "0004_oidc_links.sql",
     ]);
     expect(await migrateIdentkit(db)).toEqual([]);
     store = createPostgresStore(db);
@@ -116,5 +117,68 @@ describe.skipIf(!url)("postgresql", () => {
       await holder;
     }
     expect(await revoking).toBe(1);
+  });
+  it("oidc links: exclusive inserts keep one link per account under a REPEATABLE READ default", async () => {
+    if (!url) throw new Error("no DATABASE_URL");
+    // A pool whose sessions default to REPEATABLE READ, as a role or database setting can do.
+    const pool = new pg.Pool({
+      connectionString: url,
+      max: 4,
+      options: `-c search_path=${schema}`,
+    });
+    pool.on("connect", (client) => {
+      void client.query("SET default_transaction_isolation = 'repeatable read'");
+    });
+    const rr = new Kysely<IdentkitDatabase>({ dialect: new PostgresDialect({ pool }) });
+    try {
+      const shown = await sql<{
+        default_transaction_isolation: string;
+      }>`SHOW default_transaction_isolation`.execute(rr);
+      expect(shown.rows[0]?.default_transaction_isolation).toBe("repeatable read");
+      const rrStore = createPostgresStore(rr);
+      const links = rrStore.oidcLinks;
+      if (!links) throw new Error("store has no oidcLinks");
+      const t = setup({ store: requireStore() });
+      const created = await t.ik.accounts.create({ email: "pg-oidc-rr@example.org" });
+      if (created.status !== "created") throw new Error("not created");
+      const accountId = created.account.id;
+      const link = (n: number): OidcLinkRecord => ({
+        id: `pg-rr-link-${n}-${randomBytes(4).toString("hex")}`,
+        accountId,
+        linkKey: JSON.stringify(["google", `pg-rr-${n}-${randomBytes(4).toString("hex")}`]),
+        provider: "google",
+        issuer: "https://accounts.google.com",
+        subject: `pg-rr-${n}`,
+        tenantId: null,
+        source: "sign_in",
+        createdAt: new Date(),
+      });
+
+      // Hold the account row lock, so both inserts take their snapshot before either commits.
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => (release = resolve));
+      let lockTaken!: () => void;
+      const locked = new Promise<void>((resolve) => (lockTaken = resolve));
+      const holder = rr.transaction().execute(async (trx) => {
+        await trx
+          .selectFrom("identkit_accounts")
+          .select("id")
+          .where("id", "=", accountId)
+          .forUpdate()
+          .executeTakeFirst();
+        lockTaken();
+        await released;
+      });
+      await locked;
+      const inserts = [1, 2].map((n) => links.insert(link(n), { exclusive: true }));
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      release();
+      await holder;
+      const results = await Promise.all(inserts);
+      expect(results.toSorted()).toEqual(["account_has_link", "inserted"]);
+      expect(await links.listByAccount(accountId)).toHaveLength(1);
+    } finally {
+      await rr.destroy();
+    }
   });
 });

@@ -842,47 +842,54 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
     },
     oidcLinks: {
       async insert(link, options) {
-        return db.transaction().execute(async (trx) => {
-          // The account row lock serializes exclusive inserts for one account, so at most one
-          // link stays. The unique link key refuses a subject that is linked already.
-          await trx
-            .selectFrom("identkit_accounts")
-            .select("id")
-            .where("id", "=", link.accountId)
-            .forUpdate()
-            .executeTakeFirst();
-          const taken = await trx
-            .selectFrom("identkit_oidc_links")
-            .select("id")
-            .where("link_key", "=", link.linkKey)
-            .executeTakeFirst();
-          if (taken) return "link_taken";
-          if (options.exclusive) {
-            const existing = await trx
+        // READ COMMITTED whatever the database default: each statement after the account row
+        // lock then sees a link that the transaction holding the lock before committed. Under
+        // REPEATABLE READ the snapshot would date from before that commit, and two exclusive
+        // inserts for one account could both pass the check below.
+        return db
+          .transaction()
+          .setIsolationLevel("read committed")
+          .execute(async (trx) => {
+            // The account row lock serializes exclusive inserts for one account, so at most one
+            // link stays. The unique link key refuses a subject that is linked already.
+            await trx
+              .selectFrom("identkit_accounts")
+              .select("id")
+              .where("id", "=", link.accountId)
+              .forUpdate()
+              .executeTakeFirst();
+            const taken = await trx
               .selectFrom("identkit_oidc_links")
               .select("id")
-              .where("account_id", "=", link.accountId)
+              .where("link_key", "=", link.linkKey)
               .executeTakeFirst();
-            if (existing) return "account_has_link";
-          }
-          const row = await trx
-            .insertInto("identkit_oidc_links")
-            .values({
-              id: link.id,
-              account_id: link.accountId,
-              link_key: link.linkKey,
-              provider: link.provider,
-              issuer: link.issuer,
-              subject: link.subject,
-              tenant_id: link.tenantId,
-              source: link.source,
-              created_at: link.createdAt,
-            })
-            .onConflict((oc) => oc.column("link_key").doNothing())
-            .returning("id")
-            .executeTakeFirst();
-          return row ? "inserted" : "link_taken";
-        });
+            if (taken) return "link_taken";
+            if (options.exclusive) {
+              const existing = await trx
+                .selectFrom("identkit_oidc_links")
+                .select("id")
+                .where("account_id", "=", link.accountId)
+                .executeTakeFirst();
+              if (existing) return "account_has_link";
+            }
+            const row = await trx
+              .insertInto("identkit_oidc_links")
+              .values({
+                id: link.id,
+                account_id: link.accountId,
+                link_key: link.linkKey,
+                provider: link.provider,
+                issuer: link.issuer,
+                subject: link.subject,
+                tenant_id: link.tenantId,
+                source: link.source,
+                created_at: link.createdAt,
+              })
+              .onConflict((oc) => oc.column("link_key").doNothing())
+              .returning("id")
+              .executeTakeFirst();
+            return row ? "inserted" : "link_taken";
+          });
       },
       async findByKey(linkKey) {
         const r = await db
