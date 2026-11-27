@@ -9,8 +9,10 @@ import {
   createAesGcmSealer,
   createHmacHasher,
   createIdentkit,
+  createJwksCache,
   createMemoryStore,
   hashPayload,
+  microsoftProvider,
   hashPayloadAsync,
   NodeCryptoUnavailableError,
 } from "../../dist/index.js";
@@ -18,6 +20,7 @@ import { createD1Store, D1_MIGRATIONS, migrateIdentkitD1 } from "../../dist/d1/i
 import {
   createFakeClock,
   createFakeIdentityVerificationAdapter,
+  createFakeOidcProvider,
   createRecordingAuditSink,
   createRecordingMailSender,
   createTestSealer,
@@ -32,7 +35,14 @@ import {
   SEAL_KEY_OLD_HEX,
   SEALED,
 } from "../compat-vectors.ts";
-import { basePolicy, config, ORIGIN } from "./smoke-config.js";
+import {
+  basePolicy,
+  config,
+  OIDC_CLIENT,
+  OIDC_TENANT,
+  oidcConfig,
+  ORIGIN,
+} from "./smoke-config.js";
 
 function hex(text) {
   const bytes = new Uint8Array(text.length / 2);
@@ -68,6 +78,30 @@ function setup(store = createMemoryStore()) {
   }
   return { ik, clock, store, policy, signIn };
 }
+
+/** identkit with Microsoft sign-in whose requests go to `fetch`. */
+function oidcSetup(fetch) {
+  const clock = createFakeClock(new Date());
+  const ik = createIdentkit({
+    config: { ...config, oidc: oidcConfig },
+    sealer: createTestSealer(),
+    isPrivilegedAccount: () => false,
+    store: createMemoryStore(),
+    hasher: createHmacHasher(crypto.getRandomValues(new Uint8Array(32))),
+    mail: createRecordingMailSender(),
+    audit: createRecordingAuditSink(),
+    clock,
+    policy: { ...basePolicy, signInMethods: ["email_otp", "passkey", "oidc"] },
+    oidc: {
+      providers: [microsoftProvider({ ...OIDC_CLIENT, redirectUri: `${ORIGIN}/auth/callback` })],
+      fetch,
+      jwksCache: createJwksCache(),
+    },
+  });
+  return { ik, clock };
+}
+
+const msClaims = (oid, email) => ({ tid: OIDC_TENANT, oid, email, xms_edov: true });
 
 async function authenticator(env, action, options) {
   const response = await env.AUTHENTICATOR.fetch(`http://authenticator/${action}`, {
@@ -215,6 +249,48 @@ const checks = {
     }
     check(refused, "an unconstrained D1 session was accepted");
     createD1Store(env.DB.withSession("first-primary"), { sessionConstraint: "first-primary" });
+  },
+
+  async oidcSignInWithFakeInWorkerd() {
+    // The fake provider runs here too: Web Crypto key generation and signing in workerd.
+    const fake = await createFakeOidcProvider({ kind: "microsoft", ...OIDC_CLIENT });
+    let requests = 0;
+    const t = oidcSetup((url, init) => {
+      requests += 1;
+      return fake.fetch(url, init);
+    });
+    const oid = "aaaaaaaa-bbbb-4ccc-8ddd-000000000001";
+    for (const expected of [2, 3]) {
+      const begun = await t.ik.oidc.begin({ provider: "microsoft" });
+      const params = await fake.authorize(begun.authorizationUrl, msClaims(oid, "p@example.org"));
+      const result = await t.ik.oidc.finish({ transaction: begun.transaction, params });
+      check(result.status === "signed_in", `oidc sign-in: ${result.status} ${result.reason}`);
+      check(requests === expected, `requests: ${requests}, expected ${expected}`);
+      check((await t.ik.sessions.validate(result.token)) !== null, "oidc session invalid");
+    }
+  },
+
+  async oidcSignInThroughFetch(env) {
+    // identkit's requests leave the Worker through workerd's fetch, to the fake IdP on Node.
+    const t = oidcSetup((url, init) => env.IDP.fetch(url, init));
+    const before = await (await env.IDP.fetch("http://idp/requests")).json();
+    const begun = await t.ik.oidc.begin({ provider: "microsoft" });
+    const authorized = await env.IDP.fetch("http://idp/authorize", {
+      method: "POST",
+      body: JSON.stringify({
+        url: begun.authorizationUrl,
+        claims: msClaims("aaaaaaaa-bbbb-4ccc-8ddd-000000000002", "q@example.org"),
+      }),
+    });
+    const { query } = await authorized.json();
+    const result = await t.ik.oidc.finish({
+      transaction: begun.transaction,
+      params: new URLSearchParams(query),
+    });
+    check(result.status === "signed_in", `oidc via fetch: ${result.status} ${result.reason}`);
+    const after = await (await env.IDP.fetch("http://idp/requests")).json();
+    check(after.token - before.token === 1, "one token request");
+    check(after.jwks - before.jwks === 1, "one key request");
   },
 
   async fakeIdentityCallback() {

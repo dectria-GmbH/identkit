@@ -44,6 +44,26 @@ async function authenticatorService() {
   };
 }
 
+/**
+ * A fake Microsoft identity platform on Node, reached from workerd through a service binding,
+ * so identkit's requests go through workerd's real `fetch` (headers, body, abort signal).
+ * `POST http://idp/authorize` plays the user; every other request is the provider itself.
+ */
+async function identityProviderService() {
+  const { createFakeOidcProvider } = await import(resolve(root, "dist/testing/index.js"));
+  const { OIDC_CLIENT } = await import(resolve(root, "test/workerd/smoke-config.js"));
+  const fake = await createFakeOidcProvider({ kind: "microsoft", ...OIDC_CLIENT });
+  return async (request) => {
+    if (request.url === "http://idp/authorize") {
+      const { url, claims } = await request.json();
+      return Response.json({ query: (await fake.authorize(url, claims)).toString() });
+    }
+    if (request.url === "http://idp/requests") return Response.json(fake.requests());
+    const body = request.method === "POST" ? await request.text() : undefined;
+    return fake.fetch(request.url, { method: request.method, headers: request.headers, body });
+  };
+}
+
 /** Wall time per call of `sessions.validate` in workerd: two runs, so setup cost cancels out. */
 async function benchWorkerd(mf) {
   const time = async (n) => {
@@ -104,7 +124,10 @@ const mf = new Miniflare({
   ],
   compatibilityDate: "2026-07-01",
   compatibilityFlags: [],
-  serviceBindings: { AUTHENTICATOR: await authenticatorService() },
+  serviceBindings: {
+    AUTHENTICATOR: await authenticatorService(),
+    IDP: await identityProviderService(),
+  },
   d1Databases: { DB: "identkit-smoke" },
 });
 
