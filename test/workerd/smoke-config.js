@@ -41,6 +41,17 @@ export const config = {
   },
 };
 
+export const oidcConfig = {
+  transactionTtlSeconds: 600,
+  clockSkewSeconds: 60,
+  jwksCacheSeconds: 3600,
+  jwksRefetchIntervalSeconds: 60,
+  httpTimeoutSeconds: 10,
+};
+
+export const OIDC_CLIENT = { clientId: "smoke-client", clientSecret: "smoke-secret" };
+export const OIDC_TENANT = "11111111-2222-4333-8444-555555555555";
+
 export const basePolicy = {
   signInMethods: ["email_otp", "passkey"],
   secondFactor: "none",

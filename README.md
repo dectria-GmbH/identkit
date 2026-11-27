@@ -3,8 +3,9 @@
 Identity toolkit for TypeScript: accounts, e-mail codes, passkeys, TOTP, sessions, step-up and approval evidence.
 
 Status: early development, release 0.1.1. It covers sign-in by e-mail code, passkeys, TOTP
-(authenticator apps), sessions, step-up, approval evidence at two levels, an identity
-verification port and storage. See "Not built" for what comes later.
+(authenticator apps), sign-in through an external OpenID Connect provider (Microsoft, Google or
+any other), sessions, step-up, approval evidence at two levels, an identity verification port and
+storage. See "Not built" for what comes later.
 
 identkit is a library, not a server. The core has no HTTP framework dependency: you call it from
 your own routes and set cookies yourself.
@@ -113,19 +114,24 @@ const session = await identkit.sessions.validate(tokenFromCookie);
   `unlockAddress(email)`.
 - `identityVerification`: `start({ accountId, returnUrl })`, `handleCallback(payload)`,
   `refresh(verificationId)`, `get(verificationId)`.
+- `oidc`: `begin({ provider, loginHint? })`, `finish({ transaction, params })`,
+  `importLink(input)`, `listLinks(accountId)`, `removeLink(accountId, linkId)`. See "External
+  sign-in (OpenID Connect)".
 
 Administrative calls take bare ids and trust their caller. Expose them only to privileged code,
 or check ownership yourself before you pass client input: all of `accounts`,
 `passkeys.list`, `passkeys.revoke`, `passkeys.issueEnrollmentToken`,
 `passkeys.revokeEnrollmentTokens`, `totp.get`, `totp.revoke`,
 `totp.reseal`, `sessions.revokeById`,
-`sessions.revokeAll`, `identityVerification.start`, `identityVerification.refresh` and
-`identityVerification.get`.
+`sessions.revokeAll`, `identityVerification.start`, `identityVerification.refresh`,
+`identityVerification.get`, `oidc.importLink`, `oidc.listLinks` and `oidc.removeLink`.
 
 Standalone functions: `checkApprovalEvidence({ evidence, verifier | hasher })`, `hashPayload(payload)`,
 `hashPayloadAsync(payload)`, `approvalChallenge(nonce, payloadHash, accountId)`,
 `approvalChallengeAsync(nonce, payloadHash, accountId)`, `normalizeEmail(input)`, `parseConfig(input)`,
-`createAesGcmSealer({ keys, activeKeyId })`, `applyThrottle(state, at, rule)`, `lockDuration(rule, lockCount)` and the type `ThrottleState` (for custom stores). Constant `TOTP_INTEROPERABLE_PARAMETERS`
+`createAesGcmSealer({ keys, activeKeyId })`, `applyThrottle(state, at, rule)`, `lockDuration(rule, lockCount)` and the type `ThrottleState` (for custom stores),
+`microsoftProvider(options)`, `googleProvider(options)`, `oidcProvider(options)`,
+`createJwksCache()` and the constant `MICROSOFT_CONSUMER_TENANT_ID`. Constant `TOTP_INTEROPERABLE_PARAMETERS`
 (`{ algorithm: "SHA1", digits: 6 }`).
 
 `checkApprovalEvidence` returns an object with a `status`. Switch on the exact status and
@@ -150,7 +156,8 @@ Subpath `identkit/d1`: `createD1Store(db, options?)`, `migrateIdentkitD1(db)`, `
 
 Subpath `identkit/testing`: `createFakeClock`, `createRecordingMailSender`,
 `createRecordingAuditSink`, `createFakeIdentityVerificationAdapter`,
-`createSoftwareAuthenticator`, `createTestSealer`, `generateTotpCode`, `generateTotpCodeAsync`.
+`createSoftwareAuthenticator`, `createTestSealer`, `generateTotpCode`, `generateTotpCodeAsync`,
+`createFakeOidcProvider`.
 These are for tests and demos only.
 
 Passkey options and responses use the WebAuthn JSON forms, so a browser can pass them to
@@ -165,7 +172,7 @@ Every field is required; there is no default.
 
 | Field                        | Values                                         | Effect                                                                                                                                                                                     |
 | ---------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `signInMethods`              | `email_otp`, `passkey`                         | Methods that may start a session. TOTP never starts a session on its own.                                                                                                                  |
+| `signInMethods`              | `email_otp`, `passkey`, `oidc`                 | Methods that may start a session. TOTP never starts a session on its own. `oidc` is sign-in through an external provider (`identkit.oidc`).                                                |
 | `secondFactor`               | `none`, `if_enrolled`                          | After an e-mail code: full session, or a pending state that needs a second factor if the account has one (passkey or TOTP).                                                                |
 | `secondFactorMethods`        | `passkey`, `totp` (one or both)                | Methods that may complete the pending state.                                                                                                                                               |
 | `stepUpMethods`              | `email_otp`, `passkey`, `totp`                 | Methods that may satisfy a step-up. `requireStepUp` can narrow the list, never widen it.                                                                                                   |
@@ -232,6 +239,11 @@ standard or an owner decision; choose your own from your risk analysis.
 | `totp.lockout.windowSeconds`                     | 900     | 60 to 86400                              | Assumption                                                                                                                                                                |
 | `totp.lockout.lockSeconds`                       | 900     | 60 to 86400                              | Assumption                                                                                                                                                                |
 | `totp.lockout.maxLockSeconds`                    | 86400   | 60 to 30 days, at least `lockSeconds`    | Assumption                                                                                                                                                                |
+| `oidc.transactionTtlSeconds`                     | 600     | 60 to 1800                               | Time between `begin` and `finish`. Assumption.                                                                                                                            |
+| `oidc.clockSkewSeconds`                          | 60      | 0 to 300                                 | Tolerance for `exp`, `nbf` and `iat`. Assumption.                                                                                                                         |
+| `oidc.jwksCacheSeconds`                          | 3600    | 60 to 86400                              | How long provider keys are used before a new fetch. Assumption.                                                                                                           |
+| `oidc.jwksRefetchIntervalSeconds`                | 60      | 10 to 3600                               | Least time between two key fetches for an unknown key id. Assumption.                                                                                                     |
+| `oidc.httpTimeoutSeconds`                        | 10      | 1 to 60                                  | Timeout of each request to the provider. Assumption.                                                                                                                      |
 
 Fixed values:
 
@@ -245,8 +257,11 @@ Fixed values:
 | Sealer key length                  | exactly 32 bytes (AES-256)                                              | Design choice                                         |
 | Code attempts per pending approval | 1                                                                       | Design choice: a wrong code ends the pending approval |
 
+The section `oidc` is optional; every value inside it is required. It is needed only with the
+option `oidc` (see "External sign-in (OpenID Connect)").
+
 Options that are not configuration but are required: `isPrivilegedAccount` (see "Sign-in
-policy"), and `sealer` whenever the policy names TOTP (`secondFactorMethods`, `stepUpMethods`,
+policy"), and `sealer` whenever the policy names TOTP or the option `oidc` is set (`secondFactorMethods`, `stepUpMethods`,
 or `code-confirmation` in `approvalEvidenceLevels`). With a policy object, a missing sealer fails at
 `createIdentkit`; with a policy function, at the first TOTP call.
 
@@ -319,6 +334,59 @@ Sessions:
   factor, every step-up, and `rotate`.
 - A fresh sign-in counts as a step-up by the method used.
 - A session waiting for its second factor is not a session: `validate` returns null for it.
+- No idle end: set `idleTimeoutSeconds` equal to `absoluteTimeoutSeconds` (both at most 86400).
+  The idle end then never comes before the absolute one, so a session lasts exactly the absolute
+  time, used or not. A test checks this with 43200 seconds.
+- The option `onAllSessionsRevoked(event)` is called after every `sessions.revokeAll`, also when
+  `accounts.disable`, a passkey change, a TOTP change or `oidc.removeLink` calls it, and also
+  when no session was live. `event` holds `accountId`, `exceptSessionId` (the session that stayed,
+  or null) and `revokedSessionIds`. Use it to end sessions your application keeps itself, for
+  example with a per-account version. It runs last: after the revocation and after the calling
+  operation's own writes and audit events (the disable, the new or removed passkey, the TOTP
+  change, the removed link). If it throws, the call throws `AllSessionsRevokedHookError` (after a
+  rollback, `OperationRolledBackError`; see below), and everything identkit does is done: the
+  identkit sessions stay revoked and the audit events are written, unless `auditError` is set
+  (see below). Some calls cannot be repeated (a finished
+  passkey registration or TOTP enrolment, a `totp.remove` whose factor is gone), so re-run the
+  hook with `sessions.revokeAll(error.accountId, error.revokeAllOptions)`.
+  `revokeAll` is idempotent and calls the hook also when no session was live. Make the hook
+  idempotent too. On such a re-run `revokedSessionIds` is empty, because the sessions are already
+  revoked: do not depend on it to find the sessions to end.
+- A TOTP enrolment or a passkey registration rolls back when its grant changed before it
+  completed, and when the store fails after the new factor or passkey was stored (also on the
+  revocation of the other sessions): identkit removes the factor or passkey and revokes every
+  session of the account. A grant change is recorded with reason `grant_changed` and the call
+  returns `denied`. If an error comes up on the way (the store's, the audit sink's or the
+  hook's), the call throws `OperationRolledBackError` instead, with the first error as `cause`.
+  Its `hookFailed` is true if the hook threw or the store failed before identkit could call it;
+  then call `sessions.revokeAll(error.accountId, error.revokeAllOptions)` to finish the
+  revocation and run the hook. `revokeAllOptions` is always `{}`, so that call also ends the
+  session that started the operation.
+- The rule for callers: if you catch `OperationRolledBackError`, the operation did not take
+  effect. Any other error means that identkit did not roll back: what it wrote before the error
+  stands, and `AllSessionsRevokedHookError` means that the operation's writes are complete. An
+  error from `confirmEnrolment` or `finishRegistration` can also come before the activation, so
+  after any other error check `totp.get` or `passkeys.list` before you tell the person that the
+  factor or passkey is active. A rollback that cannot remove the new factor or passkey throws
+  the store's error or `PasskeyCleanupError` (see Passkeys and TOTP below).
+- The hook runs also when the audit sink throws, on the `session.revoked` events or on the
+  operation's own events, so a failing sink cannot leave your application's sessions live.
+  identkit still offers every other event of the operation to the sink (a refused
+  `session.revoked` does not skip `account.disabled`, `totp.removed` or `passkey.registered`).
+  Then the first sink error goes up after the hook ran. If the hook throws as well,
+  `AllSessionsRevokedHookError` goes up, because only the hook needs a re-run, and its
+  `auditError` holds that first sink error: the refused event is missing, and later events may
+  be missing too if the sink stayed down. In `totp.confirmEnrolment`, `auditError` can also hold
+  the throttle store's error from the reset after a successful enrolment. Without such a
+  failure, `auditError` is undefined. In short: sink fails only, the sink's error goes up; hook
+  fails only, `AllSessionsRevokedHookError` without `auditError`; both fail,
+  `AllSessionsRevokedHookError` with `auditError`. After a rollback, each of these goes up as
+  `OperationRolledBackError` instead.
+- A sink error on the `session.revoked` events is not a failed revocation: the sessions are
+  revoked. On the success path a TOTP enrolment or a passkey registration then stands, as when
+  the sink refuses `totp.enrolled` or `passkey.registered`, and the sink's error goes up. On a
+  rollback the sink's error goes up as the `cause` of `OperationRolledBackError`, unless an
+  earlier error came first.
 
 Passkeys:
 
@@ -347,8 +415,9 @@ Passkeys:
   approve. The registration applies its grant again after the insert and activates the passkey
   only if the session is still live and no other passkey appeared meanwhile; otherwise it
   deletes it. After the activation it checks once more; if the grant no longer holds, it deletes
-  the passkey and ends every session of the account; an error on the way does the same. A crash
-  in between leaves an unusable pending row.
+  the passkey and ends every session of the account; an error on the way does the same, also a
+  store error on the revocation of the other sessions after the last check (see Sessions for
+  `OperationRolledBackError`). A crash in between leaves an unusable pending row.
 - If the store fails on both deletes of that passkey, identkit tries twice to disable the
   account, ends all its sessions and throws: the passkey may still be active without a valid
   grant. The audit event `passkey.registration_failed` says `cleanup_failed_account_disabled`
@@ -363,8 +432,9 @@ Passkeys:
 - A registration that is already running is cancelled only by revocation, not by a token
   rotation: `rotate` and step-ups keep the session, so a registration started before them
   completes. Use `sessions.revokeById` or `revokeAll` to cut off a stolen session.
-- Registration, removal and revocation of a passkey revoke sessions before the audit event, so
-  a failing audit sink cannot skip the revocation.
+- Registration, removal and revocation of a passkey revoke sessions before the audit event and
+  call `onAllSessionsRevoked` after it, also when the audit sink throws. So a failing audit sink
+  skips neither the revocation nor the hook.
 - An e-mail sign-in checks the second-factor rule again after it created the session, so a first
   passkey registered at the same moment cannot leave a full session from a code alone.
 
@@ -416,8 +486,13 @@ TOTP:
   enrollment token) can change the account's factors.
   Enrolment, removal and administrative revocation revoke the other sessions of the account (all
   of them for `revoke`). If that revocation fails, enrolment removes the factor again and ends
-  every session; removal retries once; `revoke` ends all sessions also when it finds no factor,
-  so a retry after an error completes it.
+  every session; `revoke` ends all sessions also when it finds no factor, so a retry after an
+  error completes it. Removal retries once. If the retry fails too, the factor stays removed and
+  `remove` throws `SessionsNotRevokedError`: a retried `remove` answers `not_found`, so finish
+  with `sessions.revokeAll(error.accountId, error.revokeAllOptions)`, which also runs the hook.
+  If the first attempt committed and lost its reply, the retry finds no live session: the hook
+  gets an empty `revokedSessionIds`, and no `session.revoked` event is recorded for the sessions
+  that the first attempt revoked.
 - A TOTP second factor or step-up checks after its write that the same factor is still the
   account's active factor. A removal that raced with the check yields no session and no step-up.
 
@@ -500,6 +575,200 @@ One account per person:
   `pending` and the next `refresh` completes it. Such a verification does not time out: it waits
   for the vendor to report success again.
 
+## External sign-in (OpenID Connect)
+
+identkit signs people in through an external OpenID Connect provider with the authorization code
+flow, PKCE (S256), `state` and `nonce`. It is a client only: it issues no tokens, and it keeps no
+provider tokens (no refresh token, no access token for APIs).
+
+Before you turn on the option `oidc`, deploy this release to every instance and finish any
+gradual deployment. An earlier release cannot read a session whose method is `oidc` and fails
+it; a rollback after the first OIDC sign-in fails those sessions too (see Storage).
+
+```ts
+import { createJwksCache, googleProvider, microsoftProvider } from "identkit";
+
+// Module scope: on Workers the keys then survive between requests of one isolate.
+const jwksCache = createJwksCache();
+
+const identkit = createIdentkit({
+  ...options, // config with the `oidc` section, a sealer, a store with links
+  policy: { ...policy, signInMethods: ["email_otp", "passkey", "oidc"] },
+  oidc: {
+    providers: [
+      microsoftProvider({
+        clientId,
+        clientSecret,
+        redirectUri: "https://app.example/auth/callback",
+      }),
+      googleProvider({
+        clientId: gId,
+        clientSecret: gSecret,
+        redirectUri: "https://app.example/auth/callback",
+      }),
+    ],
+    jwksCache,
+  },
+});
+
+// Route "sign in with Microsoft"
+const { authorizationUrl, transaction } = await identkit.oidc.begin({ provider: "microsoft" });
+setCookie("__Host-oidc", transaction, {
+  httpOnly: true,
+  secure: true,
+  sameSite: "Lax",
+  maxAge: 600,
+});
+redirect(authorizationUrl);
+
+// Route "callback"
+const result = await identkit.oidc.finish({
+  transaction: cookie("__Host-oidc"),
+  params: new URL(request.url).searchParams,
+});
+// Single use: clear the transaction cookie after every finish, success or failure.
+deleteCookie("__Host-oidc");
+if (result.status === "signed_in") setSessionCookie(result.token);
+```
+
+Providers:
+
+- `microsoftProvider({ clientId, clientSecret, redirectUri, tenant?, allowedTenants?, upnAsAddress?, allowGuests?, prompt? })`:
+  Microsoft identity platform v2.0. `tenant` is `common` (default), `organizations`,
+  `consumers` or a tenant id. Scopes `openid email profile`, `prompt=select_account` by default.
+  The multi-tenant endpoints sign tokens for every tenant, so identkit checks that `iss` is
+  `https://login.microsoftonline.com/{tid}/v2.0` for the token's own `tid`. `allowedTenants`
+  limits sign-in to those tenant ids. `allowGuests` (default false) lets a guest bind by address,
+  but never a personal account; see the binding rules.
+- `googleProvider({ clientId, clientSecret, redirectUri, hostedDomains?, prompt? })`: issuer
+  `https://accounts.google.com` (also accepted without `https://`, as Google documents).
+  `hostedDomains` limits sign-in to those Workspace domains (`hd` claim).
+- `oidcProvider({ id, issuer, authorizationEndpoint, tokenEndpoint, jwksUri, clientId, clientSecret, redirectUri, scopes?, tokenEndpointAuthMethod?, algorithms?, prompt? })`:
+  any other provider. No discovery request: you give the endpoints. `iss` must equal `issuer`.
+- The client secret is not a property of the returned object; identkit sends it only to the
+  token endpoint. Endpoints and the redirect URI must be https (plain http only for localhost).
+  identkit follows no redirect from a provider endpoint: a redirect fails the request, so the
+  secret never goes to a redirect target.
+- Every factory takes `extraAudiences` (default none): audiences besides the client id that you
+  trust in an ID token. A token with any other audience is refused.
+
+The flow:
+
+- `begin` returns the authorization URL and `transaction`: state, nonce and PKCE verifier, sealed
+  with your `SecretSealer` (AES-256-GCM, its own context). identkit stores nothing at `begin`.
+  Keep `transaction` in a short-lived cookie (`__Host-` prefix, `HttpOnly`, `Secure`,
+  `SameSite=Lax`, since the callback is a top-level GET from the provider). The cookie binds the
+  flow to the browser that started it: a callback with another flow's `state` fails
+  (`state_mismatch`) before any request to the provider.
+- identkit keeps no state per flow, so it cannot make `transaction` single use: within its
+  lifetime it opens again for another code from the same authorization URL. So clear the cookie
+  after `finish`, whatever the result. Serve the callback route with `Referrer-Policy:
+no-referrer`, and never redirect from it to a value from the query: a code that leaks from the
+  callback URL (Referer header, logs, an open redirect) could otherwise complete a flow that an
+  attacker started (RFC 9700, section 4.5.3). PKCE and the nonce do not help there, because the
+  attacker started that flow.
+- `finish` opens the transaction, checks its lifetime and `state`, exchanges the code with the
+  verifier (client secret by `client_secret_post` for the presets, `client_secret_basic` by
+  default for `oidcProvider`), and verifies the ID token: signature with the provider's keys
+  (RS256 with at least 2048 bits; ES256 for `oidcProvider` if listed in `algorithms`; never
+  `none` or HMAC; a token with `crit` is refused; keys come only from the configured JWKS URI),
+  `iss`, `aud` contains the client id and no audience outside `extraAudiences`, `azp` is the
+  client id when present and required with several audiences, `exp`, `nbf` and `iat` with
+  `clockSkewSeconds`, and `nonce`. An RSA key must have at least 2048 bits and the exponent 65537.
+  Provider responses are limited in bytes.
+- Keys are cached per JWKS URI for `jwksCacheSeconds`. A token with an unknown key id causes one
+  more fetch, at most one per `jwksRefetchIntervalSeconds`. Concurrent fetches are shared. So one
+  `finish` makes at most two outgoing requests (token and keys), and one with a warm cache. Pass
+  one `createJwksCache()` from module scope; without it each identkit instance has its own cache,
+  which on Workers means one per request.
+- Results: `signed_in` (with `accountCreated` and `linkCreated`), `second_factor_required`,
+  `second_factor_unavailable`, `refused` with a reason (`organization_not_allowed`,
+  `consumer_tenant`, `guest_account`, `unverified_address`, `no_account`, `account_disabled`, `account_has_link`,
+  `refused_by_hook`) or `failed` with a reason (`invalid_transaction`, `transaction_expired`,
+  `state_mismatch`, `provider_error` with the provider's `error` code if it is a plain word,
+  `missing_code`, `token_request_failed`, `keys_unavailable`, `invalid_id_token`). Only the
+  person who completed the provider's sign-in sees a refusal, and it names only their own
+  address's state, so identkit returns the reason.
+
+Links, never the address:
+
+- identkit links an account to a subject at the provider, never to the address: Microsoft by
+  tenant id and object id (`tid`, `oid`), Google by `sub`, other providers by issuer and `sub`. A
+  subject belongs to at most one account (unique link key). A known subject signs in to its
+  account, whatever its token says about the address. A disabled account is refused.
+- `linksPerAccount` (option, default `one`): an account holds at most one link, so an account
+  linked to one provider cannot sign in with another, and a second subject with the same address
+  (for example a guest account or a re-created user) does not bind. `any` allows several.
+
+First binding (no link for the subject yet), in this order:
+
+1. `allowedTenants`, a tenant authority, or `hostedDomains` refuse other organizations
+   (`organization_not_allowed`), for every sign-in, linked or not.
+2. Microsoft personal accounts never bind (`consumer_tenant`), also with `allowGuests: true`: a
+   token of the consumer tenant (`9188040d-6c67-4c5b-b112-36a304b66dad`), and a personal account
+   invited as a guest into a work tenant (`idp` is `live.com`, a host under `live.com`, or an STS
+   URI of the consumer tenant). This is identkit's requirement, not a claim that Microsoft leaves
+   their address unchecked: a personal account belongs to no organization's tenant, so no tenant
+   administrator has verified the domain of its address, which is what `xms_edov` reports for a
+   work account. A link you import for one still signs in.
+3. Microsoft guests never bind by default (`guest_account`): a user who is homed in another
+   tenant or at another identity provider and signs in to your authority tenant (relevant with a
+   tenant id as `tenant`). identkit counts a token as a guest's if the optional claim `acct` is 1,
+   or if `idp` is present and is neither `iss` nor a Microsoft STS URI of the token's own tenant
+   (Microsoft documents `idp` as equal to the issuer except for users from another tenant, and as
+   `live.com` or the consumer tenant for an invited personal account). An unknown `idp` form
+   counts as a guest, so it fails closed. With `allowGuests: true` a guest (except a personal
+   account, see rule 2) binds by `email` with `xms_edov` true, never by `preferred_username`. A
+   link you import for a guest still signs in.
+   Limit: Microsoft does not document the `idp` value for a member of a federated domain (a
+   tenant domain that signs in at AD FS or another identity provider). If Entra puts the
+   federation provider there, identkit counts every such member as a guest and refuses its first
+   binding with `guest_account`. You can tell: the person gets `refused` with `guest_account`,
+   and the audit sink records `oidc.binding_refused` with that reason, while you know the person
+   is a member of your tenant or your tenant has no guests. Ways out: import a link for the
+   person (`oidc.importLink`; a linked subject signs in), or set `allowGuests: true`, which also
+   lets real guests bind by a verified address.
+4. The address must be verified by the provider (`unverified_address` otherwise): Google and
+   other providers by `email_verified` true. Microsoft by `email` with the optional claim
+   `xms_edov` true (add the optional claims `email` and `xms_edov` to the app registration). With
+   `upnAsAddress: true`, Microsoft also binds a member (not a guest) by `preferred_username` when
+   `xms_edov` is missing. Entra accepts as a user principal name suffix only a domain verified in
+   the tenant, but Microsoft documents `preferred_username` as mutable and not meant for
+   authorization, so this is your decision; it stays off by default. The address must also stay
+   the same under identkit's normalization except for ASCII case: an address that NFC or Unicode
+   lowercase would change (for example the Kelvin sign, which lowercases to `k`) does not bind,
+   because it could turn into another account's address. An address with non-ASCII characters
+   (in the local part or the domain) does not bind either: identkit's address check accepts only
+   ASCII addresses.
+5. The account of that address. If there is none, identkit creates one if the policy's
+   `createAccountOnFirstSignIn` is true, as for e-mail codes, else `no_account`. A disabled
+   account is refused. With `linksPerAccount: "one"`, an account that has a link is refused
+   (`account_has_link`).
+6. `mayBind(request)` (option): your own rule, for example refused subjects or a rebind window
+   after an administrative reset. It gets the provider, kind, issuer, subject, tenant id, the
+   address and the account (or null). It runs last and can only refuse (`refused_by_hook`). It
+   must return a boolean; anything else fails the sign-in. It is not called for a subject that has
+   a link.
+
+Concurrent first sign-ins of one subject leave one link; each signs in to the linked account.
+
+Session: the session records `oidc` as its method and has no step-up: identkit cannot vouch for
+what the provider checked. The second-factor rule of e-mail codes applies (policy `secondFactor`
+and `isPrivilegedAccount`). Require a step-up with your own methods before sensitive actions.
+
+Migration from your own provider sign-in:
+
+- `oidc.importLink(input)` records the link of an existing account, so the person signs in to
+  the same account. `input` is `{ accountId, provider: "microsoft", tenantId, objectId }`,
+  `{ accountId, provider: "google", subject }` or `{ accountId, provider: "oidc", issuer, subject }`.
+  It is idempotent:
+  `imported`, `already_linked`, `linked_elsewhere` (the subject belongs to another account),
+  `account_has_link` (with `linksPerAccount: "one"`) or `no_account`. Run it before you switch
+  the sign-in over.
+- `oidc.removeLink(accountId, linkId)` removes a link and revokes every session of the account.
+  The subject can then bind again by its address, so use `mayBind` if a reset must not allow
+  that at once.
+
 ## Identity verification port
 
 Implement `IdentityVerificationAdapter` for a vendor: `start`, `parseCallback` (authenticate the
@@ -511,10 +780,17 @@ nobody. Without `callbackSecret` it signs callbacks with a random secret per ins
 
 ## Audit events
 
-identkit awaits `audit.emit` for every security-relevant event. If the sink throws, the operation
-fails. Events carry ids and reasons, never a code, token, challenge, key, person key, TOTP
-secret, sealed secret, provisioning URI or e-mail address. `addressDigest` is the HMAC of the
-address, for correlation. Approval events carry `level`; TOTP events carry `factorId`.
+identkit awaits `audit.emit` for every security-relevant event. If the sink throws, the call
+throws, but what identkit wrote before the event stands: a refused event undoes no revocation and
+no factor change (see Sessions; only `OperationRolledBackError` means that nothing took effect).
+`accounts.disable` records `account.disabled` only if the account was still active, so a retry
+does not record it twice; a refused `account.disabled` is then missing. Events carry ids and
+reasons, never a code, token, challenge, key, person key, TOTP secret, sealed secret,
+provisioning URI or e-mail address. `addressDigest` is the HMAC of the address, for correlation. Approval events carry `level`; TOTP events carry `factorId`.
+
+OIDC events carry `provider` and, where one exists, `linkId`, never an ID token, code, client
+secret, subject or address: `oidc.signed_in`, `oidc.sign_in_failed` (reason), `oidc.binding_refused`
+(reason and `addressDigest`), `oidc.link_created`, `oidc.link_imported` and `oidc.link_removed`.
 
 ## Cookies
 
@@ -546,6 +822,28 @@ method `totp`, challenge purpose `approval_code`). It does not change `0001_init
 Migration `0003_lockout_and_enrollment_revocation.sql` adds the consecutive failure count to
 `identkit_throttles` (existing rows start at 0) and `revoked_at` to
 `identkit_enrollment_tokens`. It does not change the earlier files.
+
+Migration `0004_oidc_links.sql` (D1: `0002_oidc_links.sql`) adds the table `identkit_oidc_links`.
+It changes nothing else, so the previous release runs on the new schema. It cannot read the
+session rows that an OIDC sign-in writes, though: their method `oidc` is unknown to it, and it
+fails every request of such a session. So deploy this release to every instance, and finish a
+gradual deployment, before you turn on the option `oidc`. A rollback to an earlier release after
+the first OIDC sign-in fails those sessions until they end or you revoke them. From this release
+on, every store drops a session method it does not know when it reads a session (fewer methods,
+never more rights), so a later release can add a method without this problem.
+
+A release that drops a method on read also writes the session back without it when it changes
+the session (`rotate`, a step-up, a second factor). So during a mixed deployment, a session can
+lose a newer method for good: it stays lost after every instance runs the newer release. No
+decision of identkit reads the session's methods, but if your code does (for example "only
+sessions with `oidc`"), it gets the wrong answer for such a session. This is one more reason to
+deploy a release to every instance before you turn on a method that it adds, as for `oidc`.
+
+A custom store needs the member `oidcLinks` (`insert(link, { exclusive })`, `findByKey`,
+`listByAccount`, `delete`) to use OIDC sign-in. It is optional in the type, so a custom store
+from an earlier release still compiles; `createIdentkit` throws `NotConfiguredError` if the
+option `oidc` is set and the store has no `oidcLinks`. An exclusive insert must be atomic per
+account: two concurrent exclusive inserts for one account leave at most one link.
 
 ### D1 store
 
@@ -706,7 +1004,13 @@ identkit leaves these to the consumer:
   `payloadHash`, a plain SHA-256 of the approved payload. If the payload has low entropy (for
   example an account number and an amount), a reader of the audit log can find it by trying
   values. Put a random id into every payload that you hash.
-- Keep `identkit/testing` out of production code. Its fake adapters verify nobody.
+- Keep `identkit/testing` out of production code. Its fake adapters verify nobody, and its fake
+  OIDC provider signs in anyone.
+- OIDC: register the exact `redirectUri` at each provider, keep the client secret in a secret
+  store and rotate it before the provider's expiry (Entra secrets expire), and add the optional
+  claims `email` and `xms_edov` to a Microsoft app registration if addresses should bind. Pass one
+  `createJwksCache()` from module scope. Limit `oidc.begin` and the callback route in your HTTP
+  layer like every unauthenticated route. Before a switch-over, import the existing links.
 
 ## Development
 
@@ -736,7 +1040,12 @@ After a change in `migrations-d1/`, run `pnpm generate:d1-migrations`. A test fa
 
 ## Not built
 
-- OIDC, token issuance, SMS codes and delegated agent identities.
+- Token issuance: identkit is no OpenID Connect provider or authorization server. Sign-in
+  through an external provider is built (see "External sign-in (OpenID Connect)").
+- Delegated access to provider APIs (refresh tokens for Microsoft Graph or Google APIs), personal
+  API tokens, SMS codes and delegated agent identities.
+- OpenID Connect discovery, `private_key_jwt` client authentication, `form_post` response mode
+  and the `iss` callback parameter (RFC 9207).
 - QR code rendering: identkit returns the provisioning URI as a string.
 - Recovery codes, and TOTP enrolment through an enrollment token (privileged accounts without a
   factor onboard through a passkey enrollment token).

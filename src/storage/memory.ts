@@ -1,4 +1,5 @@
 import { addSeconds } from "../clock.js";
+import { knownAuthMethods } from "./auth-methods.js";
 import { applyThrottle, type ThrottleState } from "./throttle-logic.js";
 import type {
   AccountRecord,
@@ -6,6 +7,7 @@ import type {
   CredentialRecord,
   EnrollmentTokenRecord,
   IdentkitStore,
+  OidcLinkRecord,
   OtpFlowRecord,
   SessionRecord,
   TotpFactorRecord,
@@ -13,6 +15,12 @@ import type {
 } from "./types.js";
 
 const copy = <T>(value: T): T => structuredClone(value);
+
+/** As the database stores read it: methods this release does not know are dropped. */
+const readSession = (session: SessionRecord): SessionRecord => ({
+  ...copy(session),
+  authMethods: knownAuthMethods(session.authMethods),
+});
 
 const sameBytes = (a: Uint8Array, b: Uint8Array) =>
   a.byteLength === b.byteLength && a.every((byte, i) => byte === b[i]);
@@ -40,6 +48,7 @@ export function createMemoryStore(): IdentkitStore {
   const enrollment = new Map<string, EnrollmentTokenRecord>();
   const totpFactors = new Map<string, TotpFactorRecord>();
   const verifications = new Map<string, VerificationRecord>();
+  const oidcLinks = new Map<string, OidcLinkRecord>();
 
   function revokeEnrollment(accountId: string, at: Date): number {
     let revoked = 0;
@@ -165,13 +174,13 @@ export function createMemoryStore(): IdentkitStore {
       },
       findByTokenDigest(digest) {
         for (const session of sessions.values()) {
-          if (session.tokenDigest === digest) return Promise.resolve(copy(session));
+          if (session.tokenDigest === digest) return Promise.resolve(readSession(session));
         }
         return Promise.resolve(null);
       },
       findById(id) {
         const found = sessions.get(id);
-        return Promise.resolve(found ? copy(found) : null);
+        return Promise.resolve(found ? readSession(found) : null);
       },
       touch(id, at) {
         const found = sessions.get(id);
@@ -398,6 +407,38 @@ export function createMemoryStore(): IdentkitStore {
         const found = verifications.get(id);
         if (!found || found.status !== "pending") return Promise.resolve(false);
         Object.assign(found, copy(update));
+        return Promise.resolve(true);
+      },
+    },
+    oidcLinks: {
+      insert(link, options) {
+        const links = [...oidcLinks.values()];
+        if (links.some((l) => l.linkKey === link.linkKey)) return Promise.resolve("link_taken");
+        if (options.exclusive && links.some((l) => l.accountId === link.accountId)) {
+          return Promise.resolve("account_has_link");
+        }
+        if (!accounts.has(link.accountId)) return Promise.reject(new Error("account not found"));
+        oidcLinks.set(link.id, copy(link));
+        return Promise.resolve("inserted");
+      },
+      findByKey(linkKey) {
+        for (const link of oidcLinks.values()) {
+          if (link.linkKey === linkKey) return Promise.resolve(copy(link));
+        }
+        return Promise.resolve(null);
+      },
+      listByAccount(accountId) {
+        return Promise.resolve(
+          [...oidcLinks.values()]
+            .filter((l) => l.accountId === accountId)
+            .toSorted((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+            .map(copy),
+        );
+      },
+      delete(id, accountId) {
+        const found = oidcLinks.get(id);
+        if (!found || found.accountId !== accountId) return Promise.resolve(false);
+        oidcLinks.delete(id);
         return Promise.resolve(true);
       },
     },

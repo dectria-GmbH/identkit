@@ -3,10 +3,17 @@ import { addSeconds } from "./clock.js";
 import type { Context } from "./context.js";
 import { randomId } from "./crypto.js";
 import { assertMethodAllowed } from "./email-otp.js";
-import { MethodNotAllowedError, NotConfiguredError } from "./errors.js";
+import { MethodNotAllowedError, NotConfiguredError, SessionsNotRevokedError } from "./errors.js";
 import type { SecretSealer } from "./sealer.js";
 import { enrolledSecondFactors, factorChangeStepUp, hasFreshStepUp } from "./second-factor.js";
-import type { IssuedSession, SessionInternals, Sessions } from "./sessions.js";
+import {
+  finishRollback,
+  finishThenRunHook,
+  type IssuedSession,
+  type Revocation,
+  type SessionInternals,
+  type Sessions,
+} from "./sessions.js";
 import type { SessionRecord, TotpFactorRecord } from "./storage/types.js";
 import { totpEnrolmentThrottleKey, totpThrottleKey } from "./throttle-keys.js";
 import {
@@ -69,7 +76,8 @@ export interface Totp {
   startEnrolment(sessionToken: string): Promise<StartTotpEnrolmentResult>;
   /**
    * Confirms an enrolment with a first valid code from the app. Activates the factor and
-   * revokes every other session of the account.
+   * revokes every other session of the account. Throws `OperationRolledBackError` if it removed
+   * the factor again after an error: the enrolment did not take effect.
    */
   confirmEnrolment(
     sessionToken: string,
@@ -81,7 +89,9 @@ export interface Totp {
   get(accountId: string): Promise<TotpFactorInfo | null>;
   /**
    * Removes the TOTP factor of the session's account. Needs a fresh step-up with the
-   * strongest factor of the account (passkey, else TOTP). Revokes all other sessions.
+   * strongest factor of the account (passkey, else TOTP). Revokes all other sessions. If the
+   * store fails on that revocation twice, the factor stays removed and it throws
+   * `SessionsNotRevokedError`, which names the `sessions.revokeAll` call that finishes it.
    */
   remove(
     sessionToken: string,
@@ -422,7 +432,12 @@ export function createTotp(
       const remove = async () => store.totp.delete(factor.id, factor.accountId);
       const removeAll = async () => store.totp.deleteAllForAccount(factor.accountId);
       const disable = async () => store.accounts.setStatus(factor.accountId, "disabled");
+      // Removes the factor and revokes every session of the account. Returns the revocation, or
+      // null and the store's error if the revocation failed, for `finishRollback`. If the factor
+      // cannot be removed, the rollback is incomplete: `undo` disables the account, runs the
+      // hook best effort and throws the delete's error.
       const undo = async () => {
+        let cleanupFailure: { error: unknown } | null = null;
         try {
           await remove().catch(remove).catch(removeAll);
         } catch (error) {
@@ -453,18 +468,40 @@ export function createTotp(
               })
               .catch(() => undefined);
           }
-          throw error;
-        } finally {
-          await sessions.revokeAll(factor.accountId);
+          cleanupFailure = { error };
         }
+        // Always, also after a failed delete: every session of the account ends.
+        let revocation: Revocation | null = null;
+        let failure: { error: unknown } | null = null;
+        try {
+          revocation = await internals.revokeAllDeferringHook(factor.accountId);
+        } catch (error) {
+          failure = { error };
+        }
+        if (cleanupFailure) {
+          await revocation?.runHook().catch(() => undefined);
+          throw cleanupFailure.error;
+        }
+        return { revocation, failure };
+      };
+      // For the error paths: returns the error to throw. `OperationRolledBackError` carries the
+      // original error as `cause`. If the factor could not be removed, the original error goes
+      // up as it is: the rollback is incomplete and the account is disabled (see `undo`).
+      const rollBack = async (error: unknown): Promise<unknown> => {
+        let undone: Awaited<ReturnType<typeof undo>>;
+        try {
+          undone = await undo();
+        } catch {
+          return error;
+        }
+        return (await finishRollback(factor.accountId, undone.revocation, { error })) ?? error;
       };
       // The confirming code's step is recorded, so it cannot sign in or step up afterwards.
       let activated: boolean;
       try {
         activated = await store.totp.activate(factor.id, factor.accountId, step, now);
       } catch (error) {
-        await undo().catch(() => undefined);
-        throw error;
+        throw await rollBack(error);
       }
       if (!activated) {
         await enrolmentFailed(record.accountId, "not_activated", factor.id);
@@ -478,34 +515,59 @@ export function createTotp(
           ? await grantHolds(live, factor.id)
           : { status: "denied", reason: "no_session" };
       } catch (error) {
-        await undo().catch(() => undefined);
-        throw error;
+        throw await rollBack(error);
       }
       if (outcome !== true) {
-        await undo();
-        await enrolmentFailed(record.accountId, "grant_changed", factor.id);
+        const undone = await undo();
+        // The audit event, then the hook; each runs also when the other fails. Any error goes up
+        // as `OperationRolledBackError`, so the caller cannot take it for a standing enrolment.
+        const rolledBack = await finishRollback(
+          factor.accountId,
+          undone.revocation,
+          undone.failure,
+          () => enrolmentFailed(record.accountId, "grant_changed", factor.id),
+        );
+        if (rolledBack) throw rolledBack;
         return outcome;
       }
       // Revoke first: if the audit sink fails afterwards, no other session survives. If the
-      // revocation fails, the factor goes and every session ends, as for any other error.
-      let revokedSessions: number;
+      // store revocation fails, the factor goes and every session ends, as for any other
+      // error. A sink error on the revoked sessions' events is not such a failure: the
+      // sessions are revoked and the enrolment stands, as when the sink refuses
+      // `totp.enrolled`.
+      let revoked: Revocation;
       try {
-        revokedSessions = await sessions.revokeAll(factor.accountId, {
+        revoked = await internals.revokeAllDeferringHook(factor.accountId, {
           exceptSessionId: record.id,
         });
       } catch (error) {
-        await undo().catch(() => undefined);
-        throw error;
+        throw await rollBack(error);
       }
-      // Only now: a store error here must not skip the check and the revocation above.
-      await store.throttle.reset(key);
-      await ctx.emit({
-        type: "totp.enrolled",
-        accountId: factor.accountId,
-        sessionId: record.id,
-        factorId: factor.id,
+      // Hook last, also when the throttle store or the audit sink throws: the factor is active
+      // and a retried enrolment cannot reach the hook. A throwing hook surfaces as
+      // `AllSessionsRevokedHookError`, which names how to re-run it.
+      await finishThenRunHook(revoked, async () => {
+        // The event first, then the reset, each also when the other throws. A store error in
+        // the reset must not skip the check and the revocation above, so it runs only now.
+        const emitted = await ctx
+          .emit({
+            type: "totp.enrolled",
+            accountId: factor.accountId,
+            sessionId: record.id,
+            factorId: factor.id,
+          })
+          .then(
+            () => null,
+            (error: unknown) => ({ error }),
+          );
+        const reset = await store.throttle.reset(key).then(
+          () => null,
+          (error: unknown) => ({ error }),
+        );
+        const failure = emitted ?? reset;
+        if (failure) throw failure.error;
       });
-      return { status: "enrolled", factorId: factor.id, revokedSessions };
+      return { status: "enrolled", factorId: factor.id, revokedSessions: revoked.count };
     },
 
     async verifySecondFactor(pendingToken, input) {
@@ -566,16 +628,38 @@ export function createTotp(
         return { status: "denied", reason: "not_found" };
       }
       // Revoke first: if the audit sink fails afterwards, no other session survives. One
-      // retry: a retried `remove` would answer `not_found` and not reach the revocation.
+      // retry of a store error: a retried `remove` would answer `not_found` and not reach the
+      // revocation. A sink error on the revoked sessions' events is not retried; it goes up
+      // after the hook, through `finishThenRunHook`.
       const revokeOthers = async () =>
-        sessions.revokeAll(record.accountId, { exceptSessionId: record.id });
-      await revokeOthers().catch(revokeOthers);
-      await ctx.emit({
-        type: "totp.removed",
-        accountId: record.accountId,
-        sessionId: record.id,
-        factorId: factor.id,
-      });
+        internals.revokeAllDeferringHook(record.accountId, { exceptSessionId: record.id });
+      let revoked: Revocation;
+      try {
+        revoked = await revokeOthers().catch(revokeOthers);
+      } catch (error) {
+        // A retried `remove` finds no factor: it cannot record the removal any more, nor reach
+        // the revocation. The error names the call that finishes the revocation.
+        await ctx
+          .emit({
+            type: "totp.removed",
+            accountId: record.accountId,
+            sessionId: record.id,
+            factorId: factor.id,
+          })
+          .catch(() => undefined);
+        throw new SessionsNotRevokedError(record.accountId, record.id, { cause: error });
+      }
+      // Hook last, also when the audit sink throws: a retried `remove` answers `not_found` and
+      // does not reach it. A throwing hook surfaces as `AllSessionsRevokedHookError`, which
+      // names how to re-run it.
+      await finishThenRunHook(revoked, () =>
+        ctx.emit({
+          type: "totp.removed",
+          accountId: record.accountId,
+          sessionId: record.id,
+          factorId: factor.id,
+        }),
+      );
       return { status: "removed" };
     },
 
@@ -584,15 +668,35 @@ export function createTotp(
       // Pending factors too: an enrolment confirmed at this moment must not survive.
       const deleted = await store.totp.deleteAllForAccount(accountId);
       // Always, also without a factor: a retry after a failed revocation must still end them.
-      await sessions.revokeAll(accountId);
-      if (deleted === 0) return false;
-      await ctx.emit({
-        type: "totp.removed",
-        accountId,
-        ...(factor ? { factorId: factor.id } : {}),
-        reason: "administrative",
+      let revoked: Revocation;
+      try {
+        revoked = await internals.revokeAllDeferringHook(accountId);
+      } catch (error) {
+        // A retry finds no factor and cannot record the removal any more.
+        if (deleted > 0) {
+          await ctx
+            .emit({
+              type: "totp.removed",
+              accountId,
+              ...(factor ? { factorId: factor.id } : {}),
+              reason: "administrative",
+            })
+            .catch(() => undefined);
+        }
+        throw error;
+      }
+      // Hook last: a throwing hook must not skip the audit event, nor a throwing sink the hook.
+      await finishThenRunHook(revoked, async () => {
+        if (deleted > 0) {
+          await ctx.emit({
+            type: "totp.removed",
+            accountId,
+            ...(factor ? { factorId: factor.id } : {}),
+            reason: "administrative",
+          });
+        }
       });
-      return true;
+      return deleted > 0;
     },
 
     async reseal(accountId) {

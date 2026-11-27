@@ -168,6 +168,39 @@ export interface VerificationRecord {
   completedAt: Date | null;
 }
 
+/** Kind of an external identity provider. It decides the shape of the link key. */
+export type OidcProviderKind = "microsoft" | "google" | "oidc";
+
+/** `sign_in`: bound at a first sign-in. `import`: recorded by `oidc.importLink`. */
+export type OidcLinkSource = "sign_in" | "import";
+
+/**
+ * Link between an account and a subject at an external OpenID Connect provider. The link key
+ * identifies the subject, never the e-mail address: Microsoft (tenant id, object id), Google
+ * (subject), any other provider (issuer, subject).
+ */
+export interface OidcLinkRecord {
+  id: string;
+  accountId: string;
+  /** Canonical, unique: a JSON array such as `["microsoft","<tid>","<oid>"]`. */
+  linkKey: string;
+  provider: OidcProviderKind;
+  /** The issuer of the subject's ID tokens. For Microsoft the tenant's v2.0 issuer. */
+  issuer: string;
+  /** Microsoft: the object id (`oid`). Google and others: `sub`. */
+  subject: string;
+  /** Microsoft tenant id (`tid`); null for other providers. */
+  tenantId: string | null;
+  source: OidcLinkSource;
+  createdAt: Date;
+}
+
+/**
+ * `link_taken`: a link with this key exists (for this or another account). `account_has_link`:
+ * the insert was exclusive and the account already has a link.
+ */
+export type InsertOidcLinkResult = "inserted" | "link_taken" | "account_has_link";
+
 export type LinkPersonResult =
   "linked" | "already_linked" | "person_linked_elsewhere" | "account_has_other_person";
 
@@ -345,5 +378,23 @@ export interface IdentkitStore {
         "status" | "assuranceLevel" | "evidenceReference" | "failureReason" | "completedAt"
       >,
     ): Promise<boolean>;
+  };
+  /**
+   * Links to external OpenID Connect subjects. Optional, so a store written for an earlier
+   * release still fits the type; `createIdentkit` throws `NotConfiguredError` if the `oidc`
+   * option is set and the store has no `oidcLinks`. The built-in stores implement it.
+   */
+  oidcLinks?: {
+    /**
+     * Atomically inserts the link unless a link with its key exists (`link_taken`). With
+     * `exclusive`, also unless the account has any link (`account_has_link`); two concurrent
+     * exclusive inserts for one account leave at most one link.
+     */
+    insert(link: OidcLinkRecord, options: { exclusive: boolean }): Promise<InsertOidcLinkResult>;
+    findByKey(linkKey: string): Promise<OidcLinkRecord | null>;
+    /** The links of the account, oldest first. */
+    listByAccount(accountId: string): Promise<OidcLinkRecord[]>;
+    /** Deletes the link of the account. Returns false if there is none with this id. */
+    delete(id: string, accountId: string): Promise<boolean>;
   };
 }

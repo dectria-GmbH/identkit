@@ -48,11 +48,14 @@ export {
 export type { AuditEvent, AuditEventType, AuditSink } from "./audit.js";
 export type { MailSender, OtpMailPurpose } from "./context.js";
 export {
+  AllSessionsRevokedHookError,
   IdentkitError,
   InvalidArgumentError,
   MethodNotAllowedError,
   NotConfiguredError,
+  OperationRolledBackError,
   PasskeyCleanupError,
+  SessionsNotRevokedError,
 } from "./errors.js";
 export { NodeCryptoUnavailableError } from "./node-crypto.js";
 export { normalizeEmail, InvalidEmailError } from "./email.js";
@@ -68,7 +71,14 @@ export type {
   SecondFactorStart,
 } from "./passkeys.js";
 export type { StepUp, StepUpResult } from "./step-up.js";
-export type { Sessions, SessionView, IssuedSession, StepUpCheck } from "./sessions.js";
+export type {
+  Sessions,
+  SessionView,
+  IssuedSession,
+  StepUpCheck,
+  AllSessionsRevokedEvent,
+  AllSessionsRevokedHook,
+} from "./sessions.js";
 export {
   approvalChallenge,
   approvalChallengeAsync,
@@ -100,6 +110,30 @@ export type {
   PasskeyCreationOptions,
   PasskeyRequestOptions,
 } from "./webauthn.js";
+export type {
+  Oidc,
+  OidcOptions,
+  OidcBindRequest,
+  OidcBeginResult,
+  OidcSignInResult,
+  OidcFailure,
+  OidcRefusal,
+  OidcLinkView,
+  OidcImportInput,
+  OidcImportResult,
+} from "./oidc.js";
+export {
+  microsoftProvider,
+  googleProvider,
+  oidcProvider,
+  MICROSOFT_CONSUMER_TENANT_ID,
+  type OidcProvider,
+  type MicrosoftProviderOptions,
+  type GoogleProviderOptions,
+  type GenericOidcProviderOptions,
+} from "./oidc-providers.js";
+export { createJwksCache, type JwksCache, type OidcFetch } from "./oidc-jwks.js";
+export type { IdTokenAlgorithm } from "./oidc-jwt.js";
 export { createMemoryStore } from "./storage/memory.js";
 export { applyThrottle, lockDuration, type ThrottleState } from "./storage/throttle-logic.js";
 export type * from "./storage/types.js";

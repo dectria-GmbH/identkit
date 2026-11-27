@@ -3,6 +3,8 @@ import {
   createHmacHasher,
   createIdentkit,
   createMemoryStore,
+  type AllSessionsRevokedHook,
+  type OidcOptions,
   type SignInPolicy,
 } from "../src/index.js";
 import type { SecretSealer } from "../src/sealer.js";
@@ -57,6 +59,15 @@ export const testConfig = {
   },
 };
 
+/** Example values for the optional OIDC section. Assumptions, like the values above. */
+export const testOidcConfig = {
+  transactionTtlSeconds: 600,
+  clockSkewSeconds: 60,
+  jwksCacheSeconds: 3600,
+  jwksRefetchIntervalSeconds: 60,
+  httpTimeoutSeconds: 10,
+};
+
 export const emailFirstPolicy: SignInPolicy = {
   signInMethods: ["email_otp", "passkey"],
   secondFactor: "none",
@@ -73,8 +84,10 @@ export interface SetupOptions {
   counterStep?: number;
   /** Accounts the consumer marks as privileged, by e-mail address. */
   privilegedEmails?: string[];
-  config?: typeof testConfig;
+  config?: object;
   sealer?: SecretSealer;
+  onAllSessionsRevoked?: AllSessionsRevokedHook;
+  oidc?: OidcOptions;
 }
 
 export function setup(options: SetupOptions = {}) {
@@ -99,6 +112,8 @@ export function setup(options: SetupOptions = {}) {
     clock,
     policy: () => policy.current,
     identityVerification: idv,
+    ...(options.onAllSessionsRevoked ? { onAllSessionsRevoked: options.onAllSessionsRevoked } : {}),
+    ...(options.oidc ? { oidc: options.oidc } : {}),
   });
   const authenticator = createSoftwareAuthenticator({
     origin: ORIGIN,

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { addSeconds } from "../src/clock.js";
 import type {
   IdentkitStore,
+  OidcLinkRecord,
   OtpFlowRecord,
   SessionRecord,
   TotpFactorRecord,
@@ -75,6 +76,22 @@ function totpFactor(
     activatedAt: null,
     lastUsedStep: null,
     lastUsedAt: null,
+    ...overrides,
+  };
+}
+
+function oidcLink(accountId: string, overrides: Partial<OidcLinkRecord> = {}): OidcLinkRecord {
+  const subject = uid("sub");
+  return {
+    id: uid("link"),
+    accountId,
+    linkKey: JSON.stringify(["google", subject]),
+    provider: "google",
+    issuer: "https://accounts.google.com",
+    subject,
+    tenantId: null,
+    source: "sign_in",
+    createdAt: T0,
     ...overrides,
   };
 }
@@ -531,6 +548,25 @@ export function runStoreContract(
       expect(found?.stepUp?.method).toBe("totp");
     });
 
+    it("sessions: a method written by a later release is dropped on read, not an error", async () => {
+      const store = await factory();
+      const a = account();
+      await store.accounts.insert(a);
+      // As a later release would write it: a method this release does not know.
+      const later = session(a.id, {
+        authMethods: ["oidc", "later_method" as never],
+        stepUp: null,
+      });
+      const only = session(a.id, { authMethods: ["later_method" as never], stepUp: null });
+      await store.sessions.insert(later);
+      await store.sessions.insert(only);
+      expect((await store.sessions.findById(later.id))?.authMethods).toEqual(["oidc"]);
+      expect((await store.sessions.findByTokenDigest(later.tokenDigest))?.authMethods).toEqual([
+        "oidc",
+      ]);
+      expect((await store.sessions.findById(only.id))?.authMethods).toEqual([]);
+    });
+
     it("challenges: a pending code approval is consumed once, only for its purpose", async () => {
       const store = await factory();
       const digest = uid("chal");
@@ -681,6 +717,74 @@ export function runStoreContract(
       });
       expect(await store.verifications.complete(other, { ...done, status: "expired" })).toBe(true);
       expect(await store.verifications.claim(other)).toBe(false);
+    });
+
+    it("oidc links: one account per subject, exclusive inserts, list and delete", async () => {
+      const store = await factory();
+      const links = store.oidcLinks;
+      if (!links) throw new Error("store has no oidcLinks");
+      const a = account();
+      const b = account();
+      await store.accounts.insert(a);
+      await store.accounts.insert(b);
+      const first = oidcLink(a.id, {
+        provider: "microsoft",
+        linkKey: JSON.stringify(["microsoft", uid("tid"), uid("oid")]),
+        tenantId: "tid",
+        source: "import",
+      });
+      expect(await links.insert(first, { exclusive: true })).toBe("inserted");
+      expect(await links.findByKey(first.linkKey)).toEqual(first);
+      expect(await links.findByKey(JSON.stringify(["google", uid("none")]))).toBeNull();
+
+      // The same subject cannot link a second time, for this or another account.
+      expect(
+        await links.insert({ ...oidcLink(b.id), linkKey: first.linkKey }, { exclusive: false }),
+      ).toBe("link_taken");
+      expect(
+        await links.insert({ ...oidcLink(a.id), linkKey: first.linkKey }, { exclusive: true }),
+      ).toBe("link_taken");
+      // Exclusive: an account with a link gets no second one; non-exclusive: it does.
+      expect(await links.insert(oidcLink(a.id), { exclusive: true })).toBe("account_has_link");
+      const second = oidcLink(a.id, { createdAt: addSeconds(T0, 1) });
+      expect(await links.insert(second, { exclusive: false })).toBe("inserted");
+      expect((await links.listByAccount(a.id)).map((l) => l.id)).toEqual([first.id, second.id]);
+      expect(await links.listByAccount(b.id)).toEqual([]);
+
+      expect(await links.delete(first.id, b.id)).toBe(false);
+      expect(await links.delete(first.id, a.id)).toBe(true);
+      expect(await links.delete(first.id, a.id)).toBe(false);
+      expect(await links.findByKey(first.linkKey)).toBeNull();
+      expect(
+        await links.insert({ ...oidcLink(b.id), linkKey: first.linkKey }, { exclusive: true }),
+      ).toBe("inserted");
+    });
+
+    it("oidc links: concurrent exclusive inserts leave one link per account and per subject", async () => {
+      const store = await factory();
+      const links = store.oidcLinks;
+      if (!links) throw new Error("store has no oidcLinks");
+      const a = account();
+      await store.accounts.insert(a);
+      const perAccount = await Promise.all(
+        Array.from({ length: 8 }, () => links.insert(oidcLink(a.id), { exclusive: true })),
+      );
+      expect(perAccount.filter((r) => r === "inserted")).toHaveLength(1);
+      expect(perAccount.filter((r) => r === "account_has_link")).toHaveLength(7);
+      expect(await links.listByAccount(a.id)).toHaveLength(1);
+
+      const others = Array.from({ length: 8 }, () => account());
+      for (const other of others) await store.accounts.insert(other);
+      const key = JSON.stringify(["oidc", "https://idp.example", uid("sub")]);
+      const perSubject = await Promise.all(
+        others.map((other) =>
+          links.insert(oidcLink(other.id, { provider: "oidc", linkKey: key }), {
+            exclusive: false,
+          }),
+        ),
+      );
+      expect(perSubject.filter((r) => r === "inserted")).toHaveLength(1);
+      expect(perSubject.filter((r) => r === "link_taken")).toHaveLength(7);
     });
   });
 }

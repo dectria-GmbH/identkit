@@ -15,8 +15,9 @@ import {
 import { createPasskeyCore } from "./passkey-core.js";
 import { createPasskeys, type Passkeys } from "./passkeys.js";
 import { NotConfiguredError } from "./errors.js";
+import { createOidc, unconfiguredOidc, type Oidc, type OidcOptions } from "./oidc.js";
 import type { SecretSealer } from "./sealer.js";
-import { createSessions, type Sessions } from "./sessions.js";
+import { createSessions, type AllSessionsRevokedHook, type Sessions } from "./sessions.js";
 import { createStepUp, type StepUp } from "./step-up.js";
 import type { IdentkitStore } from "./storage/types.js";
 import { createTotp, createTotpEngine, type Totp } from "./totp.js";
@@ -47,6 +48,30 @@ export interface IdentkitOptions {
   sealer?: SecretSealer;
   clock?: Clock;
   identityVerification?: IdentityVerificationAdapter;
+  /**
+   * Called after every `sessions.revokeAll`, also when accounts, passkeys or TOTP call it (for
+   * example on a disable, a new passkey or a TOTP removal), and also when no session was live.
+   * Use it to end sessions that your application keeps itself. It runs last: after the
+   * revocation, the calling operation's own writes and its audit events. It runs also when the
+   * audit sink throws on those events; the sink's first error then goes up after it. If it
+   * throws, the calling operation throws `AllSessionsRevokedHookError` (with the sink's error as
+   * `auditError`, if any); everything identkit does is done by then and the operation's writes
+   * stand. An operation that identkit rolled back throws `OperationRolledBackError` instead,
+   * with `hookFailed` true. Re-run the hook with
+   * `sessions.revokeAll(error.accountId, error.revokeAllOptions)`. Make it idempotent.
+   */
+  onAllSessionsRevoked?: AllSessionsRevokedHook;
+  /**
+   * Sign-in through external OpenID Connect providers. Needs the config section `oidc`, a
+   * `sealer` and a store with `oidcLinks`; `createIdentkit` throws `NotConfiguredError` if one
+   * is missing. Without this option, every `identkit.oidc` call throws `NotConfiguredError`.
+   *
+   * Deploy this release to every instance before you set it, and finish a gradual deployment
+   * first: an identkit release without OIDC sign-in (any release before this one) cannot read
+   * the sessions of an OIDC sign-in and fails them. A rollback to such a release after the
+   * first OIDC sign-in fails those sessions too.
+   */
+  oidc?: OidcOptions;
 }
 
 export interface Identkit {
@@ -58,6 +83,7 @@ export interface Identkit {
   totp: Totp;
   accounts: Accounts;
   identityVerification: IdentityVerification;
+  oidc: Oidc;
 }
 
 export function createIdentkit(options: IdentkitOptions): Identkit {
@@ -102,7 +128,11 @@ export function createIdentkit(options: IdentkitOptions): Identkit {
   };
 
   const otp = createOtpEngine(ctx);
-  const { sessions, internals } = createSessions(ctx);
+  const onAllSessionsRevoked = options.onAllSessionsRevoked ?? null;
+  if (onAllSessionsRevoked !== null && typeof onAllSessionsRevoked !== "function") {
+    throw new TypeError("onAllSessionsRevoked must be a function");
+  }
+  const { sessions, internals } = createSessions(ctx, onAllSessionsRevoked);
   const core = createPasskeyCore(ctx);
   const totpEngine = createTotpEngine(ctx);
 
@@ -113,7 +143,8 @@ export function createIdentkit(options: IdentkitOptions): Identkit {
     sessions,
     approvals: createApprovals(ctx, core, totpEngine, internals),
     totp: createTotp(ctx, totpEngine, sessions, internals),
-    accounts: createAccounts(ctx, (accountId) => sessions.revokeAll(accountId)),
+    accounts: createAccounts(ctx, (accountId) => internals.revokeAllDeferringHook(accountId)),
     identityVerification: createIdentityVerification(ctx),
+    oidc: options.oidc ? createOidc(ctx, internals, options.oidc) : unconfiguredOidc(),
   };
 }

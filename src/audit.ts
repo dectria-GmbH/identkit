@@ -1,6 +1,6 @@
 /**
  * Security-relevant events. Events never carry a code, token, challenge, key, TOTP secret,
- * sealed secret, provisioning URI or e-mail address. `addressDigest` is a keyed hash of the normalized address, so a consumer can
+ * sealed secret, provisioning URI, e-mail address, ID token or provider subject. `addressDigest` is a keyed hash of the normalized address, so a consumer can
  * correlate events for one address without identkit writing the address itself.
  */
 export type AuditEventType =
@@ -45,7 +45,13 @@ export type AuditEventType =
   | "identity_verification.completed"
   | "identity_verification.failed"
   | "identity_verification.expired"
-  | "identity_verification.person_conflict";
+  | "identity_verification.person_conflict"
+  | "oidc.signed_in"
+  | "oidc.sign_in_failed"
+  | "oidc.binding_refused"
+  | "oidc.link_created"
+  | "oidc.link_imported"
+  | "oidc.link_removed";
 
 export interface AuditEvent {
   type: AuditEventType;
@@ -66,6 +72,10 @@ export interface AuditEvent {
   payloadHash?: string;
   /** Approval proof level, for approval events: `signature` or `code-confirmation`. */
   level?: string;
+  /** OIDC events: the configured provider id, or the provider kind for imports and removals. */
+  provider?: string;
+  /** OIDC events: id of the link between an account and a provider subject. */
+  linkId?: string;
 }
 
 /**

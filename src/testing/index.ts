@@ -25,6 +25,12 @@ import {
 import type { AssuranceLevel } from "../storage/types.js";
 
 export {
+  createFakeOidcProvider,
+  type FakeOidcProvider,
+  type FakeOidcProviderOptions,
+  type FakeClaims,
+} from "./fake-oidc-provider.js";
+export {
   createSoftwareAuthenticator,
   type SoftwareAuthenticator,
   type SoftwareAuthenticatorOptions,

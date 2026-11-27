@@ -55,3 +55,103 @@ export class PasskeyCleanupError extends IdentkitError {
     );
   }
 }
+
+/**
+ * The option `onAllSessionsRevoked` threw. identkit finished its own work before it called the
+ * hook: the identkit sessions are revoked, and the calling operation's writes stand. Its audit
+ * events are complete too, unless `auditError` is set. To re-run the hook, call
+ * `sessions.revokeAll(error.accountId, error.revokeAllOptions)`; that call is idempotent.
+ * `cause` holds the hook's error.
+ *
+ * An operation that identkit rolled back never throws this error; it throws
+ * `OperationRolledBackError`, which says whether the hook failed.
+ */
+export class AllSessionsRevokedHookError extends IdentkitError {
+  /** The options for `sessions.revokeAll` that re-run the hook for the same sessions. */
+  readonly revokeAllOptions: { exceptSessionId?: string };
+  /**
+   * The first error of the same operation's audit events (the revoked sessions, then the
+   * operation's own events), else undefined. identkit runs the hook also after a failing sink,
+   * and this error then wins, because only the hook needs a re-run. The event the sink refused
+   * is missing; identkit still offered every other event of the operation to the sink, and
+   * those may be missing too if the sink stayed down. In `totp.confirmEnrolment` it can also be
+   * the throttle store's error from the reset after a successful enrolment.
+   */
+  readonly auditError: unknown;
+
+  constructor(
+    readonly accountId: string,
+    /** The session that stayed live, or null. */
+    readonly exceptSessionId: string | null,
+    options?: ErrorOptions & { auditError?: unknown },
+  ) {
+    super(
+      "all_sessions_revoked_hook_failed",
+      "onAllSessionsRevoked failed after the revocation; call sessions.revokeAll again",
+      options,
+    );
+    this.revokeAllOptions = exceptSessionId === null ? {} : { exceptSessionId };
+    this.auditError = options?.auditError;
+  }
+}
+
+/**
+ * identkit rolled the operation back: it did not take effect. `totp.confirmEnrolment` and
+ * `passkeys.finishRegistration` throw it when they rolled back and an error came up: the store
+ * failed after the new factor or passkey was stored, or the grant changed before the operation
+ * completed and the store, the audit sink or the hook then failed (without such an error, the
+ * call returns `denied`). identkit removed the new factor or passkey and revoked every session
+ * of the account. If it cannot remove them, it disables the account and throws the store's
+ * error or `PasskeyCleanupError` instead: the factor or passkey may then still be active.
+ *
+ * If you catch this error, the operation did not take effect. Any other error means that
+ * identkit did not roll back: what it wrote before the error stands. After any other error from
+ * `totp.confirmEnrolment` or `passkeys.finishRegistration`, check `totp.get` or `passkeys.list`.
+ *
+ * `cause` holds the first error: the store's, the audit sink's, or the hook's. If `hookFailed`
+ * is true, the hook `onAllSessionsRevoked` threw, or the store failed before identkit could
+ * call it: call `sessions.revokeAll(error.accountId, error.revokeAllOptions)` to finish the
+ * revocation and run the hook. `revokeAllOptions` is always `{}`, so that call also ends the
+ * session that started the operation.
+ */
+export class OperationRolledBackError extends IdentkitError {
+  /** The options for `sessions.revokeAll` that finish the rollback's revocation. Always `{}`. */
+  readonly revokeAllOptions: { exceptSessionId?: string } = {};
+  /** True if the rollback's revocation or its hook did not complete. */
+  readonly hookFailed: boolean;
+
+  constructor(
+    readonly accountId: string,
+    options: { cause: unknown; hookFailed: boolean },
+  ) {
+    super("operation_rolled_back", "the operation was rolled back and did not take effect", {
+      cause: options.cause,
+    });
+    this.hookFailed = options.hookFailed;
+  }
+}
+
+/**
+ * The operation's writes stand, but the store failed to revoke the account's other sessions,
+ * and a retry of the operation cannot reach that revocation (for example `totp.remove`, whose
+ * factor is gone). Finish it with `sessions.revokeAll(error.accountId, error.revokeAllOptions)`;
+ * that call also runs the hook `onAllSessionsRevoked`. `cause` holds the store's error.
+ */
+export class SessionsNotRevokedError extends IdentkitError {
+  /** The options for `sessions.revokeAll` that finish the revocation. */
+  readonly revokeAllOptions: { exceptSessionId?: string };
+
+  constructor(
+    readonly accountId: string,
+    /** The session that should stay live, or null. */
+    readonly exceptSessionId: string | null,
+    options: { cause: unknown },
+  ) {
+    super(
+      "sessions_not_revoked",
+      "the other sessions of the account were not revoked; call sessions.revokeAll",
+      options,
+    );
+    this.revokeAllOptions = exceptSessionId === null ? {} : { exceptSessionId };
+  }
+}
