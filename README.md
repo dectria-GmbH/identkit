@@ -4,8 +4,8 @@ Identity toolkit for TypeScript: accounts, e-mail codes, passkeys, TOTP, session
 
 Status: early development, release 0.1.1. It covers sign-in by e-mail code, passkeys, TOTP
 (authenticator apps), sign-in through an external OpenID Connect provider (Microsoft, Google or
-any other), sessions, personal API tokens, step-up, approval evidence at two levels, an identity
-verification port and storage. See "Not built" for what comes later.
+any other), sessions, personal API tokens, an OAuth authorization server for MCP clients,
+step-up, approval evidence at two levels, an identity verification port and storage. See "Not built" for what comes later.
 
 identkit is a library, not a server. The core has no HTTP framework dependency: you call it from
 your own routes and set cookies yourself.
@@ -111,7 +111,8 @@ const session = await identkit.sessions.validate(tokenFromCookie);
   `verify({ sessionToken, payloadHash, levels?, response })` or
   `verify({ sessionToken, payloadHash, levels?, approvalId, code })`.
 - `accounts`: `create({ email })`, `get(id)`, `findByEmail(email)`, `disable(id)` (also revokes
-  the account's sessions and API tokens), `unlock(id)`, `unlockAddress(email)`.
+  the account's sessions and API tokens and ends its OAuth grants), `unlock(id)`,
+  `unlockAddress(email)`.
 - `identityVerification`: `start({ accountId, returnUrl })`, `handleCallback(payload)`,
   `refresh(verificationId)`, `get(verificationId)`.
 - `oidc`: `begin({ provider, loginHint? })`, `finish({ transaction, params })`,
@@ -120,6 +121,12 @@ const session = await identkit.sessions.validate(tokenFromCookie);
 - `apiTokens`: `create({ accountId, name, scopes, expiresInDays })`, `verify(token)`,
   `list(accountId)`, `revoke({ accountId, tokenId })`, `revokeAll(accountId)`, `import(input)`.
   See "Personal API tokens".
+- `oauth`: `metadata`, `wwwAuthenticate(input)`, `register({ body, addressKey? })`,
+  `authorize.begin`, `authorize.approve`, `authorize.deny`, `token({ form, authorization })`,
+  `revoke({ form, authorization })`, `validateAccessToken(token, { resource? })`,
+  `listGrants(accountId)`, `revokeGrant({ accountId, grantId })`, `revokeAll(accountId)`,
+  `getClient(clientId)`, `deleteClient(clientId)`, `importClient(input)`, `importGrant(input)`,
+  `purge()`. See "OAuth authorization server (MCP clients)".
 
 Administrative calls take bare ids and trust their caller. Expose them only to privileged code,
 or check ownership yourself before you pass client input: all of `accounts`,
@@ -127,15 +134,17 @@ or check ownership yourself before you pass client input: all of `accounts`,
 `passkeys.revokeEnrollmentTokens`, `totp.get`, `totp.revoke`,
 `totp.reseal`, `sessions.revokeById`,
 `sessions.revokeAll`, `identityVerification.start`, `identityVerification.refresh`,
-`identityVerification.get`, `oidc.importLink`, `oidc.listLinks`, `oidc.removeLink`, and every
-`apiTokens` call except `verify`.
+`identityVerification.get`, `oidc.importLink`, `oidc.listLinks`, `oidc.removeLink`, every
+`apiTokens` call except `verify`, and `oauth.listGrants`, `oauth.revokeGrant`, `oauth.revokeAll`,
+`oauth.getClient`, `oauth.deleteClient`, `oauth.importClient`, `oauth.importGrant` and
+`oauth.purge`.
 
 Standalone functions: `checkApprovalEvidence({ evidence, verifier | hasher })`, `hashPayload(payload)`,
 `hashPayloadAsync(payload)`, `approvalChallenge(nonce, payloadHash, accountId)`,
 `approvalChallengeAsync(nonce, payloadHash, accountId)`, `normalizeEmail(input)`, `parseConfig(input)`,
 `createAesGcmSealer({ keys, activeKeyId })`, `applyThrottle(state, at, rule)`, `lockDuration(rule, lockCount)` and the type `ThrottleState` (for custom stores),
 `microsoftProvider(options)`, `googleProvider(options)`, `oidcProvider(options)`,
-`createJwksCache()`, `parseBearerToken(header)`, `apiTokenOptionsSchema` and the constant
+`createJwksCache()`, `parseBearerToken(header)`, `apiTokenOptionsSchema`, `oauthOptionsSchema` and the constant
 `MICROSOFT_CONSUMER_TENANT_ID`. Constant `TOTP_INTEROPERABLE_PARAMETERS`
 (`{ algorithm: "SHA1", digits: 6 }`).
 
@@ -162,7 +171,9 @@ Subpath `identkit/d1`: `createD1Store(db, options?)`, `migrateIdentkitD1(db)`, `
 Subpath `identkit/testing`: `createFakeClock`, `createRecordingMailSender`,
 `createRecordingAuditSink`, `createFakeIdentityVerificationAdapter`,
 `createSoftwareAuthenticator`, `createTestSealer`, `generateTotpCode`, `generateTotpCodeAsync`,
-`createFakeOidcProvider`.
+`createFakeOidcProvider`, `createOAuthTestClient` (registers a client and drives the
+authorization step, the exchange, refresh and revocation like an MCP client) and
+`createPkcePair`.
 These are for tests and demos only.
 
 Passkey options and responses use the WebAuthn JSON forms, so a browser can pass them to
@@ -344,8 +355,9 @@ Sessions:
   time, used or not. A test checks this with 43200 seconds.
 - The option `onAllSessionsRevoked(event)` is called after every `sessions.revokeAll`, also when
   `accounts.disable`, a passkey change, a TOTP change or `oidc.removeLink` calls it, and also
-  when no session was live. It does not cover personal API tokens: `sessions.revokeAll` leaves
-  them live (see "Personal API tokens"). `event` holds `accountId`, `exceptSessionId` (the session that stayed,
+  when no session was live. It does not cover personal API tokens or OAuth grants:
+  `sessions.revokeAll` leaves them live (see "Personal API tokens" and "OAuth authorization
+  server"). `event` holds `accountId`, `exceptSessionId` (the session that stayed,
   or null) and `revokedSessionIds`. Use it to end sessions your application keeps itself, for
   example with a per-account version. It runs last: after the revocation and after the calling
   operation's own writes and audit events (the disable, the new or removed passkey, the TOTP
@@ -355,8 +367,9 @@ Sessions:
   (see below). Some calls cannot be repeated (a finished
   passkey registration or TOTP enrolment, a `totp.remove` whose factor is gone), so re-run the
   hook with `sessions.revokeAll(error.accountId, error.revokeAllOptions)`. One exception: if
-  the error's `tokenRevocationError` is set (only `accounts.disable` sets it), call
-  `accounts.disable` again instead; it also runs the hook again (see "Personal API tokens").
+  the error's `tokenRevocationError` or `grantRevocationError` is set (only `accounts.disable`
+  sets them), call `accounts.disable` again instead; it also runs the hook again (see "Personal
+  API tokens").
   `revokeAll` is idempotent and calls the hook also when no session was live. Make the hook
   idempotent too. On such a re-run `revokedSessionIds` is empty, because the sessions are already
   revoked: do not depend on it to find the sessions to end.
@@ -371,7 +384,8 @@ Sessions:
   revocation and run the hook. `revokeAllOptions` is always `{}`, so that call also ends the
   session that started the operation.
 - The rule for callers: if you catch `OperationRolledBackError`, the operation did not take
-  effect. Any other error means that identkit did not roll back: what it wrote before the error
+  effect. One exception: a rolled-back OAuth code exchange leaves the replaced grant ended (see
+  "OAuth authorization server"). Any other error means that identkit did not roll back: what it wrote before the error
   stands, and `AllSessionsRevokedHookError` means that the operation's writes are complete. An
   error from `confirmEnrolment` or `finishRegistration` can also come before the activation, so
   after any other error check `totp.get` or `passkeys.list` before you tell the person that the
@@ -428,11 +442,12 @@ Passkeys:
   `OperationRolledBackError`). A crash in between leaves an unusable pending row.
 - If the store fails on both deletes of that passkey, identkit tries twice to disable the
   account, ends all its sessions and throws: the passkey may still be active without a valid
-  grant. The disable, as `accounts.disable`, also revokes the account's API tokens. The audit
-  event `passkey.registration_failed` says `cleanup_failed_account_disabled` (with an
-  `account.disabled` event and an `api_token.revoked` event per token) or, if the disable
-  failed too, `cleanup_failed_disable_failed`. In the second case the account may still be
-  active, so the passkey can sign in, or its API tokens may not be revoked;
+  grant. The disable, as `accounts.disable`, also revokes the account's API tokens and ends its
+  OAuth grants. The audit event `passkey.registration_failed` says
+  `cleanup_failed_account_disabled` (with an `account.disabled` event, an `api_token.revoked`
+  event per token and an `oauth.grant_ended` event per grant) or, if the disable failed too,
+  `cleanup_failed_disable_failed`. In the second case the account may still be active, so the
+  passkey can sign in, or its API tokens or OAuth grants may not be ended;
   `finishRegistration` then throws `PasskeyCleanupError`, which names the account and the
   credential, so your code learns it also when the audit sink was down. In both cases an
   operator first removes the passkey with `passkeys.revoke(accountId, credentialId)` (the
@@ -440,7 +455,7 @@ Passkeys:
   account again in the store; identkit has no call to enable an account. Enabling it first
   brings the passkey back into use. After `cleanup_failed_disable_failed`, the operator also
   calls `accounts.disable(accountId)` until it succeeds before the account is enabled again;
-  otherwise its API tokens can come back into use.
+  otherwise its API tokens and OAuth grants can come back into use.
 - A registration that is already running is cancelled only by revocation, not by a token
   rotation: `rotate` and step-ups keep the session, so a registration started before them
   completes. Use `sessions.revokeById` or `revokeAll` to cut off a stolen session.
@@ -470,15 +485,16 @@ TOTP:
   and then lost its reply. If the store fails on every delete (two tries, then a delete of all
   the account's factors), identkit tries twice to disable the account, ends all its sessions
   and throws: the factor may still be active, and someone without the grant may know its
-  secret. The disable, as `accounts.disable`, also revokes the account's API tokens. The audit
-  event `totp.enrolment_failed` says `cleanup_failed_account_disabled` (with an
-  `account.disabled` event and an `api_token.revoked` event per token) or, if the disable failed
-  too, `cleanup_failed_disable_failed`: the account may still be active, or its API tokens may
-  not be revoked. On the error paths no grant may have been lost; the account is disabled all
+  secret. The disable, as `accounts.disable`, also revokes the account's API tokens and ends its
+  OAuth grants. The audit event `totp.enrolment_failed` says `cleanup_failed_account_disabled`
+  (with an `account.disabled` event, an `api_token.revoked` event per token and an
+  `oauth.grant_ended` event per grant) or, if the disable failed too,
+  `cleanup_failed_disable_failed`: the account may still be active, or its API tokens or OAuth
+  grants may not be ended. On the error paths no grant may have been lost; the account is disabled all
   the same. An operator removes the factor with `totp.revoke(accountId)` and enables the account
   again in the store; identkit has no call to enable an account. After
   `cleanup_failed_disable_failed`, the operator first calls `accounts.disable(accountId)` until
-  it succeeds; otherwise the account's API tokens can come back into use.
+  it succeeds; otherwise the account's API tokens and OAuth grants can come back into use.
 - A code is accepted within `driftSteps` time steps on either side of the current one. All
   candidates are computed and compared in constant time.
 - Replay: the store keeps the latest accepted time step per factor and accepts a step only if
@@ -981,6 +997,330 @@ Import:
   only the copies of that account (`legacyDigest: true` marks a legacy copy). To move a legacy
   token to the HMAC, the owner creates a new token; identkit does not replace a stored digest.
 
+## OAuth authorization server (MCP clients)
+
+`identkit.oauth` is an OAuth 2.1 authorization server for clients such as MCP clients: discovery
+documents (RFC 8414, RFC 9728), dynamic client registration (RFC 7591), the authorization code
+flow with PKCE (S256 only), refresh token rotation, revocation (RFC 7009) and the access token
+check of your protected resource. identkit makes every decision that carries a security
+property. Your code routes, reads bodies, renders the consent page and writes responses.
+
+```ts
+const identkit = createIdentkit({
+  ...options, // a store with oauth (the built-in stores have it) and a sealer
+  oauth: {
+    issuer: "https://example.com",
+    resources: ["https://example.com/mcp"],
+    defaultScopes: ["mcp:read"],
+    optInScopes: ["mcp:events"],
+  },
+});
+const { oauth } = identkit;
+
+// GET oauth.metadata.authorizationServerPath() and oauth.metadata.protectedResourcePath():
+// answer with oauth.metadata.authorizationServer() and oauth.metadata.protectedResource().
+
+// POST /oauth/register (cap the body size before you read it)
+const registered = await oauth.register({ body: await readText(request, 8192), addressKey: ip });
+
+// GET /oauth/authorize: sign the person in first, with this URL as the return target.
+const begun = await oauth.authorize.begin({
+  params: url.searchParams,
+  accountId: session.accountId,
+});
+// "consent": render the page, with the ticket in a hidden field. Else render the error on your
+// own page: never redirect it.
+renderAuthorizePage(begun);
+
+// POST /oauth/authorize (the consent form)
+const decided = approved
+  ? await oauth.authorize.approve({ ticket, accountId: session.accountId, optInScopes })
+  : await oauth.authorize.deny({ ticket, accountId: session.accountId });
+if (decided.status === "redirect") return Response.redirect(decided.location, 303);
+
+// POST /oauth/token and POST /oauth/revoke
+const form = new URLSearchParams(await request.text());
+const result = await oauth.token({ form, authorization: request.headers.get("authorization") });
+return Response.json(result.body, { status: result.httpStatus, headers: result.headers });
+
+// Every request of the protected resource
+const bearer = parseBearerToken(request.headers.get("authorization"));
+const checked = await oauth.validateAccessToken(bearer ?? "", {
+  resource: "https://example.com/mcp",
+});
+if (checked.status !== "valid") {
+  const challenge = oauth.wwwAuthenticate({ tokenPresented: bearer !== null });
+  return new Response(null, { status: 401, headers: { "WWW-Authenticate": challenge } });
+}
+// checked.accountId, checked.clientId, checked.grantId, checked.scopes
+```
+
+Without the option `oauth`, every `identkit.oauth` call throws `NotConfiguredError`.
+`createIdentkit` throws `NotConfiguredError` if the store has no `oauth` or the option `sealer` is
+missing, and `InvalidArgumentError` for an invalid option or a prefix that overlaps
+`apiTokens.prefix`.
+
+Routes (the endpoint paths are options; the well-known paths follow from `issuer` and
+`resources`):
+
+| Route                                      | Method    | Call                                                  |
+| ------------------------------------------ | --------- | ----------------------------------------------------- |
+| `metadata.authorizationServerPath()`       | GET       | `metadata.authorizationServer()`                      |
+| `metadata.protectedResourcePath(resource)` | GET       | `metadata.protectedResource(resource)`                |
+| `/oauth/register`                          | POST      | `register({ body, addressKey? })`                     |
+| `/oauth/authorize`                         | GET, POST | `authorize.begin`, then `authorize.approve` or `deny` |
+| `/oauth/token`                             | POST      | `token({ form, authorization })`                      |
+| `/oauth/revoke`                            | POST      | `revoke({ form, authorization })`                     |
+
+Endpoint calls return `{ httpStatus, body, headers }`. Write `body` as JSON (an empty body if it
+is null) with that status and those headers. The headers hold `Cache-Control: no-store` and
+`Pragma: no-cache` on every answer, `WWW-Authenticate: Basic realm="..."` on an
+`invalid_client` after a Basic attempt, and `Retry-After` on a 429. Error bodies hold an RFC
+error code and a fixed English `error_description`, never an echo of the input. identkit
+suggests the status; you may change it.
+
+Options (configurable; the defaults are design choices and common MCP client behaviour, not
+values from a standard):
+
+| Option                                | Default                                                                | Bounds and notes                                                                                                                                                  |
+| ------------------------------------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `issuer`                              | required                                                               | one static `https:` URL without query, fragment or trailing slash (`http:` only on `localhost` and `127.0.0.1`). Never derive it from a request (RFC 9207 mix-up) |
+| `resources`                           | required                                                               | 1 to 8 URLs, same form as `issuer`. The first is the default `resource` of a request                                                                              |
+| `resourceName`                        | none                                                                   | `resource_name` in the RFC 9728 document                                                                                                                          |
+| `endpoints`                           | `/oauth/authorize`, `/oauth/token`, `/oauth/register`, `/oauth/revoke` | paths, or absolute URLs on the issuer's origin. `register: null` turns registration off                                                                           |
+| `defaultScopes`                       | required                                                               | 1 or more; granted on every grant. RFC 6749 scope tokens: visible ASCII without space, `"` and `\`, at most 128                                                   |
+| `optInScopes`                         | `[]`                                                                   | granted only if `approve` names them; none may be a default scope                                                                                                 |
+| `accessTokenSeconds`                  | 3600                                                                   | 60 to 86400                                                                                                                                                       |
+| `refreshTokenSeconds`                 | 2592000 (30 days)                                                      | 3600 to 31536000; capped at the grant's end                                                                                                                       |
+| `grantSeconds`                        | 7776000 (90 days)                                                      | the absolute end of a grant; at least `refreshTokenSeconds`                                                                                                       |
+| `codeSeconds`                         | 300                                                                    | 30 to 600                                                                                                                                                         |
+| `consentSeconds`                      | 600                                                                    | 60 to 3600                                                                                                                                                        |
+| `refreshRaceGraceSeconds`             | 30                                                                     | 0 to 120; 0 turns the grace off                                                                                                                                   |
+| `maxGrantsPerAccount`                 | 10                                                                     | 1 to 1000; live grants of other clients than the one at hand                                                                                                      |
+| `refreshTokens`                       | `"always"`                                                             | `"always"` (every client gets one, as common MCP clients expect) or `"if_registered"` (only clients whose `grant_types` has `refresh_token`)                      |
+| `registration.maxPerDay`              | 1000                                                                   | per deployment and UTC day                                                                                                                                        |
+| `registration.maxPerAddressPerDay`    | 30                                                                     | per `addressKey` and UTC day; skipped without `addressKey`                                                                                                        |
+| `registration.maxBodyBytes`           | 8192                                                                   | 1024 to 65536 UTF-8 bytes                                                                                                                                         |
+| `registration.maxRedirectUris`        | 5                                                                      | 1 to 20                                                                                                                                                           |
+| `registration.maxRedirectUriLength`   | 512                                                                    | 64 to 2048                                                                                                                                                        |
+| `registration.defaultAuthMethod`      | `client_secret_basic`                                                  | the RFC 7591 default; one of `allowedAuthMethods`                                                                                                                 |
+| `registration.allowedAuthMethods`     | `none`, `client_secret_basic`, `client_secret_post`                    | 1 or more                                                                                                                                                         |
+| `redirectUris.allowIpv6Loopback`      | `false`                                                                | accept `http://[::1]` redirect URIs                                                                                                                               |
+| `redirectUris.allowPrivateUseSchemes` | `false`                                                                | accept RFC 8252 schemes such as `com.example.app:/cb`                                                                                                             |
+| `clientRetention.unusedDays`          | 30                                                                     | 1 to 3650; see `purge`                                                                                                                                            |
+| `clientRetention.idleDays`            | 180                                                                    | 1 to 3650; see `purge`                                                                                                                                            |
+| `prefixes`                            | `ikc_`, `ikcs_`, `ikac_`, `ikat_`, `ikrt_`                             | client id, client secret, code, access token, refresh token; as `apiTokens.prefix`; distinct, none a prefix of another or of `apiTokens.prefix`                   |
+| `admit`                               | none                                                                   | a policy that can refuse; see "Rules"                                                                                                                             |
+| `legacy`                              | none                                                                   | see "Import and legacy tokens"                                                                                                                                    |
+| `acceptLegacyClientSecrets`           | `false`                                                                | see "Import and legacy tokens"                                                                                                                                    |
+| `onAuditError`                        | none                                                                   | receives a refused `oauth.token_refreshed`; see "Audit and errors"                                                                                                |
+| `onStoreError`                        | none                                                                   | receives a failed best-effort store write; see "Audit and errors"                                                                                                 |
+| `basicRealm`                          | the issuer's host                                                      | the realm of `WWW-Authenticate: Basic`                                                                                                                            |
+
+Token formats. Every secret is an opaque random string with its own prefix. The store keeps only
+its HMAC (the `SecretHasher`, under the purposes `oauth-client-secret`, `oauth-code`,
+`oauth-access-token`, `oauth-refresh-ref` and `oauth-refresh-token`), never the secret:
+
+- client id: `ikc_` and 22 base64url characters (16 bytes); not secret;
+- client secret: `ikcs_` and 43 characters (32 bytes), for a confidential client; it never
+  expires (`client_secret_expires_at: 0`);
+- authorization code: `ikac_` and 43 characters;
+- access token: `ikat_` and 43 characters, one store row per issued token;
+- refresh token: `ikrt_`, a 22-character ref, `.` and a 43-character secret. The ref is fixed per
+  grant and finds it in one read; the secret changes on every rotation.
+
+The registration limit per address stores a keyed digest of `addressKey` (purpose
+`oauth-registration-address`), never the value. No token is a JWT: a resource server must call
+`validateAccessToken`, which also makes every revocation take effect at once. The hasher key
+now protects these digests too; identkit does not support rotating it.
+
+Rules:
+
+- Raw input. `authorize.begin`, `token` and `revoke` take the raw parameters and the raw
+  `Authorization` value; `register` takes the raw body text. Pass `URLSearchParams`: identkit then
+  refuses a parameter sent twice (`invalid_request`). A record cannot show a repeat; its parser
+  has picked one value already. `register` refuses a body over `maxBodyBytes`, but cap the read
+  yourself before you buffer it: identkit cannot stop an upload it never sees.
+- Registration. Redirect URIs must be absolute, without fragment or user info, `https:` (or
+  `http:` on `localhost` and `127.0.0.1`, any port), with an ASCII host that equals its parsed
+  form: Unicode hosts, punycode labels (`xn--`), percent-encoding in the host, upper case, dot
+  segments and written-out default ports are refused. `grant_types` must hold
+  `authorization_code` (and `refresh_token` at most), `response_types` must be `["code"]`.
+  `client_name` loses control, format, bidi and separator characters and is cut at 100. The day
+  limits count atomically; the 429 says `temporarily_unavailable`.
+- Authorization. Errors never redirect: `begin` returns `invalid` for your own page (RFC 9700
+  4.11.2). The request must name a registered redirect URI, or leave it out if the client has
+  exactly one. A loopback registration accepts any port, never another host: `localhost` and
+  `127.0.0.1` do not match each other. `code_challenge_method` must be `S256`. `resource`
+  (RFC 8707) must be one of `resources`; without it the grant is for the first. The request's
+  `scope` only marks opt-in scopes as requested (`requestedOptInScopes`); the consent decides.
+  `approve` and `deny` redirect with `iss` (RFC 9207) and the `state` that was sent.
+- The consent ticket is sealed with the sealer (context `identkit/oauth/consent/v1`) and bound to
+  the account. It is the form's CSRF token too: an attacker can get one only for an own account.
+  It is not single use; a second approve issues another code for the same client, which equals
+  a second click. Tickets sealed with a key you remove from the sealer's `keys` fail as
+  `invalid_ticket`, so remove an old key no earlier than `consentSeconds` after the switch.
+- Code exchange. A code works once. The first attempt uses it up, also a failed one, so a wrong
+  verifier burns it. A code that comes back after its exchange ends the grant it created
+  (`code_reuse`, RFC 6749 4.1.2). The code is bound to its client, its redirect URI (required at
+  the token endpoint if the authorization request named it, and equal when sent), its PKCE
+  challenge and its resource. An account holds one grant per client: a new exchange replaces the
+  earlier grant (`replaced`). `maxGrantsPerAccount` holds also under parallel exchanges.
+- Client authentication. A confidential client sends its secret by Basic (form-encoded, RFC 6749
+  2.3.1) or in the form (`client_secret_post`), whatever it registered; never both, and never
+  none. A public client sends `client_id` in the form and no secret. A public client that sends a
+  Basic header, also one with an empty password, is refused `invalid_client`. Every presented
+  secret gets its digest before the client lookup, and the compare is constant time. Changing
+  `registration.allowedAuthMethods` affects new registrations only.
+- Refresh. A refresh rotates the refresh token and issues a new access token. The previous
+  refresh token gets `invalid_grant` within `refreshRaceGraceSeconds` of the rotation and ends
+  nothing (parallel refreshes of one client). Any other old token of the grant ends it
+  (`refresh_reuse`, RFC 9700 4.14.2): it is a copy in other hands. A token of another client
+  ends nothing. An expired grant or refresh token ends the grant. A disabled account or a refusal
+  by `admit` refuses the refresh and keeps the grant. `scope` may narrow (a subset of the grant),
+  never widen (`invalid_scope`); another `resource` is `invalid_target`.
+- Revocation ends the grant of an access or refresh token of the calling client (all its tokens
+  stop), and answers 200 whatever the token, once the client is authenticated. A token of
+  another client ends nothing. A holder of a code or of any refresh token of a grant (also an
+  old one) can end the grant: revocation by refresh token matches the ref, and a replayed code
+  ends its grant.
+- `validateAccessToken(token, { resource? })` is one indexed read with the grant and the account,
+  no write and no event. It refuses `malformed`, `unknown` (also every token of an ended grant),
+  `expired`, `grant_expired`, `account_disabled`, `wrong_resource` (another resource than asked
+  for, or one no longer configured) and `no_allowed_scope`. It returns the token's scopes that
+  the options still list: removing a scope from the options removes it from every grant at once.
+  A store error goes up; it never counts as valid. A `resource` that is not configured throws
+  `InvalidArgumentError`.
+- `admit(request)` is called at `begin`, again at `approve`, at the code exchange and at a
+  refresh, with `phase`, the account, the client and the scopes. It can only refuse; a result
+  that is not a boolean throws `TypeError`. Apply a per-request policy after `validateAccessToken`
+  in your own code: identkit calls no hook on that path.
+- Scopes are opaque strings. Check them in your code on every request.
+
+Accounts and sessions:
+
+- `accounts.disable`, and the passkey and TOTP cleanups that disable an account, end every grant
+  and code of the account (reason `account_disabled`), also when the option `oauth` is not set,
+  if the store has `oauth`. `validateAccessToken` and a refresh refuse a disabled account
+  anyway. If the end of the grants throws, `accounts.disable` still revokes the sessions, offers
+  its events and runs the hook. The error that goes up follows the order under "Personal API
+  tokens": the session revocation's, the hook's, the sink's, then the token store's, then the
+  grant store's. The hook's `AllSessionsRevokedHookError` carries the grant store's error as
+  `grantRevocationError` (next to `tokenRevocationError`), and its message names both. After any
+  error, call `accounts.disable` again until it succeeds.
+- Grants are separate from sessions: `sessions.revokeAll`, a passkey or TOTP change and
+  `oidc.removeLink` end no grant, so a sign-out everywhere does not disconnect MCP clients. If it
+  should, call `oauth.revokeAll(accountId)` in your sign-out-everywhere route, or in
+  `onAllSessionsRevoked` if every trigger should end grants.
+- Deleting an account row directly in the database deletes its grants, their access tokens and
+  its codes by foreign key.
+
+Administrative calls take bare ids and trust their caller: `listGrants(accountId)`,
+`revokeGrant({ accountId, grantId })`, `revokeAll(accountId)`, `getClient(clientId)`,
+`deleteClient(clientId)` (with its grants and codes), `importClient`, `importGrant` and `purge`.
+
+`purge()` deletes expired grants, codes and access tokens, registration counts of earlier days,
+and clients by `clientRetention`: never used (no approval, exchange or refresh) and older than
+`unusedDays`, or last used more than `idleDays` ago. It never deletes a client that holds a live
+grant or code. An approval writes the client's last use (at most twice a day) before the code,
+so a client in the middle of a flow is never unused or idle. Run `purge` on a schedule, for
+example daily.
+
+Audit and errors:
+
+- Events carry `clientId`, `grantId`, `accountId`, `scopes`, `reason` and `method` where they
+  apply, never a token, code, secret, ref, digest of those, client name, redirect URI, `state`,
+  code challenge or raw `addressKey`: `oauth.client_registered`, `oauth.client_imported`,
+  `oauth.client_deleted` (`administrative`, `unused`, `idle`), `oauth.registration_refused`
+  (`daily_limit`, `address_limit`, with `addressDigest`), `oauth.consent_approved`,
+  `oauth.consent_denied`, `oauth.grant_created`, `oauth.grant_imported`, `oauth.grant_ended`
+  (`revoked_by_client`, `revoked`, `revoked_all`, `client_deleted`, `account_disabled`,
+  `replaced`, `code_reuse`, `refresh_reuse`, `expired`), `oauth.token_failed` (`code_unknown`,
+  `code_expired`, `client_mismatch`, `redirect_mismatch`, `pkce_failed`, `resource_mismatch`,
+  `refresh_unknown`, `refresh_raced`, `refused_by_policy`, `account_disabled`, `grant_limit`)
+  and `oauth.token_refreshed`. `validateAccessToken` records nothing.
+- A refused `oauth.client_registered` or `oauth.client_imported` deletes the new client, and the
+  call throws `OAuthClientRolledBackError` (with `clientId`; a client belongs to no account, so
+  it is no `OperationRolledBackError`). If that delete fails, the store's error goes up and the
+  client stands without its record; nobody holds its id or secret.
+- A refused `oauth.grant_created` deletes the new grant, and `token` throws
+  `OperationRolledBackError` (`hookFailed` false); answer 500, the client starts the flow again
+  (its code is used up). One exception to "nothing took effect": if the exchange replaced the
+  account's earlier grant of the same client, that grant stays ended and its client must connect
+  again. Its `oauth.grant_ended` (reason `replaced`) goes to the sink before
+  `oauth.grant_created`; if the sink refused that event, the grant ended without its record, and
+  the call throws the same error. A refused `oauth.grant_imported` deletes the imported grant
+  and throws `OperationRolledBackError` too.
+- `oauth.consent_approved` goes to the sink before the code is stored: no code stands without its
+  record. A refused `grant_ended`, `client_deleted` or `registration_refused` undoes nothing;
+  `deleteClient`, `revokeAll`, `accounts.disable` and `purge` offer every event before the first
+  error goes up.
+- `oauth.token_refreshed` is best effort, the second exception to the sink contract beside
+  `api_token.used`. The rotation is written before it; if a refused event failed the call, the
+  client would keep its old refresh token, which is the previous one now, and its next refresh
+  after the grace would end the grant. A sink outage would disconnect every client. identkit
+  passes the error and the event to `onAuditError` and still returns the tokens.
+- `onStoreError(error, { kind, clientId })` receives a failed best-effort store write:
+  `client_last_used` (the last-use time after a refresh) and `client_secret_upgrade` (see
+  "Import and legacy tokens"). The tokens are issued already, so the call still returns them.
+  identkit awaits the handler and drops what it throws.
+- A client deleted, or a code replayed, in the moment between the grant insert and
+  `oauth.grant_created` ends the new grant before its creation is recorded: the trail shows
+  `grant_ended` before `grant_created`, and the exchange answers with tokens that already fail
+  `validateAccessToken`. No grant survives.
+
+Import and legacy tokens. Move clients and grants of an earlier system to identkit, and keep
+connected clients working:
+
+- `importClient({ id, name?, redirectUris, grantTypes, authMethod, createdAt?, lastUsedAt?,
+secret? | secretSha256? })` keeps the id (visible ASCII, 1 to 128 characters). Redirect URIs
+  and grant types follow the registration rules. A confidential client needs exactly one of
+  `secret` (the plaintext; identkit stores its HMAC) and `secretSha256` (hex of the unkeyed
+  SHA-256; needs `acceptLegacyClientSecrets: true`, else `NotConfiguredError`). Results:
+  `imported`, `already_imported` (same id and data), `id_taken`.
+- With `acceptLegacyClientSecrets`, a SHA-256 secret authenticates, and on its first successful
+  use identkit replaces it with the HMAC by compare-and-set (best effort: a failed write goes to
+  `onStoreError`, and the next use tries again). This differs from API tokens on purpose: client
+  secrets never expire, so without the upgrade a weak digest would stay for good. After the
+  upgrade, a second import with `secretSha256` answers `id_taken` (identkit cannot prove the same
+  secret without the plaintext); one with `secret` answers `already_imported`. Without the
+  option, such a client cannot authenticate.
+- `importGrant({ id, accountId, clientId, scopes, resource, createdAt, expiresAt, generation,
+refreshedAt?, refreshExpiresAt, refreshSha256 })` keeps the grant id, because the legacy tokens
+  name it. Scopes must be default or opt-in scopes, the resource one of `resources`.
+  `refreshSha256` is the unkeyed SHA-256 hex of the current refresh token, whose generation is
+  `generation`. It never replaces a grant. Results: `imported`, `already_imported`, `id_taken`,
+  `account_client_taken`, `limit_reached`, `expired`, `no_account`, `account_disabled`,
+  `no_client`. Imported rows show `legacyDigest: true` (clients) and `source: "import"`.
+- `legacy.verifyAccessToken(token)` and `legacy.verifyRefreshToken(token)` check the earlier
+  system's own tokens: its signature and expiry. They return `{ grantId, audience, expiresAt }`
+  or `{ grantId, generation, expiresAt }`, or null to refuse. identkit calls them only for a
+  token of at most 4096 characters that starts with none of its prefixes, and only before
+  `legacy.until`; set `until` to the latest legacy refresh expiry, so the path ends by itself.
+  Then identkit checks the rest as for its own tokens: the grant exists, was imported (a legacy
+  token never reaches a grant that identkit created), is live, the account is active, the
+  audience is one of `resources` (and the one asked for), and at refresh the client is the
+  grant's. A legacy refresh with the grant's generation and stored SHA-256 rotates into an
+  identkit refresh token. One generation below within the grace is `invalid_grant` and keeps the
+  grant; anything else ends it (`refresh_reuse`). A verifier that throws fails the call; a result
+  of another shape throws `TypeError`. Revocation accepts legacy tokens too.
+- Codes and consent tickets in flight are not imported: a client in the middle of a flow at the
+  switch gets `invalid_grant` or `invalid_ticket` and starts again. Switch at low traffic.
+- The unkeyed SHA-256 of a client secret or refresh token lets a database reader test guesses
+  offline without a key. With 256-bit random values that is no practical attack.
+
+What stays with you:
+
+- Routing, the sign-in before `authorize.begin`, and the consent page. Escape `client.name` for
+  HTML (identkit removes unsafe characters, but escaping is the page's job), send
+  `Content-Security-Policy: frame-ancestors 'none'` against clickjacking, and offer opt-in scopes
+  unticked.
+- CORS. The well-known documents may be open to every origin. For token, register and revoke,
+  browser-based MCP clients need CORS; decide it per deployment. identkit sets no CORS header.
+- A body size cap before you buffer a request, a rate limit on the token endpoint (identkit
+  limits only registrations), and TLS.
+- The meaning of each scope on every request of your resource.
+
 ## Identity verification port
 
 Implement `IdentityVerificationAdapter` for a vendor: `start`, `parseCallback` (authenticate the
@@ -993,8 +1333,9 @@ nobody. Without `callbackSecret` it signs callbacks with a random secret per ins
 ## Audit events
 
 identkit awaits `audit.emit` for every security-relevant event. If the sink throws, the call
-throws, but what identkit wrote before the event stands (one exception: `api_token.used` is best
-effort, see "Personal API tokens"): a refused event undoes no revocation and
+throws, but what identkit wrote before the event stands (two exceptions: `api_token.used` and
+`oauth.token_refreshed` are best effort, see "Personal API tokens" and "OAuth authorization
+server"): a refused event undoes no revocation and
 no factor change (see Sessions; only `OperationRolledBackError` means that nothing took effect).
 `accounts.disable` records `account.disabled` only if the account was still active, so a retry
 does not record it twice; a refused `account.disabled` is then missing. Events carry ids and
@@ -1007,6 +1348,11 @@ secret, subject or address: `oidc.signed_in`, `oidc.sign_in_failed` (reason), `o
 
 API token events carry `tokenId`, never the token or its digest: `api_token.created`,
 `api_token.imported`, `api_token.revoked` and `api_token.used` (see "Personal API tokens").
+
+OAuth events carry `clientId` and, where one exists, `grantId`, never a token, code, secret,
+client name, redirect URI or `state`: the `oauth.*` events listed under "OAuth authorization
+server (MCP clients)". The types `AuditEventType` and `AuditEvent` (new fields `clientId` and
+`grantId`) grow with them: an exhaustive `switch` over `AuditEventType` stops compiling.
 
 ## Cookies
 
@@ -1065,6 +1411,28 @@ release, also if you do not use API tokens. `accounts.disable` revokes the token
 in every store that has `apiTokens`, and the built-in stores all have it. Without the table,
 every `accounts.disable` disables the account, revokes its sessions and runs
 `onAllSessionsRevoked`, and then throws the database error, until the migration runs.
+
+Migration `0006_oauth.sql` (D1: `0004_oauth.sql`) adds the tables `identkit_oauth_clients`,
+`identkit_oauth_grants`, `identkit_oauth_access_tokens`, `identkit_oauth_codes` and
+`identkit_oauth_registration_counts`. It changes nothing else, so the previous release runs on
+the new schema, and a rollback of the code needs no schema rollback. Grants are deleted when they
+end, not marked; the foreign keys remove their access tokens, and an account or client delete
+removes its grants and codes. The unique index `identkit_oauth_grants_account_client_idx` holds
+one grant per account and client; a later release may replace it.
+
+Upgrade note: apply `0006_oauth.sql` (D1: `0004_oauth.sql`) before you deploy this release, also
+if you do not use OAuth: migrate first, then deploy. `accounts.disable` ends the OAuth grants of
+the account in every store that has `oauth`, and the built-in stores all have it. Without the
+tables, every `accounts.disable` disables the account, revokes its sessions and runs
+`onAllSessionsRevoked`, and then throws the database error, until the migration runs.
+
+A custom store needs the member `oauth` to use the OAuth server (the full list is the type
+`IdentkitStore["oauth"]`). It is optional in the type; `createIdentkit` throws
+`NotConfiguredError("store.oauth")` if the option `oauth` is set without it. Each guarded method
+states its atomicity in its comment: `consumeCode` returns a code to exactly one of concurrent
+calls, `insertGrant` checks the account and the grant limit and replaces the grant of the same
+client in one atomic step, `rotateGrant` is a compare-and-set on the generation, and
+`reserveRegistration` never lets a count pass its maximum.
 
 A custom store needs the member `apiTokens` (`insert`, `findByDigests`, `listByAccount`,
 `markUsed`, `revoke`, `revokeAllForAccount`, `delete`) to use personal API tokens. It is
@@ -1191,7 +1559,9 @@ example `window_start < ?1 AND (locked_until IS NULL OR locked_until < ?1)` with
 identkit leaves these to the consumer:
 
 - Purge old rows. identkit does not delete them (see "Storage"), revoked and expired API tokens
-  included. Each `passkeys.startSignIn` and
+  included. The OAuth tables are the exception: call `oauth.purge()` on a schedule, for example
+  daily; it deletes expired grants, codes and access tokens, old registration counts and unused
+  or idle clients, and records the ends. Each `passkeys.startSignIn` and
   each `emailSignIn.requestCode` writes rows without authentication (a challenge; a flow, a send
   gate and a mail), so without a scheduled job these tables grow with every call.
 - Purge `identkit_throttles` only by this rule, or not at all. A deleted row resets the failure
@@ -1235,7 +1605,14 @@ identkit leaves these to the consumer:
   returns `valid`.
 
 - Limit unauthenticated calls in your HTTP layer: per client and in total, for `requestCode`,
-  `startSignIn`, every verify route and every route that calls `apiTokens.verify`. identkit limits per address and per account only.
+  `startSignIn`, every verify route, every route that calls `apiTokens.verify`, and the OAuth
+  token, revocation and authorization routes. identkit limits per address and per account
+  only, and for OAuth only registrations. Pass `addressKey` to `oauth.register` (for example the
+  IPv4 address or the IPv6 /64) so the per-address limit applies.
+- OAuth: set a static `issuer` (your public URL) in production, never one from the request.
+  Cap request bodies before you read them. To move from an earlier system, import clients and
+  grants at low traffic, set `legacy.until` to the latest legacy refresh expiry, and remove the
+  verifiers after it.
 - Treat audit events as personal data where the payload is. Approval events carry
   `payloadHash`, a plain SHA-256 of the approved payload. If the payload has low entropy (for
   example an account number and an amount), a reader of the audit log can find it by trying
@@ -1276,14 +1653,18 @@ After a change in `migrations-d1/`, run `pnpm generate:d1-migrations`. A test fa
 
 ## Not built
 
-- Token issuance: identkit is no OpenID Connect provider or authorization server. Sign-in
-  through an external provider is built (see "External sign-in (OpenID Connect)").
+- OpenID Connect provider features: identkit's OAuth server issues no ID tokens and has no
+  userinfo endpoint or OpenID discovery. Also not built for it: JWT access tokens, token
+  introspection (RFC 7662), `private_key_jwt`, pushed authorization requests (RFC 9126), DPoP,
+  the client credentials and device grants, token exchange (RFC 8693) and client ID metadata
+  documents. Sign-in through an external provider is built (see "External sign-in (OpenID
+  Connect)").
 - Delegated access to provider APIs (refresh tokens for Microsoft Graph or Google APIs), SMS codes
   and delegated agent identities. API token scopes are opaque strings, so a later grant for an
   agent can narrow them.
 - Replacing a legacy API token digest with the HMAC on use.
-- OpenID Connect discovery, `private_key_jwt` client authentication, `form_post` response mode
-  and the `iss` callback parameter (RFC 9207).
+- For sign-in through an external provider: OpenID Connect discovery, `private_key_jwt` client
+  authentication, `form_post` response mode and the `iss` callback parameter (RFC 9207).
 - QR code rendering: identkit returns the provisioning URI as a string.
 - Recovery codes, and TOTP enrolment through an enrollment token (privileged accounts without a
   factor onboard through a passkey enrollment token).
