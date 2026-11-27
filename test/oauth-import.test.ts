@@ -682,6 +682,35 @@ describe("oauth import after an end (review a2 B r1 M1)", () => {
     expect(await t.ik.oauth.importGrant(fresh)).toEqual({ status: "revoked" });
     expect(await t.ik.oauth.listGrants(g.accountId)).toEqual([]);
   });
+
+  it("a client import that races with a concurrent import and delete answers revoked", async () => {
+    // Another call imports the client and deletes it between this call's read and its insert.
+    const inner = createMemoryStore();
+    const oauth = inner.oauth;
+    if (!oauth) throw new Error("no oauth");
+    let beforeInsert: (() => Promise<void>) | null = null;
+    const store: IdentkitStore = {
+      ...inner,
+      oauth: {
+        ...oauth,
+        insertClient: async (client) => {
+          const hook = beforeInsert;
+          beforeInsert = null;
+          if (!hook) return oauth.insertClient(client);
+          await hook();
+          // The insert of the other call won; this one met its row.
+          return "id_taken";
+        },
+      },
+    };
+    const t = importSetup({}, store);
+    const input = publicClient({ id: "raced-client" });
+    beforeInsert = async () => {
+      expect((await t.ik.oauth.importClient(input)).status).toBe("imported");
+      expect(await t.ik.oauth.deleteClient(input.id)).toBe(true);
+    };
+    expect(await t.ik.oauth.importClient(input)).toEqual({ status: "revoked" });
+  });
 });
 
 describe("oauth legacy access tokens", () => {

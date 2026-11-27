@@ -301,9 +301,15 @@ export function createImport(internals: OAuthInternals) {
       const inserted = await store.insertClient(record);
       if (inserted === "revoked") return { status: "revoked" };
       if (inserted !== "inserted") {
-        // Inserted by a concurrent call between the read and the insert.
+        // Inserted by a concurrent call between the read and the insert, and maybe deleted
+        // since: then a tombstone names it.
         const raced = await store.findClient(id);
-        return raced && (await sameClient(raced, record, secret))
+        if (!raced) {
+          return (await store.findImportTombstone("client", id))
+            ? { status: "revoked" }
+            : { status: "id_taken" };
+        }
+        return (await sameClient(raced, record, secret))
           ? { status: "already_imported", client: toClientView(raced) }
           : { status: "id_taken" };
       }
