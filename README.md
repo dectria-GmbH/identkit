@@ -523,12 +523,17 @@ identkit leaves these to the consumer:
   gate and a mail), so without a scheduled job these tables grow with every call.
 - Purge `identkit_throttles` only by this rule, or not at all. A deleted row resets the failure
   counts and the lock length of its address or account, and gives an attacker a fresh set of
-  guesses. The rule deletes only rows whose last window started and whose last lock ended more
-  than `N` days ago. After a purge the key starts from zero: `maxConsecutiveFailures` attempts,
-  then one per lock end while the lock length grows back to `maxLockSeconds` (with the example
-  values, 106 attempts in the first day). A purge can give that much at most once per key every
-  `N` days. Choose `N` from your risk analysis (30 days is an example, not a recommendation from
-  a standard):
+  guesses. The rule deletes rows that are idle: their last window started and their last lock
+  ended more than `N` days ago. It never deletes a running lock. It does delete rows with a
+  failure count or a lock count above zero, by design: a success deletes the row, so every
+  stored row has one. After a purge the key starts from zero: `maxConsecutiveFailures`
+  attempts, then one per lock end while the lock length grows back to `maxLockSeconds`. With
+  the example values that is 106 attempts in the first day (100, then 6 lock ends; a test
+  checks this count), then about one per day. An attacker who keeps guessing keeps the row
+  fresh and is never purged; one who waits `N` days between bursts gains at most about 106
+  attempts per key per `N` days. Choose `N` of at least one day, so no running window is
+  purged, and from your risk analysis (30 days is an example, not a recommendation from a
+  standard):
 
   ```sql
   DELETE FROM identkit_throttles
@@ -540,9 +545,18 @@ identkit leaves these to the consumer:
   administrative call.
 - A custom store (your own `IdentkitStore`) must apply the throttle rules in
   `throttle.reserve`: call `applyThrottle(state, at, rule)` from `identkit` on the stored state
-  inside one atomic section, and store every field of `next`. A store that skips a field
-  compiles, but skips a limit. The PostgreSQL store expects the isolation level READ COMMITTED,
-  the PostgreSQL default.
+  (`null` for a key without a row) inside one atomic section, store every field of `next`, and
+  return `result`. A store that skips a field compiles, but skips a limit. The other two
+  throttle calls:
+  - `throttle.peek(key, at)` returns the stored `lockedUntil` while `at` is before it, else
+    null. It writes nothing.
+  - `throttle.reset(key)` removes every field of the key; the PostgreSQL store deletes the row.
+    A reset that clears only the attempts keeps the consecutive count and the lock length, so a
+    success or an unlock stays incomplete.
+
+  A store does not need `lockDuration`: `applyThrottle` computes the lock. The PostgreSQL store
+  expects the isolation level READ COMMITTED, the PostgreSQL default.
+
 - Limit unauthenticated calls in your HTTP layer: per client and in total, for `requestCode`,
   `startSignIn` and every verify route. identkit limits per address and per account only.
 - Treat audit events as personal data where the payload is. Approval events carry
