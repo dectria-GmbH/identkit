@@ -10,3 +10,10 @@ auditConfig:
 # optional dependency, so the script does not need to run.
 allowBuilds:
   workerd: false
+
+# miniflare (dev only, runtime smoke test) pins undici and sharp versions with known advisories.
+# undici moves to a patched release; sharp serves only the Images binding, which the smoke test
+# does not use, so it is removed.
+overrides:
+  miniflare>undici: 7.30.2
+  miniflare>sharp: "-"
