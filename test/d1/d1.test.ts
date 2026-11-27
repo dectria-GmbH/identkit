@@ -112,6 +112,21 @@ describe("d1", { timeout: 30_000 }, () => {
     }
   }, 60_000);
 
+  it("migrations: an applied migration whose SQL changed is refused", async () => {
+    const { db, stop } = await startLocalD1();
+    try {
+      const first = { name: "0001_a.sql", sql: "CREATE TABLE identkit_a (id TEXT NOT NULL);\n" };
+      expect(await migrateIdentkitD1(db, { migrations: [first] })).toEqual(["0001_a.sql"]);
+      expect(await migrateIdentkitD1(db, { migrations: [first] })).toEqual([]);
+      const changed = { ...first, sql: "CREATE TABLE identkit_a (id TEXT);\n" };
+      await expect(migrateIdentkitD1(db, { migrations: [changed] })).rejects.toThrow(
+        /0001_a\.sql differs from the applied one/,
+      );
+    } finally {
+      await stop();
+    }
+  }, 60_000);
+
   it("storage: times and counters are integers, booleans 0 or 1, lists JSON text", async () => {
     const db = requireDb();
     const s = requireStore();

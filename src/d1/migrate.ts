@@ -10,9 +10,25 @@ export interface D1Migration {
 
 const NAME = /^\d{4}_[a-z0-9_]+\.sql$/;
 
+/** SHA-256 of the migration SQL as hex. Web Crypto, so it runs on Workers and Node. */
+async function checksum(sql: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(sql));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function refuseChanged(name: string, recorded: unknown, expected: string): void {
+  if (recorded !== expected) {
+    throw new Error(
+      `migration ${name} differs from the applied one: a migration file must not change ` +
+        "after it was applied",
+    );
+  }
+}
+
 /**
  * Applies the identkit D1 migrations that are not applied yet, in name order, and returns
- * the names it applied. It records them in `identkit_migrations`. Each migration runs as one
+ * the names it applied. It records them in `identkit_migrations` with a SHA-256 checksum of
+ * their SQL, and throws if an applied migration has a different SQL now. Each migration runs as one
  * `batch()` (one transaction) that first records its name: if a concurrent run applied it
  * first, the name is taken, the batch rolls back, and this run skips it. Works on Workers
  * without a file system. Do not mix it with `wrangler d1 migrations apply` for the same
@@ -31,29 +47,39 @@ export async function migrateIdentkitD1(
   await db
     .prepare(
       `CREATE TABLE IF NOT EXISTS identkit_migrations (
-        name TEXT PRIMARY KEY,
+        name TEXT NOT NULL PRIMARY KEY,
+        checksum TEXT NOT NULL,
         applied_at INTEGER NOT NULL
       )`,
     )
     .run();
-  const { results } = await db.prepare("SELECT name FROM identkit_migrations").all();
-  const done = new Set(results.map((r) => r["name"]));
+  const { results } = await db.prepare("SELECT name, checksum FROM identkit_migrations").all();
+  const done = new Map(results.map((r) => [r["name"], r["checksum"]]));
   const applied: string[] = [];
   for (const migration of migrations) {
-    if (done.has(migration.name)) continue;
+    const sum = await checksum(migration.sql);
+    if (done.has(migration.name)) {
+      refuseChanged(migration.name, done.get(migration.name), sum);
+      continue;
+    }
     try {
       await db.batch([
         db
-          .prepare("INSERT INTO identkit_migrations (name, applied_at) VALUES (?1, ?2)")
-          .bind(migration.name, Date.now()),
+          .prepare(
+            "INSERT INTO identkit_migrations (name, checksum, applied_at) VALUES (?1, ?2, ?3)",
+          )
+          .bind(migration.name, sum, Date.now()),
         ...splitStatements(migration.sql).map((statement) => db.prepare(statement)),
       ]);
     } catch (error) {
       const recorded = await db
-        .prepare("SELECT name FROM identkit_migrations WHERE name = ?1")
+        .prepare("SELECT checksum FROM identkit_migrations WHERE name = ?1")
         .bind(migration.name)
         .first();
-      if (recorded) continue;
+      if (recorded) {
+        refuseChanged(migration.name, recorded["checksum"], sum);
+        continue;
+      }
       throw error;
     }
     applied.push(migration.name);

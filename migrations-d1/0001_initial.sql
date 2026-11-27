@@ -5,6 +5,8 @@
 -- Types: every time is an INTEGER of milliseconds since the Unix epoch (UTC), so SQLite
 -- compares times as numbers. A boolean is an INTEGER 0 or 1. A list of strings is TEXT with a
 -- JSON array. The store never compares it in SQL. A public key is a BLOB.
+-- Each TEXT primary key is NOT NULL: SQLite accepts NULL in a TEXT primary key of a table that
+-- is not STRICT, and an upsert never conflicts on NULL.
 --
 -- Every table and index starts with identkit_, so the schema can share a database with other
 -- tables. Allowed values of enumerations (status, purpose, method) are not CHECK constraints:
@@ -12,7 +14,7 @@
 -- additive. The store checks each value it reads.
 
 CREATE TABLE identkit_accounts (
-  id TEXT PRIMARY KEY,
+  id TEXT NOT NULL PRIMARY KEY,
   email TEXT NOT NULL UNIQUE,
   webauthn_user_id TEXT NOT NULL UNIQUE,
   status TEXT NOT NULL,
@@ -23,7 +25,7 @@ CREATE TABLE identkit_accounts (
 );
 
 CREATE TABLE identkit_otp_flows (
-  id TEXT PRIMARY KEY,
+  id TEXT NOT NULL PRIMARY KEY,
   purpose TEXT NOT NULL,
   email TEXT NOT NULL,
   address_digest TEXT NOT NULL,
@@ -44,12 +46,12 @@ CREATE INDEX identkit_otp_flows_open_idx ON identkit_otp_flows (address_digest, 
 CREATE INDEX identkit_otp_flows_expires_idx ON identkit_otp_flows (expires_at);
 
 CREATE TABLE identkit_otp_send_gates (
-  gate_key TEXT PRIMARY KEY,
+  gate_key TEXT NOT NULL PRIMARY KEY,
   last_sent_at INTEGER NOT NULL
 );
 
 CREATE TABLE identkit_throttles (
-  key TEXT PRIMARY KEY,
+  key TEXT NOT NULL PRIMARY KEY,
   window_start INTEGER NOT NULL,
   attempts INTEGER NOT NULL,
   locked_until INTEGER,
@@ -58,7 +60,7 @@ CREATE TABLE identkit_throttles (
 );
 
 CREATE TABLE identkit_sessions (
-  id TEXT PRIMARY KEY,
+  id TEXT NOT NULL PRIMARY KEY,
   account_id TEXT NOT NULL REFERENCES identkit_accounts (id) ON DELETE CASCADE,
   token_digest TEXT NOT NULL UNIQUE,
   state TEXT NOT NULL,
@@ -77,7 +79,7 @@ CREATE INDEX identkit_sessions_account_live_idx ON identkit_sessions (account_id
   WHERE revoked_at IS NULL;
 
 CREATE TABLE identkit_credentials (
-  id TEXT PRIMARY KEY,
+  id TEXT NOT NULL PRIMARY KEY,
   account_id TEXT NOT NULL REFERENCES identkit_accounts (id) ON DELETE CASCADE,
   public_key BLOB NOT NULL,
   counter INTEGER NOT NULL CHECK (counter >= 0 AND counter <= 4294967295),
@@ -93,7 +95,7 @@ CREATE TABLE identkit_credentials (
 CREATE INDEX identkit_credentials_account_idx ON identkit_credentials (account_id);
 
 CREATE TABLE identkit_challenges (
-  id TEXT PRIMARY KEY,
+  id TEXT NOT NULL PRIMARY KEY,
   challenge_digest TEXT NOT NULL UNIQUE,
   purpose TEXT NOT NULL,
   account_id TEXT,
@@ -108,7 +110,7 @@ CREATE TABLE identkit_challenges (
 CREATE INDEX identkit_challenges_expires_idx ON identkit_challenges (expires_at);
 
 CREATE TABLE identkit_enrollment_tokens (
-  token_digest TEXT PRIMARY KEY,
+  token_digest TEXT NOT NULL PRIMARY KEY,
   account_id TEXT NOT NULL REFERENCES identkit_accounts (id) ON DELETE CASCADE,
   created_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL,
@@ -119,7 +121,7 @@ CREATE TABLE identkit_enrollment_tokens (
 CREATE INDEX identkit_enrollment_tokens_account_idx ON identkit_enrollment_tokens (account_id);
 
 CREATE TABLE identkit_verifications (
-  id TEXT PRIMARY KEY,
+  id TEXT NOT NULL PRIMARY KEY,
   account_id TEXT NOT NULL REFERENCES identkit_accounts (id) ON DELETE CASCADE,
   vendor_reference TEXT UNIQUE,
   status TEXT NOT NULL,
@@ -132,7 +134,7 @@ CREATE TABLE identkit_verifications (
 );
 
 CREATE TABLE identkit_totp_factors (
-  id TEXT PRIMARY KEY,
+  id TEXT NOT NULL PRIMARY KEY,
   account_id TEXT NOT NULL REFERENCES identkit_accounts (id) ON DELETE CASCADE,
   sealed_secret TEXT NOT NULL,
   algorithm TEXT NOT NULL,

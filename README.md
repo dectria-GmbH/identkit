@@ -567,8 +567,9 @@ keeps its own record of applied files:
 
 - `await migrateIdentkitD1(env.DB)` from a deployment script or an admin route. It works without
   a file system (the SQL ships as strings in `D1_MIGRATIONS`), runs each file as one `batch()`
-  (one transaction), records it in `identkit_migrations` and skips applied files. Concurrent
-  runs apply each file once.
+  (one transaction), records it in `identkit_migrations` with a SHA-256 checksum of its SQL and
+  skips applied files. If the SQL of an applied file changed, it throws. Concurrent runs apply
+  each file once.
 - `wrangler d1 migrations apply`. Declare a second binding to the same database with its own
   migrations folder and table:
 

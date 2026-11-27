@@ -1,4 +1,8 @@
-/** Splits a migration file at semicolons that end a line. Comment lines are dropped. */
+/**
+ * Splits a migration file at semicolons that end a line. Comment lines are dropped. A statement
+ * with an inner semicolon at a line end (a trigger body `BEGIN ...; END;`) would break apart, so
+ * migrations must not contain one.
+ */
 export function splitStatements(text: string): string[] {
   const withoutComments = text
     .split("\n")
