@@ -5,6 +5,7 @@ import {
   toClientView,
   type OAuthEndpointResult,
   type OAuthInternals,
+  type OAuthParams,
 } from "./common.js";
 import {
   createMetadata,
@@ -20,6 +21,13 @@ import {
 } from "./options.js";
 import { createRegister } from "./register.js";
 import { createAuthorize, type OAuthAuthorize } from "./authorize.js";
+import {
+  createTokenEndpoint,
+  emitOAuthGrantsEnded,
+  endAllOAuthGrants,
+  type ValidateAccessTokenResult,
+} from "./token.js";
+import type { OAuthGrantRecord } from "../storage/types.js";
 
 export type {
   AuthorizeBeginResult,
@@ -29,6 +37,42 @@ export type {
   OAuthAuthorize,
 } from "./authorize.js";
 export type { OAuthEndpointResult, OAuthParams } from "./common.js";
+export {
+  emitOAuthGrantsEnded,
+  endAllOAuthGrants,
+  type OAuthAccessTokenRefusal,
+  type OAuthGrantEndReason,
+  type OAuthTokenFailure,
+  type ValidateAccessTokenResult,
+} from "./token.js";
+
+/** What a consumer sees of a grant. Never contains a token or a digest. */
+export interface OAuthGrantView {
+  id: string;
+  accountId: string;
+  clientId: string;
+  scopes: string[];
+  resource: string;
+  createdAt: Date;
+  expiresAt: Date;
+  /** The last refresh, or null. */
+  refreshedAt: Date | null;
+  source: "created" | "import";
+}
+
+function toGrantView(grant: OAuthGrantRecord): OAuthGrantView {
+  return {
+    id: grant.id,
+    accountId: grant.accountId,
+    clientId: grant.clientId,
+    scopes: [...grant.scopes],
+    resource: grant.resource,
+    createdAt: grant.createdAt,
+    expiresAt: grant.expiresAt,
+    refreshedAt: grant.refreshedAt,
+    source: grant.source,
+  };
+}
 export type { OAuthMetadata, WwwAuthenticateInput } from "./metadata.js";
 export {
   oauthOptionsSchema,
@@ -57,6 +101,31 @@ export interface OAuth {
   register(input: { body: string; addressKey?: string }): Promise<OAuthEndpointResult>;
   /** The authorization endpoint: check the request, then the person's approval or denial. */
   authorize: OAuthAuthorize;
+  /**
+   * The token endpoint: code exchange and refresh. Pass the form as `URLSearchParams` and the
+   * raw `Authorization` header value (or null). Rate-limit this route yourself.
+   */
+  token(input: { form: OAuthParams; authorization: string | null }): Promise<OAuthEndpointResult>;
+  /**
+   * Token revocation (RFC 7009): ends the grant of an access or refresh token of the calling
+   * client. Always 200 with an empty body once the client is authenticated.
+   */
+  revoke(input: { form: OAuthParams; authorization: string | null }): Promise<OAuthEndpointResult>;
+  /**
+   * Checks an access token on every request of the protected resource: one read, no write, no
+   * event. Pass `resource` to accept only tokens for it. Apply your own per-request policy to
+   * the returned account and scopes afterwards.
+   */
+  validateAccessToken(
+    token: string,
+    options?: { resource?: string },
+  ): Promise<ValidateAccessTokenResult>;
+  /** Administrative: the account's live grants, oldest first. */
+  listGrants(accountId: string): Promise<OAuthGrantView[]>;
+  /** Administrative: ends the grant of the account. Returns true if this call ended it. */
+  revokeGrant(input: { accountId: string; grantId: string }): Promise<boolean>;
+  /** Administrative: ends every grant of the account. Returns how many this call ended. */
+  revokeAll(accountId: string): Promise<number>;
   /** Administrative: the client, or null. */
   getClient(clientId: string): Promise<OAuthClientView | null>;
   /**
@@ -83,6 +152,12 @@ export function unconfiguredOAuth(): OAuth {
     wwwAuthenticate: fail,
     register: reject,
     authorize: { begin: reject, approve: reject, deny: reject },
+    token: reject,
+    revoke: reject,
+    validateAccessToken: reject,
+    listGrants: reject,
+    revokeGrant: reject,
+    revokeAll: reject,
     getClient: reject,
     deleteClient: reject,
   };
@@ -114,6 +189,31 @@ export function createOAuth(
     wwwAuthenticate: (input) => wwwAuthenticate(settings, input),
     register: createRegister(internals),
     authorize: createAuthorize(internals),
+    ...createTokenEndpoint(internals),
+
+    async listGrants(accountId) {
+      requireId(accountId, "accountId");
+      return (await store.listGrants(accountId, ctx.clock.now())).map(toGrantView);
+    },
+
+    async revokeGrant(input) {
+      if (typeof input !== "object" || input === null) {
+        throw new InvalidArgumentError("revokeGrant needs { accountId, grantId }");
+      }
+      const accountId = requireId(input.accountId, "accountId");
+      const grantId = requireId(input.grantId, "grantId");
+      const ended = await store.deleteGrant(grantId, { accountId });
+      // The event after the delete: a refused event undoes no revocation.
+      if (ended) await emitOAuthGrantsEnded(ctx, accountId, [ended], "revoked");
+      return ended !== null;
+    },
+
+    async revokeAll(accountId) {
+      requireId(accountId, "accountId");
+      const ended = await endAllOAuthGrants(ctx, accountId);
+      await emitOAuthGrantsEnded(ctx, accountId, ended, "revoked_all");
+      return ended.length;
+    },
 
     async getClient(clientId) {
       const found = await store.findClient(requireId(clientId, "clientId"));

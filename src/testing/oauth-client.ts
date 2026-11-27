@@ -1,6 +1,6 @@
 import { sha256, toBase64Url, utf8 } from "../bytes.js";
 import { randomToken } from "../crypto.js";
-import type { OAuth } from "../oauth/index.js";
+import type { OAuth, OAuthEndpointResult } from "../oauth/index.js";
 import type { OAuthClientAuthMethod } from "../storage/types.js";
 
 export interface PkcePair {
@@ -59,6 +59,23 @@ export interface OAuthTestClient {
     accountId: string,
     options?: OAuthTestAuthorizeOptions,
   ): Promise<{ code: string; verifier: string; location: URL }>;
+  /** The code exchange at `oauth.token`, with `extra` form parameters. */
+  exchange(
+    code: string,
+    verifier: string,
+    extra?: Record<string, string>,
+  ): Promise<OAuthEndpointResult>;
+  /**
+   * `authorize`, then `exchange`. Returns the tokens of a successful exchange; throws otherwise.
+   */
+  connect(
+    accountId: string,
+    options?: OAuthTestAuthorizeOptions,
+  ): Promise<{ accessToken: string; refreshToken: string | null; result: OAuthEndpointResult }>;
+  /** A refresh at `oauth.token`, with `extra` form parameters such as `scope`. */
+  refresh(refreshToken: string, extra?: Record<string, string>): Promise<OAuthEndpointResult>;
+  /** A revocation at `oauth.revoke`. */
+  revoke(token: string): Promise<OAuthEndpointResult>;
 }
 
 /**
@@ -86,7 +103,7 @@ export async function createOAuthTestClient(
   }
   const clientSecret = typeof secret === "string" ? secret : null;
 
-  return {
+  const client: OAuthTestClient = {
     clientId,
     clientSecret,
     redirectUri,
@@ -139,5 +156,43 @@ export async function createOAuthTestClient(
       if (code === null) throw new Error("approve returned no code");
       return { code, verifier: pkce.verifier, location };
     },
+
+    exchange(code, verifier, extra = {}) {
+      return oauth.token(
+        client.credentials({
+          grant_type: "authorization_code",
+          code,
+          code_verifier: verifier,
+          redirect_uri: redirectUri,
+          ...extra,
+        }),
+      );
+    },
+
+    async connect(accountId, connectOptions = {}) {
+      const { code, verifier } = await client.authorize(accountId, connectOptions);
+      const result = await client.exchange(code, verifier);
+      const accessToken = result.body?.["access_token"];
+      const refreshToken = result.body?.["refresh_token"];
+      if (result.httpStatus !== 200 || typeof accessToken !== "string") {
+        throw new Error(`exchange failed: ${String(result.body?.["error"])}`);
+      }
+      return {
+        accessToken,
+        refreshToken: typeof refreshToken === "string" ? refreshToken : null,
+        result,
+      };
+    },
+
+    refresh(refreshToken, extra = {}) {
+      return oauth.token(
+        client.credentials({ grant_type: "refresh_token", refresh_token: refreshToken, ...extra }),
+      );
+    },
+
+    revoke(token) {
+      return oauth.revoke(client.credentials({ token }));
+    },
   };
+  return client;
 }
