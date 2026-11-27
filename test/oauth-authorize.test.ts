@@ -189,6 +189,31 @@ async function consent(
 }
 
 describe("oauth authorize.approve and deny", () => {
+  it("approve writes the client's last use before the code, at most twice a day; a store error issues nothing", async () => {
+    const { ik, client, accountId, clock, store, audit } = await flow();
+    const oauthStore = store.oauth;
+    if (!oauthStore) throw new Error("no oauth store");
+    const markUsed = oauthStore.markClientUsed.bind(oauthStore);
+    const writes: Date[] = [];
+    let failing = false;
+    oauthStore.markClientUsed = async (id, at, notAfter) => {
+      if (failing) throw new Error("db blip");
+      writes.push(at);
+      return markUsed(id, at, notAfter);
+    };
+    const first = clock.now();
+    await client.authorize(accountId);
+    clock.advanceSeconds(3600);
+    await client.authorize(accountId);
+    expect(writes).toEqual([first]);
+    expect((await ik.oauth.getClient(client.clientId))?.lastUsedAt).toEqual(first);
+    clock.advanceSeconds(12 * 3600);
+    failing = true;
+    await expect(client.authorize(accountId)).rejects.toThrow("db blip");
+    // Two approvals recorded, none for the failed one, whose code was never stored.
+    expect(audit.ofType("oauth.consent_approved")).toHaveLength(2);
+  });
+
   it("approve stores a single-use code with the chosen scopes and redirects with code, state and iss", async () => {
     const { ik, store, audit, ticket, accountId, client, hasher } = await consent();
     const approved = await ik.oauth.authorize.approve({

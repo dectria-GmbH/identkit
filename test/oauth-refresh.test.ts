@@ -105,7 +105,7 @@ describe("oauth refresh", () => {
     expect(reported.map((e) => e.type)).toEqual(["oauth.token_refreshed"]);
   });
 
-  it("a failed last-used write fails neither the exchange nor a won refresh; onStoreError gets it", async () => {
+  it("a failed last-used write fails no won refresh; onStoreError gets it", async () => {
     const reported: unknown[] = [];
     const setup = oauthSetup({
       oauth: {
@@ -117,11 +117,14 @@ describe("oauth refresh", () => {
     });
     const oauthStore = setup.store.oauth;
     if (!oauthStore) throw new Error("no oauth store");
-    oauthStore.markClientUsed = () => Promise.reject(new Error("db blip"));
     const client = await createOAuthTestClient(setup.ik.oauth);
     const accountId = await setup.account();
-    const tokens = await client.connect(accountId);
-    if (tokens.refreshToken === null) throw new Error("no refresh token");
+    // The approval writes the last use (strictly, before the code); the store breaks after it.
+    const { code, verifier } = await client.authorize(accountId);
+    oauthStore.markClientUsed = () => Promise.reject(new Error("db blip"));
+    const exchanged = await client.exchange(code, verifier);
+    expect(exchanged.httpStatus).toBe(200);
+    const tokens = { refreshToken: tokensOf(exchanged).refresh };
     setup.clock.advanceSeconds(86_401);
     const result = await client.refresh(tokens.refreshToken);
     expect(result.httpStatus).toBe(200);
@@ -131,7 +134,6 @@ describe("oauth refresh", () => {
     expect((await client.refresh(next.refresh)).httpStatus).toBe(200);
     const write = { kind: "client_last_used", clientId: client.clientId };
     expect(reported).toEqual([
-      ["Error: db blip", write],
       ["Error: db blip", write],
       ["Error: db blip", write],
     ]);

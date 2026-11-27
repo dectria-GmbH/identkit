@@ -22,6 +22,8 @@ import { matchRedirectUri, type RedirectUriRules } from "./redirect-uris.js";
 const TICKET_CONTEXT = "identkit/oauth/consent/v1";
 const MAX_TICKET_LENGTH = 8192;
 const MAX_STATE_LENGTH = 1024;
+/** How often an approval writes the client's last use: at most twice a day. */
+const MARK_INTERVAL_SECONDS = 43_200;
 /** RFC 7636 section 4.2: 43 to 128 unreserved characters. */
 const CODE_CHALLENGE = /^[A-Za-z0-9._~-]{43,128}$/;
 
@@ -359,6 +361,17 @@ export function createAuthorize(internals: OAuthInternals): OAuthAuthorize {
       });
       if (!allowed) return { status: "refused", reason: "refused_by_policy" };
 
+      const now = ctx.clock.now();
+      // An approval counts as use of the client, written before the code, so `purge` never
+      // takes a client while a flow of it is open: the exchange consumes the code before the
+      // grant exists, and in between the client holds neither. At most twice a day, so the last
+      // use is always less than a day old while a code lives (`codeSeconds` is at most 600) and
+      // `clientRetention.idleDays` is at least 1. Strict: nothing is written yet.
+      const markAfter = addSeconds(now, -MARK_INTERVAL_SECONDS);
+      if (client.lastUsedAt === null || client.lastUsedAt.getTime() <= markAfter.getTime()) {
+        await store.markClientUsed(client.id, now, markAfter);
+      }
+
       // The event before the code: no code stands without its record.
       await ctx.emit({
         type: "oauth.consent_approved",
@@ -366,7 +379,6 @@ export function createAuthorize(internals: OAuthInternals): OAuthAuthorize {
         clientId: client.id,
         scopes: [...scopes],
       });
-      const now = ctx.clock.now();
       const code = `${settings.prefixes.code}${randomToken()}`;
       await store.insertCode({
         digest: await ctx.hasher.digest("oauth-code", code),

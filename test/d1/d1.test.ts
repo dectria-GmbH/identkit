@@ -17,6 +17,7 @@ import { hashPayload } from "../../src/index.js";
 import { mfaPolicy, setup } from "../helpers.js";
 import { runStoreContract } from "../store-contract.js";
 import { runStoreFlows } from "../store-flows.js";
+import { oauthRowsAfterAccountDelete } from "../oauth-helpers.js";
 import { startLocalD1 } from "./local-d1.js";
 import { recordingD1 } from "./recording-d1.js";
 
@@ -105,6 +106,28 @@ describe("d1", { timeout: 30_000 }, () => {
 
   runStoreContract("d1", () => requireStore());
   runStoreFlows("d1", requireStore);
+
+  it("oauth row 28: deleting an account row removes its grants, access tokens and codes", async () => {
+    const db = requireDb();
+    const result = await oauthRowsAfterAccountDelete(
+      requireStore(),
+      async (accountId) => {
+        await db.prepare("DELETE FROM identkit_accounts WHERE id = ?1").bind(accountId).run();
+      },
+      async (table, column, value) => {
+        const row = await db
+          .prepare(`SELECT count(*) AS n FROM ${table} WHERE ${column} = ?1`)
+          .bind(value)
+          .first();
+        return Number(row?.["n"]);
+      },
+    );
+    // The control: the rows exist before the delete.
+    expect(result.before).toEqual({ grants: 1, accessTokens: 1, codes: 1 });
+    expect(result.after).toEqual({ grants: 0, accessTokens: 0, codes: 0 });
+    // The client belongs to no account and stays.
+    expect(result.client).not.toBeNull();
+  });
 
   it("migrations: every new table and index starts with identkit_; other tables stay", async () => {
     const db = requireDb();

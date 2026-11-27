@@ -1,8 +1,10 @@
 import type { Context } from "../context.js";
 import { InvalidArgumentError, NotConfiguredError } from "../errors.js";
+import { addSeconds } from "../clock.js";
 import {
   requireId,
   toClientView,
+  utcDayStart,
   type OAuthEndpointResult,
   type OAuthInternals,
   type OAuthParams,
@@ -58,6 +60,18 @@ export {
   type OAuthTokenFailure,
   type ValidateAccessTokenResult,
 } from "./token.js";
+
+/** What `oauth.purge` removed. */
+export interface OAuthPurgeResult {
+  /** Clients deleted as unused or idle. */
+  clients: number;
+  /** Grants past their absolute end. */
+  grants: number;
+  codes: number;
+  accessTokens: number;
+  /** Registration counts of earlier UTC days. */
+  registrationWindows: number;
+}
 
 /** What a consumer sees of a grant. Never contains a token or a digest. */
 export interface OAuthGrantView {
@@ -164,6 +178,17 @@ export interface OAuth {
    * throws `OperationRolledBackError`.
    */
   importGrant(input: ImportOAuthGrantInput): Promise<ImportOAuthGrantResult>;
+  /**
+   * Administrative: deletes expired grants, codes and access tokens, registration counts of
+   * earlier days, and clients by `clientRetention`: never used and older than `unusedDays`, or
+   * last used more than `idleDays` ago. Never deletes a client that holds a live grant or code;
+   * an approval counts as use, so a client in the middle of a flow stays. Records
+   * `oauth.grant_ended` (reason `expired`) for each grant and `oauth.client_deleted` (reason
+   * `unused` or `idle`) for each client. The deletions stand if the sink refuses an event; every
+   * other event is still sent, and the first error goes up. Run it on a schedule, for example
+   * daily.
+   */
+  purge(): Promise<OAuthPurgeResult>;
 }
 
 const fail = (): never => {
@@ -193,6 +218,7 @@ export function unconfiguredOAuth(): OAuth {
     deleteClient: reject,
     importClient: reject,
     importGrant: reject,
+    purge: reject,
   };
 }
 
@@ -247,6 +273,48 @@ export function createOAuth(
       const ended = await endAllOAuthGrants(ctx, accountId);
       await emitOAuthGrantsEnded(ctx, accountId, ended, "revoked_all");
       return ended.length;
+    },
+
+    async purge() {
+      const now = ctx.clock.now();
+      const day = 86_400;
+      const { unusedDays, idleDays } = settings.clientRetention;
+      const removed = await store.purge({
+        at: now,
+        unusedBefore: addSeconds(now, -unusedDays * day),
+        idleBefore: addSeconds(now, -idleDays * day),
+        // Only the current UTC day counts registrations.
+        windowBefore: utcDayStart(now),
+      });
+      // The events after the deletes: a refused event undoes nothing. A throwing sink does not
+      // skip the other events; the first error goes up after all of them.
+      let failure: { error: unknown } | null = null;
+      for (const grant of removed.grants) {
+        try {
+          await emitOAuthGrantsEnded(ctx, grant.accountId, [grant], "expired");
+        } catch (error) {
+          failure ??= { error };
+        }
+      }
+      for (const client of removed.clients) {
+        try {
+          await ctx.emit({
+            type: "oauth.client_deleted",
+            clientId: client.id,
+            reason: client.reason,
+          });
+        } catch (error) {
+          failure ??= { error };
+        }
+      }
+      if (failure) throw failure.error;
+      return {
+        clients: removed.clients.length,
+        grants: removed.grants.length,
+        codes: removed.codes,
+        accessTokens: removed.accessTokens,
+        registrationWindows: removed.registrationWindows,
+      };
     },
 
     async getClient(clientId) {

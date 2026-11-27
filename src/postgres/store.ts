@@ -24,6 +24,8 @@ import type { IdentkitDatabase } from "./schema.js";
 type Row<T extends keyof IdentkitDatabase> = Selectable<IdentkitDatabase[T]>;
 
 const UNIQUE_VIOLATION = "23505";
+/** Client ids per DELETE in `oauth.purge`. */
+const PURGE_CHUNK = 1000;
 /** serialization_failure and deadlock_detected. */
 const LOST_RACE = new Set(["40001", "40P01"]);
 
@@ -1545,8 +1547,8 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
         return rows.map(toOAuthGrant);
       },
       async purge({ at, unusedBefore, idleBefore, windowBefore }) {
-        // Each statement is idempotent. A client delete re-checks in its own WHERE that the
-        // client holds no live grant and no live code, so a grant created meanwhile keeps it.
+        // Each statement is idempotent. The expired rows first, each on its own: they need no
+        // shared invariant.
         const grants = await db
           .deleteFrom("identkit_oauth_grants")
           .where("expires_at", "<=", at)
@@ -1560,52 +1562,75 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           .deleteFrom("identkit_oauth_access_tokens")
           .where("expires_at", "<=", at)
           .executeTakeFirst();
-        const deleteClients = (rule: "unused" | "idle") =>
-          db
-            .deleteFrom("identkit_oauth_clients as c")
-            .where((eb) =>
-              rule === "unused"
-                ? eb.and([eb("c.last_used_at", "is", null), eb("c.created_at", "<", unusedBefore)])
-                : eb.and([
-                    eb("c.last_used_at", "is not", null),
-                    eb("c.last_used_at", "<", idleBefore),
-                  ]),
-            )
-            .where((eb) =>
-              eb.not(
-                eb.exists(
-                  eb
-                    .selectFrom("identkit_oauth_grants as g")
-                    .select("g.id")
-                    .whereRef("g.client_id", "=", "c.id")
-                    .where("g.expires_at", ">", at),
-                ),
-              ),
-            )
-            .where((eb) =>
-              eb.not(
-                eb.exists(
-                  eb
-                    .selectFrom("identkit_oauth_codes as o")
-                    .select("o.digest")
-                    .whereRef("o.client_id", "=", "c.id")
-                    .where("o.expires_at", ">", at),
-                ),
-              ),
-            )
-            .returning("c.id")
-            .execute();
-        const unused = await deleteClients("unused");
-        const stale = await deleteClients("idle");
+        // The rule of each kind: never used and old, or used long ago.
+        const before = { unused: unusedBefore, idle: idleBefore };
+        const used = { unused: "is", idle: "is not" } as const;
+        const dateColumn = { unused: "c.created_at", idle: "c.last_used_at" } as const;
+        // The clients in one READ COMMITTED transaction. First the candidates FOR UPDATE: a grant
+        // insert or import holds a key share lock on its client until it commits, so this waits
+        // for it, and one that starts later waits here and then fails on the deleted client. The
+        // delete is a second statement, so its snapshot sees every grant committed during the
+        // wait, and its NOT EXISTS keeps that client. A single DELETE would not: after its wait
+        // it re-checks only the client row, which the grant insert did not change.
+        const deleted = await db
+          .transaction()
+          .setIsolationLevel("read committed")
+          .execute(async (trx) => {
+            const removed: { id: string; reason: "unused" | "idle" }[] = [];
+            for (const rule of ["unused", "idle"] as const) {
+              const candidates = await trx
+                .selectFrom("identkit_oauth_clients as c")
+                .select("c.id")
+                .where("c.last_used_at", used[rule], null)
+                .where(dateColumn[rule], "<", before[rule])
+                .forUpdate()
+                .execute();
+              // In chunks, to stay far below the parameter limit of one statement.
+              for (let i = 0; i < candidates.length; i += PURGE_CHUNK) {
+                const rows = await trx
+                  .deleteFrom("identkit_oauth_clients as c")
+                  .where(
+                    "c.id",
+                    "in",
+                    candidates.slice(i, i + PURGE_CHUNK).map((r) => r.id),
+                  )
+                  .where("c.last_used_at", used[rule], null)
+                  .where(dateColumn[rule], "<", before[rule])
+                  .where((eb) =>
+                    eb.not(
+                      eb.exists(
+                        eb
+                          .selectFrom("identkit_oauth_grants as g")
+                          .select("g.id")
+                          .whereRef("g.client_id", "=", "c.id")
+                          .where("g.expires_at", ">", at),
+                      ),
+                    ),
+                  )
+                  .where((eb) =>
+                    eb.not(
+                      eb.exists(
+                        eb
+                          .selectFrom("identkit_oauth_codes as o")
+                          .select("o.digest")
+                          .whereRef("o.client_id", "=", "c.id")
+                          .where("o.expires_at", ">", at),
+                      ),
+                    ),
+                  )
+                  .returning("c.id")
+                  .execute();
+                removed.push(...rows.map((r) => ({ id: r.id, reason: rule })));
+              }
+            }
+            return removed;
+          });
         const windows = await db
           .deleteFrom("identkit_oauth_registration_counts")
           .where("window_start", "<", windowBefore)
           .executeTakeFirst();
         return {
-          clients: [
-            ...unused.map((r) => ({ id: r.id, reason: "unused" as const })),
-            ...stale.map((r) => ({ id: r.id, reason: "idle" as const })),
-          ],
+          clients: deleted,
           grants: grants.map(toOAuthGrant),
           codes: Number(codes.numDeletedRows),
           accessTokens: Number(tokens.numDeletedRows),

@@ -178,9 +178,15 @@ export const oauthOptionsSchema = z
       .default({}),
     clientRetention: z
       .object({
-        /** A client that never got a grant goes this many days after its registration. */
+        /**
+         * A client that was never used (no approval, code exchange or refresh) goes this many
+         * days after its registration.
+         */
         unusedDays: z.number().int().min(1).max(3650).default(30),
-        /** A client that got a grant goes this many days after its last use, never while live. */
+        /**
+         * A used client goes this many days after its last use, never while it holds a live
+         * grant or code.
+         */
         idleDays: z.number().int().min(1).max(3650).default(180),
       })
       .strict()
@@ -257,10 +263,11 @@ export const oauthOptionsSchema = z
       .optional(),
     /**
      * Receives the error when a best-effort store write fails, with the write: the client's
-     * last-used time, which identkit writes at most once a day after a code exchange or a
-     * refresh took effect, and the upgrade of an imported SHA-256 client secret after it
-     * matched. The call still returns its tokens: they are issued already, and an error would
-     * make the client retry with a code or a refresh token that is used up. A failed upgrade is
+     * last-used time, which identkit writes at most once a day after a refresh took effect, and
+     * the upgrade of an imported SHA-256 client secret after it matched. The call still returns
+     * its tokens: they are issued already, and an error would make the client retry with a
+     * refresh token that is used up. (The approval writes the last-used time strictly, before
+     * anything else: an error there fails `authorize.approve`, and nothing is issued.) A failed upgrade is
      * tried again at the next use. Without this option the error is dropped. identkit awaits
      * the call and drops what it throws; keep it quick.
      */

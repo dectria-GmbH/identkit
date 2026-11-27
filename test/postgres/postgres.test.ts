@@ -18,6 +18,7 @@ import type { IdentkitStore, OidcLinkRecord } from "../../src/storage/types.js";
 import { setup } from "../helpers.js";
 import { runStoreContract } from "../store-contract.js";
 import { runStoreFlows } from "../store-flows.js";
+import { oauthRowsAfterAccountDelete } from "../oauth-helpers.js";
 
 const url = process.env["DATABASE_URL"];
 const schema = `identkit_test_${randomBytes(6).toString("hex")}`;
@@ -63,6 +64,29 @@ describe.skipIf(!url)("postgresql", () => {
 
   runStoreContract("postgresql", () => requireStore());
   runStoreFlows("postgresql", requireStore);
+
+  it("oauth row 28: deleting an account row removes its grants, access tokens and codes", async () => {
+    if (!db) throw new Error("database not initialised");
+    const k = db;
+    const result = await oauthRowsAfterAccountDelete(
+      requireStore(),
+      async (accountId) => {
+        await k.deleteFrom("identkit_accounts").where("id", "=", accountId).execute();
+      },
+      async (table, column, value) => {
+        const { rows } = await sql<{ n: string }>`
+          SELECT count(*) AS n FROM ${sql.table(table)} WHERE ${sql.ref(column)} = ${value}`.execute(
+          k,
+        );
+        return Number(rows[0]?.n);
+      },
+    );
+    // The control: the rows exist before the delete.
+    expect(result.before).toEqual({ grants: 1, accessTokens: 1, codes: 1 });
+    expect(result.after).toEqual({ grants: 0, accessTokens: 0, codes: 0 });
+    // The client belongs to no account and stays.
+    expect(result.client).not.toBeNull();
+  });
 
   it("enrollment: revokeAllForAccount waits for the account row lock that issue takes", async () => {
     const database = db;

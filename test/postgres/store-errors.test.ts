@@ -210,4 +210,44 @@ describe("postgresql store without a database", () => {
     ).rejects.toThrow("oauth grant references a missing client");
     expect(missing.sqls.some((q) => q.includes('"identkit_oauth_grants"'))).toBe(false);
   });
+
+  it("rule: purge locks candidate clients FOR UPDATE, then deletes them in a second statement", async () => {
+    const { oauth, steps } = scriptedStore((query) => {
+      if (query.sql.startsWith("select")) return { rows: [{ id: "c1" }] };
+      if (query.sql.startsWith('delete from "identkit_oauth_clients"')) {
+        return { rows: [{ id: "c1" }] };
+      }
+      return { rows: [], numAffectedRows: 0n };
+    });
+    const at = new Date();
+    const result = await oauth.purge({
+      at,
+      unusedBefore: at,
+      idleBefore: at,
+      windowBefore: at,
+    });
+    expect(result.clients).toEqual([
+      { id: "c1", reason: "unused" },
+      { id: "c1", reason: "idle" },
+    ]);
+    // Review a2 r1 L4: one DELETE with NOT EXISTS re-checks only the client row after it waited
+    // on a grant insert's key share lock, and cascaded the grant that had just committed.
+    const begin = steps.indexOf("BEGIN");
+    const clientSteps = steps
+      .slice(begin)
+      .filter((q) => q.includes('"identkit_oauth_clients"') || q === "BEGIN" || q === "COMMIT")
+      .map((q) =>
+        q.startsWith("select")
+          ? `select${q.endsWith(" for update") ? " for update" : ""}`
+          : q.split(" ")[0],
+      );
+    expect(clientSteps).toEqual([
+      "BEGIN",
+      "select for update",
+      "delete",
+      "select for update",
+      "delete",
+      "COMMIT",
+    ]);
+  });
 });

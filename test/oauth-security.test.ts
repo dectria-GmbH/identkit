@@ -1,6 +1,7 @@
 /**
  * The security review list of the OAuth server: one `it` per row, named by its number. Each test
- * fails when the defence of its row is turned off at its call site.
+ * fails when the defence of its row is turned off at its call site. Row 28 (foreign key
+ * cascades) runs in test/d1 and test/postgres, against the database itself.
  */
 import { createHash, randomBytes } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
@@ -819,5 +820,23 @@ describe("oauth security review list", () => {
     expect(blank.body).not.toHaveProperty("client_name");
     // The name never reaches an audit event.
     expect(JSON.stringify(audit.events)).not.toContain("evil");
+  });
+
+  it("row 27: purge never deletes a client that holds a live grant, however old its last use", async () => {
+    const { ik, client, accountId, clock, account } = await connected({
+      oauth: { clientRetention: { unusedDays: 1, idleDays: 1 } },
+    });
+    const tokens = await refreshTokenOf(client, accountId);
+    // The control: a client used as long ago, whose grant ended, goes in the same run.
+    const ended = await createOAuthTestClient(ik.oauth);
+    const otherAccount = await account();
+    await ended.connect(otherAccount);
+    await ik.oauth.revokeAll(otherAccount);
+    clock.advanceSeconds(10 * 86_400);
+    await ik.oauth.purge();
+    expect(await ik.oauth.getClient(ended.clientId)).toBeNull();
+    expect(await ik.oauth.getClient(client.clientId)).not.toBeNull();
+    expect(await ik.oauth.listGrants(accountId)).toHaveLength(1);
+    expect((await client.refresh(tokens.refreshToken)).httpStatus).toBe(200);
   });
 });

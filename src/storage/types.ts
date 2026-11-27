@@ -279,7 +279,7 @@ export interface OAuthClientRecord {
   name: string | null;
   source: OAuthClientSource;
   createdAt: Date;
-  /** Written at a code exchange and a refresh, at most once a day. */
+  /** Written at an approval (at most twice a day) and a refresh (at most once a day). */
   lastUsedAt: Date | null;
 }
 
@@ -720,10 +720,11 @@ export interface IdentkitStore {
     /** The grants of the account with `expiresAt` after `at`, oldest first. */
     listGrants(accountId: string, at: Date): Promise<OAuthGrantRecord[]>;
     /**
-     * Deletes grants, codes and access tokens that expire at or before `at`; clients that never
-     * got a grant and were created before `unusedBefore`; clients last used before
+     * Deletes grants, codes and access tokens that expire at or before `at`; clients never used
+     * (`lastUsedAt` null) and created before `unusedBefore`; clients last used before
      * `idleBefore`; and registration windows that start before `windowBefore`. Never deletes a
-     * client that holds a live grant or a live code.
+     * client that holds a live grant or a live code, also not one whose grant a concurrent
+     * insert or import commits: that grant either keeps the client or is refused.
      */
     purge(input: {
       at: Date;

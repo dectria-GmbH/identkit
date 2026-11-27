@@ -9,6 +9,7 @@ import {
 import type { SecretHasher } from "../src/crypto.js";
 import {
   createFakeClock,
+  createOAuthTestClient,
   createRecordingAuditSink,
   createRecordingMailSender,
   createTestSealer,
@@ -69,4 +70,35 @@ export function registration(overrides: Record<string, unknown> = {}): string {
     client_name: "Example client",
     ...overrides,
   });
+}
+
+/**
+ * Security row 28: deleting an account row in the database removes its grants, their access
+ * tokens and its codes by foreign key. `deleteAccount` runs the raw SQL delete; `count` counts
+ * the rows of a table whose column equals the value. Returns the counts after the delete.
+ */
+export async function oauthRowsAfterAccountDelete(
+  store: IdentkitStore,
+  deleteAccount: (accountId: string) => Promise<void>,
+  count: (table: string, column: string, value: string) => Promise<number>,
+) {
+  const t = oauthSetup({ store });
+  const client = await createOAuthTestClient(t.ik.oauth);
+  const accountId = await t.account();
+  await client.connect(accountId);
+  await client.authorize(accountId);
+  const [grant] = await t.ik.oauth.listGrants(accountId);
+  if (!grant) throw new Error("no grant");
+  const before = {
+    grants: await count("identkit_oauth_grants", "account_id", accountId),
+    accessTokens: await count("identkit_oauth_access_tokens", "grant_id", grant.id),
+    codes: await count("identkit_oauth_codes", "account_id", accountId),
+  };
+  await deleteAccount(accountId);
+  const after = {
+    grants: await count("identkit_oauth_grants", "account_id", accountId),
+    accessTokens: await count("identkit_oauth_access_tokens", "grant_id", grant.id),
+    codes: await count("identkit_oauth_codes", "account_id", accountId),
+  };
+  return { before, after, client: await t.ik.oauth.getClient(client.clientId) };
 }

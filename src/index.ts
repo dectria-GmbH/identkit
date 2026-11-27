@@ -139,6 +139,7 @@ export {
   type OAuthMetadata,
   type OAuthOptions,
   type OAuthParams,
+  type OAuthPurgeResult,
   type OAuthStoreErrorHandler,
   type WwwAuthenticateInput,
 } from "./oauth/index.js";

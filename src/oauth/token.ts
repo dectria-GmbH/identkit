@@ -232,9 +232,9 @@ export function createTokenEndpoint(internals: OAuthInternals) {
   }
 
   /**
-   * Writes `lastUsedAt` of the client at most once a day, best effort: the exchange or rotation
-   * is written already. If a store error failed the call, the client would never get its new
-   * tokens, and its retry with the used code or the previous refresh token would fail.
+   * Writes `lastUsedAt` of the client at most once a day after a refresh, best effort: the
+   * rotation is written already. If a store error failed the call, the client would never get
+   * its new tokens, and its retry with the previous refresh token would fail.
    */
   async function markUsed(client: OAuthClientRecord, now: Date): Promise<void> {
     const notAfter = addSeconds(now, -DAY_SECONDS);
@@ -414,7 +414,8 @@ export function createTokenEndpoint(internals: OAuthInternals) {
       await store.deleteGrant(grant.id, { clientId: client.id });
       throw new OperationRolledBackError(grant.accountId, { cause: error, hookFailed: false });
     }
-    await markUsed(client, now);
+    // No last-use write here: the approval that issued the code wrote it, at most a few minutes
+    // ago (see `authorize.approve`).
     return tokenResponse(access.token, access.record, refresh?.token ?? null, now);
   }
 

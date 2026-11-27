@@ -1604,8 +1604,9 @@ export function createD1Store(db: D1DatabaseLike, options: D1StoreOptions = {}):
         return rows.map(toOAuthGrant);
       },
       async purge({ at, unusedBefore, idleBefore, windowBefore }) {
-        // One batch. A client delete checks in its own WHERE that the client holds no live
-        // grant and no live code, so a grant created before the batch keeps its client.
+        // One batch, which D1 runs as one transaction. A client delete checks in its own WHERE
+        // that the client holds no live grant and no live code, so a grant created before the
+        // batch keeps its client, and a grant insert after it fails on the missing client.
         const free = `NOT EXISTS (SELECT 1 FROM identkit_oauth_grants g
                                   WHERE g.client_id = c.id AND g.expires_at > ?1)
           AND NOT EXISTS (SELECT 1 FROM identkit_oauth_codes o
