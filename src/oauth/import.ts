@@ -325,8 +325,9 @@ export function createImport(internals: OAuthInternals) {
         // client: for the audit trail its import did not happen, so a retry may import it. If
         // the delete fails, its error goes up and the client stands without its record.
         const ended = await store.rollBackImport("client", id, clock.now());
-        // A grant that a concurrent call attached to the client did happen: the store wrote
-        // its tombstone, and its end is recorded here, best effort (the sink just refused).
+        // A grant that a concurrent call attached to the client did happen: the store wrote a
+        // tombstone for an imported one (not for one created in the meantime), and its end is
+        // recorded here, best effort (the sink just refused).
         for (const grant of ended ?? []) {
           try {
             await emitOAuthGrantsEnded(ctx, grant.accountId, [grant], "client_deleted");

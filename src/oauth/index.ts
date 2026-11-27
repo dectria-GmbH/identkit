@@ -174,9 +174,9 @@ export interface OAuth {
    * sink refuses it, the client is deleted again (without a tombstone, so a retry imports) and
    * the call throws `OAuthClientRolledBackError`. A grant on the client ends with it, whether
    * it was imported or created in the meantime. It gets `oauth.grant_ended` (reason
-   * `client_deleted`, best effort). An imported grant also keeps its tombstone. A concurrent identical import may answer
-   * `already_imported` for a client that the other call then rolls back; run imports one at a
-   * time, and the grant imports after the client imports.
+   * `client_deleted`, best effort). An imported grant also gets a tombstone. A concurrent
+   * identical import may answer `already_imported` for a client that the other call then rolls
+   * back; run imports one at a time, and the grant imports after the client imports.
    */
   importClient(input: ImportOAuthClientInput): Promise<ImportOAuthClientResult>;
   /**
@@ -185,8 +185,10 @@ export interface OAuth {
    * grant that ended since answers `revoked`: it never comes back. Records
    * `oauth.grant_imported`; if the sink refuses it, the grant is deleted again (without a
    * tombstone, so a retry imports) and the call throws `OperationRolledBackError`. If the
-   * client's own import rolls back at the same time, the grant ends with the client and keeps
-   * a tombstone. Its import then answers `revoked`, also after the sink works again. A concurrent
+   * client's own import rolls back at the same time, the order decides. If the client rollback
+   * runs first, the grant ends with the client and gets a tombstone; its import then answers
+   * `revoked`, also after the sink works again. If the grant rollback runs first, the grant has
+   * no tombstone, and its import answers `no_client` until the client stands again. A concurrent
    * identical import may answer `already_imported` for a grant that the other call then rolls
    * back; run imports one at a time.
    */
