@@ -8,11 +8,6 @@ on:
 permissions:
   contents: read
 
-# Two release tags pushed close together run one after the other, never in parallel.
-concurrency:
-  group: release
-  cancel-in-progress: false
-
 jobs:
   check:
     name: check and pack
