@@ -53,9 +53,10 @@ export interface IdentkitOptions {
    * example on a disable, a new passkey or a TOTP removal), and also when no session was live.
    * Use it to end sessions that your application keeps itself. It runs last: after the
    * revocation, the calling operation's own writes and its audit events. It runs also when the
-   * audit sink throws on those events; the sink's error then goes up after it. If it throws, the
-   * calling operation throws `AllSessionsRevokedHookError` (with the sink's error as
-   * `auditError`, if any); everything identkit does is done by then. Re-run it with
+   * audit sink throws on those events; the sink's first error then goes up after it. If it
+   * throws, the calling operation throws `AllSessionsRevokedHookError` (with the sink's error as
+   * `auditError`, if any); everything identkit does is done by then. That error does not mean
+   * success: `rolledBack` is true if the operation rolled back. Re-run the hook with
    * `sessions.revokeAll(error.accountId, error.revokeAllOptions)`. Make it idempotent.
    */
   onAllSessionsRevoked?: AllSessionsRevokedHook;

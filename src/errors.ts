@@ -62,22 +62,36 @@ export class PasskeyCleanupError extends IdentkitError {
  * audit events are complete too, unless `auditError` is set. To re-run the hook, call
  * `sessions.revokeAll(error.accountId, error.revokeAllOptions)`; that call is idempotent.
  * `cause` holds the hook's error.
+ *
+ * This error does not mean that the operation succeeded. If `rolledBack` is true, the operation
+ * did not take effect. If an operation fails for another reason and rolls back, that error goes
+ * up and the hook runs best effort, so a rollback never throws this error for a hook failure.
  */
 export class AllSessionsRevokedHookError extends IdentkitError {
   /** The options for `sessions.revokeAll` that re-run the hook for the same sessions. */
   readonly revokeAllOptions: { exceptSessionId?: string };
   /**
-   * The audit sink's error if the sink also threw on an audit event of the same operation, else
-   * undefined. identkit runs the hook also after a failing sink, and this error then wins,
-   * because only the hook needs a re-run. The audit event the sink refused may be missing.
+   * The first error of the same operation's audit events (the revoked sessions, then the
+   * operation's own events), else undefined. identkit runs the hook also after a failing sink,
+   * and this error then wins, because only the hook needs a re-run. The event the sink refused
+   * is missing; identkit still offered every other event of the operation to the sink, and
+   * those may be missing too if the sink stayed down. In `totp.confirmEnrolment` it can also be
+   * the throttle store's error from the reset after a successful enrolment.
    */
   readonly auditError: unknown;
+  /**
+   * True if the operation did not take effect: a TOTP enrolment or a passkey registration whose
+   * grant changed before it completed. identkit removed the new factor or passkey and revoked
+   * every session of the account; without the hook failure the call would have returned
+   * `denied`. `revokeAllOptions` is then `{}`. False for every other operation.
+   */
+  readonly rolledBack: boolean;
 
   constructor(
     readonly accountId: string,
     /** The session that stayed live, or null. */
     readonly exceptSessionId: string | null,
-    options?: ErrorOptions & { auditError?: unknown },
+    options?: ErrorOptions & { auditError?: unknown; rolledBack?: boolean },
   ) {
     super(
       "all_sessions_revoked_hook_failed",
@@ -86,5 +100,6 @@ export class AllSessionsRevokedHookError extends IdentkitError {
     );
     this.revokeAllOptions = exceptSessionId === null ? {} : { exceptSessionId };
     this.auditError = options?.auditError;
+    this.rolledBack = options?.rolledBack === true;
   }
 }
