@@ -42,8 +42,9 @@ export interface Sessions {
    * Administrative: revokes all sessions of an account, for example on sign-out everywhere.
    * Takes a bare id. Do not pass client input without your own check. Calls the option
    * `onAllSessionsRevoked` after the revocation and its audit events, also when no session was
-   * live. If the hook throws, this call throws `AllSessionsRevokedHookError` and the sessions
-   * stay revoked. The call is idempotent: call it again to re-run the hook.
+   * live and also when the audit sink throws (its error then goes up after the hook). If the hook
+   * throws, this call throws `AllSessionsRevokedHookError` and the sessions stay revoked. The
+   * call is idempotent: call it again to re-run the hook.
    */
   revokeAll(accountId: string, options?: { exceptSessionId?: string }): Promise<number>;
 }
