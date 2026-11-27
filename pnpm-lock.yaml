@@ -194,6 +194,9 @@ importers:
       prettier:
         specifier: 3.10.1
         version: 3.10.1
+      rolldown:
+        specifier: 1.2.19
+        version: 1.2.19
       typescript:
         specifier: 7.0.2
         version: 7.0.2

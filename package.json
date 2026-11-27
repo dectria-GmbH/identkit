@@ -59,6 +59,7 @@
     "format:check": "prettier --check .",
     "test": "vitest run --maxWorkers=2",
     "test:postgres": "vitest run --maxWorkers=2 test/postgres",
+    "check:runtime": "node scripts/check-runtime-imports.mjs",
     "prepublishOnly": "pnpm build",
     "check": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test && pnpm build"
   },
@@ -82,6 +83,7 @@
     "oxlint-tsgolint": "7.0.2007",
     "pg": "8.23.1",
     "prettier": "3.10.1",
+    "rolldown": "1.2.19",
     "typescript": "7.0.2",
     "vitest": "5.1.1"
   }
