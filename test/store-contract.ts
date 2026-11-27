@@ -1538,24 +1538,36 @@ export function runStoreContract(
       await oauth.deleteClient(dynamic.id, ended);
       expect(await tombstone("client", dynamic.id)).toBeNull();
 
-      // A rollback writes none, so the import can run again.
+      // A rollback writes none for its own row, so the import can run again.
       const rolled = await pair();
-      expect(await oauth.rollBackImport("grant", rolled.grant.id)).toBe(true);
+      expect(await oauth.rollBackImport("grant", rolled.grant.id, ended)).toEqual([]);
       expect(await oauth.findGrant(rolled.grant.id)).toBeNull();
       expect(await tombstone("grant", rolled.grant.id)).toBeNull();
       expect(await oauth.importGrant(rolled.grant, limit)).toBe("inserted");
-      expect(await oauth.rollBackImport("client", rolled.client.id)).toBe(true);
+      // A client rollback returns the grants it takes. These did happen: an imported one gets
+      // its tombstone, and its import stays refused.
+      const cascaded = await oauth.rollBackImport("client", rolled.client.id, ended);
+      expect(cascaded?.map((g) => g.id)).toEqual([rolled.grant.id]);
       expect(await oauth.findClient(rolled.client.id)).toBeNull();
       expect(await oauth.findGrant(rolled.grant.id)).toBeNull();
       expect(await tombstone("client", rolled.client.id)).toBeNull();
-      expect(await tombstone("grant", rolled.grant.id)).toBeNull();
+      expect(await tombstone("grant", rolled.grant.id)).toEqual(ended);
       expect(await oauth.insertClient(rolled.client)).toBe("inserted");
+      expect(await oauth.importGrant(rolled.grant, limit)).toBe("revoked");
       // Only an imported row: a rollback leaves a dynamic client and a created grant alone.
-      expect(await oauth.rollBackImport("client", dynamic.id)).toBe(false);
+      const standing = oauthClient();
+      await oauth.insertClient(standing);
+      expect(await oauth.rollBackImport("client", standing.id, ended)).toBeNull();
+      expect(await oauth.findClient(standing.id)).not.toBeNull();
       const created = oauthGrant(accountId, rolled.client.id);
       await oauth.insertGrant(created, oauthAccessToken(created.id), limit);
-      expect(await oauth.rollBackImport("grant", created.id)).toBe(false);
+      expect(await oauth.rollBackImport("grant", created.id, ended)).toBeNull();
       expect(await oauth.findGrant(created.id)).not.toBeNull();
+      // A created grant that a client rollback takes is returned, without a tombstone.
+      const taken = await oauth.rollBackImport("client", rolled.client.id, ended);
+      expect(taken?.map((g) => g.id)).toEqual([created.id]);
+      expect(await tombstone("grant", created.id)).toBeNull();
+      expect(await tombstone("client", rolled.client.id)).toBeNull();
 
       // Purge: an expired imported grant and an unused imported client.
       const expiring = await pair({ expiresAt: addSeconds(T0, day) });

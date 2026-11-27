@@ -320,6 +320,8 @@ describe("postgresql store without a database", () => {
       ["endGrantByCode", (o) => o.endGrantByCode("code", at), ["grant"]],
       ["deleteGrantsForAccount", (o) => o.deleteGrantsForAccount("a1", at), ["grant"]],
       ["deleteClient", (o) => o.deleteClient("c1", at), ["grant", "client"]],
+      // A client rollback: its grants did happen, the client did not.
+      ["rollBackImport client", (o) => o.rollBackImport("client", "c1", at), ["grant"]],
       ["insertGrant", (o) => o.insertGrant(replacing, token, { maxOtherGrants: 5, at }), ["grant"]],
       [
         "purge",
@@ -349,12 +351,19 @@ describe("postgresql store without a database", () => {
         ).toBe(true);
       }
     }
-    // The rollback of a refused import writes none.
-    for (const kind of ["grant", "client"] as const) {
-      const { oauth, steps } = scriptedStore(answer);
-      expect(await oauth.rollBackImport(kind, "g1")).toBe(true);
-      expect(steps.some((q) => q.includes("identkit_oauth_import_tombstones"))).toBe(false);
-    }
+    // The rollback of a refused grant import writes none.
+    const grantRollBack = scriptedStore(answer);
+    expect(await grantRollBack.oauth.rollBackImport("grant", "g1", at)).toEqual([]);
+    expect(grantRollBack.steps.some((q) => q.includes("identkit_oauth_import_tombstones"))).toBe(
+      false,
+    );
+    // A client rollback locks only an imported client.
+    const clientRollBack = scriptedStore(answer);
+    await clientRollBack.oauth.rollBackImport("client", "c1", at);
+    const lock = clientRollBack.steps.find(
+      (q) => q.startsWith("select") && q.endsWith(" for update"),
+    );
+    expect(lock).toMatch(/"source" = \$\d+ for update$/);
   });
 
   it("rule: an insert or import that a tombstone names is rolled back and answers revoked", async () => {

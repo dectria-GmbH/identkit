@@ -86,12 +86,15 @@ export function createMemoryStore(): IdentkitStore {
     return grant;
   }
 
-  /** Deletes the client, its grants and its codes. Returns the grants, or null. */
-  function dropClient(id: string, at: Date | null): OAuthGrantRecord[] | null {
+  /**
+   * Deletes the client, its grants and its codes. Returns the grants, or null. Imported rows get
+   * their tombstones; a rolled-back client (`clientTombstone` false) gets none, its grants do.
+   */
+  function dropClient(id: string, at: Date, clientTombstone = true): OAuthGrantRecord[] | null {
     const client = oauthClients.get(id);
     if (!client) return null;
     oauthClients.delete(id);
-    if (at !== null && client.source === "import") {
+    if (clientTombstone && client.source === "import") {
       importTombstones.set(tombstoneKey("client", id), at);
     }
     const ended: OAuthGrantRecord[] = [];
@@ -828,15 +831,14 @@ export function createMemoryStore(): IdentkitStore {
         const at = importTombstones.get(tombstoneKey(kind, id));
         return Promise.resolve(at ? new Date(at) : null);
       },
-      rollBackImport(kind, id) {
+      rollBackImport(kind, id, at) {
         if (kind === "grant") {
-          if (oauthGrants.get(id)?.source !== "import") return Promise.resolve(false);
+          if (oauthGrants.get(id)?.source !== "import") return Promise.resolve(null);
           dropGrant(id, null);
-          return Promise.resolve(true);
+          return Promise.resolve([]);
         }
-        if (oauthClients.get(id)?.source !== "import") return Promise.resolve(false);
-        dropClient(id, null);
-        return Promise.resolve(true);
+        if (oauthClients.get(id)?.source !== "import") return Promise.resolve(null);
+        return Promise.resolve(dropClient(id, at, false));
       },
     },
   };

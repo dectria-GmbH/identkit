@@ -586,6 +586,50 @@ describe("oauth import after an end (review a2 B r1 M1)", () => {
     expect(await t.ik.oauth.importGrant(grantInput)).toEqual({ status: "imported" });
   });
 
+  it("a client rollback ends the grant that a concurrent import attached to it", async () => {
+    const t = importSetup();
+    const accountId = await t.account();
+    const clientInput = publicClient({ id: `attached-${accountId}` });
+    const now = t.clock.now().getTime();
+    const grantInput: ImportOAuthGrantInput = {
+      id: `attached-g-${accountId}`,
+      accountId,
+      clientId: clientInput.id,
+      scopes: ["mcp:read"],
+      resource: RESOURCE,
+      createdAt: new Date(now - DAY),
+      expiresAt: new Date(now + DAY),
+      generation: 1,
+      refreshExpiresAt: new Date(now + DAY),
+      refreshSha256: sha256Hex("attached"),
+    };
+    // The sink is slow on the client's event: the grant import commits, then the sink refuses.
+    const emit = t.audit.emit.bind(t.audit);
+    t.audit.emit = async (event) => {
+      if (event.type !== "oauth.client_imported") return emit(event);
+      t.audit.emit = emit;
+      expect(await t.ik.oauth.importGrant(grantInput)).toEqual({ status: "imported" });
+      throw new Error("sink down");
+    };
+    await expect(t.ik.oauth.importClient(clientInput)).rejects.toBeInstanceOf(
+      OAuthClientRolledBackError,
+    );
+    expect(await t.ik.oauth.listGrants(accountId)).toEqual([]);
+    // The grant passed its own audit record, so its end is recorded too.
+    expect(t.audit.ofType("oauth.grant_imported")).toHaveLength(1);
+    const ended = t.audit.ofType("oauth.grant_ended");
+    expect(ended).toHaveLength(1);
+    expect(ended[0]).toMatchObject({
+      accountId,
+      clientId: clientInput.id,
+      grantId: grantInput.id,
+      reason: "client_deleted",
+    });
+    // The client import did not happen and may run again; the grant stays ended.
+    expect((await t.ik.oauth.importClient(clientInput)).status).toBe("imported");
+    expect(await t.ik.oauth.importGrant(grantInput)).toEqual({ status: "revoked" });
+  });
+
   it("an end that races with the import's store write still answers revoked", async () => {
     // The store's import runs after a concurrent end wrote the tombstone: the store refuses.
     const inner = createMemoryStore();

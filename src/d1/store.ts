@@ -1714,15 +1714,35 @@ export function createD1Store(db: D1DatabaseLike, options: D1StoreOptions = {}):
         );
         return r ? date(r["ended_at"]) : null;
       },
-      async rollBackImport(kind, id) {
-        // One DELETE, no tombstone. The foreign keys remove a grant's access tokens, and a
-        // client's grants and codes.
-        const table = kind === "grant" ? "identkit_oauth_grants" : "identkit_oauth_clients";
-        const r = await one(
-          `DELETE FROM ${table} WHERE id = ?1 AND source = 'import' RETURNING id`,
-          id,
-        );
-        return r !== null;
+      async rollBackImport(kind, id, at) {
+        if (kind === "grant") {
+          // One DELETE, no tombstone. The foreign key removes the grant's access tokens.
+          const r = await one(
+            "DELETE FROM identkit_oauth_grants WHERE id = ?1 AND source = 'import' RETURNING id",
+            id,
+          );
+          return r === null ? null : [];
+        }
+        // One batch, as in `deleteClient`: the client gets no tombstone, its grants do. Every
+        // statement matches only while the client is an imported one. The foreign keys remove
+        // the grants' access tokens and the client's codes.
+        const imported =
+          "EXISTS (SELECT 1 FROM identkit_oauth_clients WHERE id = ?1 AND source = 'import')";
+        const [, grants, client] = await db.batch([
+          db.prepare(tombstoneGrants(`client_id = ?1 AND ${imported}`, "?2")).bind(id, ms(at)),
+          db
+            .prepare(
+              `DELETE FROM identkit_oauth_grants WHERE client_id = ?1 AND ${imported}
+               RETURNING ${OAUTH_GRANT_COLUMNS}`,
+            )
+            .bind(id),
+          db
+            .prepare(
+              "DELETE FROM identkit_oauth_clients WHERE id = ?1 AND source = 'import' RETURNING id",
+            )
+            .bind(id),
+        ]);
+        return batchRows(client).length === 1 ? batchRows(grants).map(toOAuthGrant) : null;
       },
     },
   };

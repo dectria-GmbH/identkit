@@ -19,6 +19,7 @@ import {
   toClientView,
   type OAuthInternals,
 } from "./common.js";
+import { emitOAuthGrantsEnded } from "./grant-end.js";
 import type { OAuthClientView } from "./options.js";
 import { parseRedirectUri } from "./redirect-uris.js";
 
@@ -314,10 +315,19 @@ export function createImport(internals: OAuthInternals) {
           reason: algorithm ?? "none",
         });
       } catch (error) {
-        // No client stands without its audit record. The delete writes no tombstone: for the
-        // audit trail the import did not happen, so a retry may import it. If the delete fails,
-        // its error goes up and the client stands without its record.
-        await store.rollBackImport("client", id);
+        // No client stands without its audit record. The delete writes no tombstone for the
+        // client: for the audit trail its import did not happen, so a retry may import it. If
+        // the delete fails, its error goes up and the client stands without its record.
+        const ended = await store.rollBackImport("client", id, clock.now());
+        // A grant that a concurrent call attached to the client did happen: the store wrote
+        // its tombstone, and its end is recorded here, best effort (the sink just refused).
+        for (const grant of ended ?? []) {
+          try {
+            await emitOAuthGrantsEnded(ctx, grant.accountId, [grant], "client_deleted");
+          } catch {
+            // The rollback error below goes up in any case.
+          }
+        }
         throw new OAuthClientRolledBackError(id, { cause: error });
       }
       return { status: "imported", client: toClientView(record) };
@@ -437,7 +447,7 @@ export function createImport(internals: OAuthInternals) {
         // No grant stands without its audit record. The delete writes no tombstone: for the
         // audit trail the import did not happen, so a retry may import it. If the delete fails,
         // its error goes up and the grant stands without its record.
-        await store.rollBackImport("grant", id);
+        await store.rollBackImport("grant", id, clock.now());
         throw new OperationRolledBackError(accountId, { cause: error, hookFailed: false });
       }
       return { status: "imported" };

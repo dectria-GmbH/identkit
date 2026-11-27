@@ -398,6 +398,46 @@ const oauthAccessTokenRow = (t: OAuthAccessTokenRecord) => ({
  * first (`migrateIdentkit` or the files in `migrations/`). Each guarded method is one
  * conditional statement or one transaction with a row lock.
  */
+/**
+ * Deletes the client with its grants and codes, and returns the grants, or null. Imported grants
+ * get their tombstones. The client gets one too, unless this rolls back its import (`rollBack`):
+ * then it matches only an imported client and writes no tombstone for it.
+ */
+async function endClient(
+  db: Kysely<IdentkitDatabase>,
+  id: string,
+  at: Date,
+  rollBack: boolean,
+): Promise<OAuthGrantRecord[] | null> {
+  return db
+    .transaction()
+    .setIsolationLevel("read committed")
+    .execute(async (trx) => {
+      // The row lock first: a concurrent grant insert or import takes a key share lock on the
+      // client before it touches any grant row, so it waits here, then fails on the deleted
+      // client. Without this lock, the client delete could cascade a grant committed after the
+      // grant delete below. Both sides lock the client before any grant row, so they never wait
+      // on each other in a cycle (a replacing insert holds the row lock of the grant it deletes).
+      let lock = trx
+        .selectFrom("identkit_oauth_clients")
+        .select(["id", "source"])
+        .where("id", "=", id);
+      if (rollBack) lock = lock.where("source", "=", "import");
+      const client = await lock.forUpdate().executeTakeFirst();
+      if (!client) return null;
+      const grants = await trx
+        .deleteFrom("identkit_oauth_grants")
+        .where("client_id", "=", id)
+        .returningAll()
+        .execute();
+      // The foreign keys remove the grants' access tokens and the client's codes.
+      await trx.deleteFrom("identkit_oauth_clients").where("id", "=", id).execute();
+      await writeTombstones(trx, "grant", grants, at);
+      if (!rollBack) await writeTombstones(trx, "client", [client], at);
+      return grants.map(toOAuthGrant);
+    });
+}
+
 export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore {
   return {
     accounts: {
@@ -1343,34 +1383,7 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
         return row !== undefined;
       },
       async deleteClient(id, at) {
-        return db
-          .transaction()
-          .setIsolationLevel("read committed")
-          .execute(async (trx) => {
-            // The row lock first: a concurrent grant insert or import takes a key share lock on
-            // the client before it touches any grant row, so it waits here, then fails on the
-            // deleted client. Without this lock, the client delete could cascade a grant committed
-            // after the grant delete below. Both sides lock the client before any grant row, so
-            // they never wait on each other in a cycle (a replacing insert holds the row lock of
-            // the grant it deletes).
-            const client = await trx
-              .selectFrom("identkit_oauth_clients")
-              .select(["id", "source"])
-              .where("id", "=", id)
-              .forUpdate()
-              .executeTakeFirst();
-            if (!client) return null;
-            const grants = await trx
-              .deleteFrom("identkit_oauth_grants")
-              .where("client_id", "=", id)
-              .returningAll()
-              .execute();
-            // The foreign keys remove the grants' access tokens and the client's codes.
-            await trx.deleteFrom("identkit_oauth_clients").where("id", "=", id).execute();
-            await writeTombstones(trx, "grant", grants, at);
-            await writeTombstones(trx, "client", [client], at);
-            return grants.map(toOAuthGrant);
-          });
+        return endClient(db, id, at, false);
       },
       async reserveRegistration({ keys, windowStart }) {
         // One upsert per key, in order. Each is atomic: the row lock of ON CONFLICT DO UPDATE
@@ -1758,24 +1771,17 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           .executeTakeFirst();
         return row ? row.ended_at : null;
       },
-      async rollBackImport(kind, id) {
-        // One DELETE, no tombstone. A client delete locks the client row first and then
-        // cascades its grants and codes, the lock order of `deleteClient`.
-        const row =
-          kind === "grant"
-            ? await db
-                .deleteFrom("identkit_oauth_grants")
-                .where("id", "=", id)
-                .where("source", "=", "import")
-                .returning("id")
-                .executeTakeFirst()
-            : await db
-                .deleteFrom("identkit_oauth_clients")
-                .where("id", "=", id)
-                .where("source", "=", "import")
-                .returning("id")
-                .executeTakeFirst();
-        return row !== undefined;
+      async rollBackImport(kind, id, at) {
+        // A client goes as in `deleteClient`, with the same lock order, and only its grants
+        // get tombstones. A grant goes in one DELETE, without a tombstone.
+        if (kind === "client") return endClient(db, id, at, true);
+        const row = await db
+          .deleteFrom("identkit_oauth_grants")
+          .where("id", "=", id)
+          .where("source", "=", "import")
+          .returning("id")
+          .executeTakeFirst();
+        return row === undefined ? null : [];
       },
     },
   };

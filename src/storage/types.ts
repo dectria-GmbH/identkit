@@ -647,8 +647,9 @@ export interface IdentkitStore {
    *
    * Import tombstones: every call that deletes a grant or a client whose `source` is `import`
    * writes a tombstone of its kind and id, atomically with the delete, with the time `at` of the
-   * call. Only `rollBackImport` deletes without one. Inserts and imports refuse an id that a
-   * tombstone names, so an ended imported grant or client never comes back by a new import.
+   * call. Only `rollBackImport` deletes the rolled-back row itself without one. Inserts and
+   * imports refuse an id that a tombstone names, so an ended imported grant or client never
+   * comes back by a new import.
    */
   oauth?: {
     /**
@@ -760,10 +761,16 @@ export interface IdentkitStore {
     findImportTombstone(kind: OAuthImportTombstoneKind, id: string): Promise<Date | null>;
     /**
      * Deletes an imported grant or client whose import the audit sink refused, without a
-     * tombstone: for the audit trail the import did not happen, so a retry may import it again.
-     * Matches only a row whose `source` is `import`. A client delete takes its grants and codes,
-     * without tombstones either. Returns false if no such row exists.
+     * tombstone for it: for the audit trail the import did not happen, so a retry may import it
+     * again. Matches only a row whose `source` is `import`. A client delete takes its grants and
+     * codes, and returns the grants; these did happen, so each imported one gets its tombstone
+     * with the time `at`, atomically with the delete. Returns null if no such row exists, and
+     * an empty list for a grant.
      */
-    rollBackImport(kind: OAuthImportTombstoneKind, id: string): Promise<boolean>;
+    rollBackImport(
+      kind: OAuthImportTombstoneKind,
+      id: string,
+      at: Date,
+    ): Promise<OAuthGrantRecord[] | null>;
   };
 }
