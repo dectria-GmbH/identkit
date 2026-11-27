@@ -52,6 +52,7 @@ export {
   InvalidArgumentError,
   MethodNotAllowedError,
   NotConfiguredError,
+  PasskeyCleanupError,
 } from "./errors.js";
 export { normalizeEmail, InvalidEmailError } from "./email.js";
 export type { RequestCodeResult, CodeFailure } from "./email-otp.js";

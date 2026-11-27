@@ -15,7 +15,10 @@ export interface ThrottleState {
   consecutiveFailures: number;
 }
 
-/** Lock duration for the next lock: `lockSeconds * 2^lockCount`, at most `maxLockSeconds`. */
+/**
+ * Lock duration for the next lock: `lockSeconds * 2^lockCount`, at most `maxLockSeconds`. A
+ * store does not need it: `applyThrottle` computes the lock.
+ */
 export function lockDuration(rule: ThrottleRule, lockCount: number): number {
   const factor = 2 ** Math.min(lockCount, 30);
   return Math.min(rule.lockSeconds * factor, rule.maxLockSeconds);

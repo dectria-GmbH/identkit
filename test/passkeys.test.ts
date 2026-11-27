@@ -533,6 +533,42 @@ describe("passkey step-up and removal", () => {
     expect(await t.ik.sessions.validate(user.token)).toBeNull();
   });
 
+  it("an administrative revoke that fails after the token revocation still records it", async () => {
+    for (const failing of ["delete", "revokeAll"] as const) {
+      const { inner, store, hooks } = hookedTotpStore();
+      let deleteFails = false;
+      const wrapped = {
+        ...store,
+        credentials: {
+          ...store.credentials,
+          delete: async (...args: Parameters<typeof inner.credentials.delete>) => {
+            if (deleteFails) {
+              deleteFails = false;
+              throw new Error("store unavailable");
+            }
+            return inner.credentials.delete(...args);
+          },
+        },
+      };
+      const t = setup({ store: wrapped });
+      const user = await t.userWithPasskey("person@example.org");
+      await t.ik.passkeys.issueEnrollmentToken(user.account.id);
+      if (failing === "delete") deleteFails = true;
+      else hooks.failRevokeAll = 1;
+      await expect(
+        t.ik.passkeys.revoke(user.account.id, user.credentialId),
+        failing,
+      ).rejects.toThrow("store unavailable");
+      // The tokens are revoked, so a retry revokes none and cannot record it any more.
+      expect(t.audit.ofType("enrollment.revoked"), failing).toMatchObject([
+        { accountId: user.account.id, reason: "passkey_revoked" },
+      ]);
+      await t.ik.passkeys.revoke(user.account.id, user.credentialId);
+      expect(t.audit.ofType("enrollment.revoked"), failing).toHaveLength(1);
+      expect(await t.ik.passkeys.list(user.account.id), failing).toHaveLength(0);
+    }
+  });
+
   it("a removal retried after a failed session revocation still ends the other sessions", async () => {
     const { store, hooks } = hookedTotpStore();
     const t = setup({ store });

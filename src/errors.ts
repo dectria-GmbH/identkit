@@ -3,8 +3,9 @@ export class IdentkitError extends Error {
   constructor(
     readonly code: string,
     message: string,
+    options?: ErrorOptions,
   ) {
-    super(message);
+    super(message, options);
     this.name = new.target.name;
   }
 }
@@ -33,5 +34,24 @@ export class NotConfiguredError extends IdentkitError {
 export class InvalidArgumentError extends IdentkitError {
   constructor(message: string) {
     super("invalid_argument", message);
+  }
+}
+
+/**
+ * A passkey registration lost its grant after the passkey was activated, and identkit could
+ * neither delete the passkey nor disable the account. The passkey may still sign in. Remove it
+ * with `passkeys.revoke(accountId, credentialId)`. `cause` holds the store error.
+ */
+export class PasskeyCleanupError extends IdentkitError {
+  constructor(
+    readonly accountId: string,
+    readonly credentialId: string,
+    options?: ErrorOptions,
+  ) {
+    super(
+      "passkey_cleanup_failed",
+      "a passkey without a valid grant may still be active; revoke it with passkeys.revoke",
+      options,
+    );
   }
 }

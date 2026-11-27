@@ -3,6 +3,7 @@
   "version": "0.1.1",
   "description": "Identity toolkit for TypeScript: accounts, e-mail codes, passkeys, TOTP, sessions, step-up and approval evidence.",
   "license": "MIT",
+  "author": "dectria GmbH",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/dectria-GmbH/identkit.git"

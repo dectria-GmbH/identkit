@@ -216,10 +216,17 @@ export interface IdentkitStore {
      * Atomically counts one attempt for `key` under `rule`: both limits, the timed release and
      * the doubling lock. A custom store must call `applyThrottle` (exported by identkit) on the
      * stored state inside its own atomic section and save every field of the result; a store
-     * that skips a field skips a limit.
+     * that skips a field skips a limit. For a key without stored state, pass `null`. Returns
+     * the `result` of `applyThrottle`.
      */
     reserve(key: string, at: Date, rule: ThrottleRule): Promise<ThrottleResult>;
+    /** The stored `lockedUntil` while `at` is before it, else null. Writes nothing. */
     peek(key: string, at: Date): Promise<Date | null>;
+    /**
+     * Removes every field of the key: attempts, window, lock, lock count and consecutive count.
+     * A reset that keeps the consecutive count or the lock count leaves a success or an unlock
+     * incomplete.
+     */
     reset(key: string): Promise<void>;
   };
   sessions: {

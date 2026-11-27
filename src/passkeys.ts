@@ -3,6 +3,7 @@ import type { Context } from "./context.js";
 import { enrolledSecondFactors, factorChangeStepUp, hasFreshStepUp } from "./second-factor.js";
 import { isTokenShaped, randomToken } from "./crypto.js";
 import { assertMethodAllowed } from "./email-otp.js";
+import { PasskeyCleanupError } from "./errors.js";
 import type { PasskeyCore } from "./passkey-core.js";
 import { toAccountView, type AccountView } from "./accounts.js";
 import type { IssuedSession, SessionInternals, Sessions } from "./sessions.js";
@@ -59,6 +60,10 @@ export interface PasskeyInfo {
 
 export interface Passkeys {
   startRegistration(grant: RegistrationGrant): Promise<StartRegistrationResult>;
+  /**
+   * Throws `PasskeyCleanupError` if the grant was lost after the activation and the store
+   * failed to delete the new passkey and to disable the account: the passkey may still sign in.
+   */
   finishRegistration(
     grant: RegistrationGrant,
     response: RegistrationResponseJSON,
@@ -88,7 +93,9 @@ export interface Passkeys {
   /**
    * Administrative removal after loss or theft. Revokes all sessions and all enrollment
    * tokens of the account, on every call: also when the passkey is already gone, so a retry
-   * after an error completes the revocation. Returns false if no passkey was removed.
+   * after an error completes the revocation. Returns false if no passkey was removed. If it
+   * throws after the token revocation, it records `enrollment.revoked` first (best effort),
+   * because a retry finds no token to revoke.
    */
   revoke(accountId: string, credentialId: string): Promise<boolean>;
   /**
@@ -327,6 +334,8 @@ export function createPasskeys(
         store.credentials.delete(verified.credentialId, account.id, verified.publicKey);
       const disable = async () => store.accounts.setStatus(account.id, "disabled");
       const undo = async () => {
+        let failed = false;
+        let failure: unknown;
         try {
           // One retry: a passkey that survives here could sign in again later.
           await remove().catch(remove);
@@ -353,20 +362,30 @@ export function createPasskeys(
               .emit({ type: "account.disabled", accountId: account.id, reason: "passkey_cleanup" })
               .catch(() => undefined);
           }
-          throw error;
-        } finally {
-          await sessions.revokeAll(account.id).catch(async (error: unknown) => {
-            // Other sessions may survive: record it, then fail.
-            await ctx
-              .emit({
-                type: "passkey.registration_failed",
-                accountId: account.id,
-                reason: "cleanup_failed",
-              })
-              .catch(() => undefined);
-            throw error;
-          });
+          failed = true;
+          // The audit event above is best effort. If the account is still active, the caller
+          // must learn that a passkey without a grant may sign in.
+          failure = disabled
+            ? error
+            : new PasskeyCleanupError(account.id, verified.credentialId, { cause: error });
         }
+        try {
+          await sessions.revokeAll(account.id);
+        } catch (error) {
+          // Other sessions may survive: record it, then fail.
+          await ctx
+            .emit({
+              type: "passkey.registration_failed",
+              accountId: account.id,
+              reason: "cleanup_failed",
+            })
+            .catch(() => undefined);
+          if (!(failure instanceof PasskeyCleanupError)) {
+            failed = true;
+            failure = error;
+          }
+        }
+        if (failed) throw failure;
       };
       let activated = false;
       let outcome: true | RegistrationDenied;
@@ -381,8 +400,11 @@ export function createPasskeys(
           ? await grantStillHolds(grant, resolved, account.id, verified.credentialId)
           : { status: "denied", reason: "no_session" };
       } catch (error) {
-        // Keep the original error; `undo` records its own failure.
-        await undo().catch(() => undefined);
+        // Keep the original error; `undo` records its own failure. A passkey that may still
+        // be active on an active account outweighs it: that error goes up instead.
+        await undo().catch((undoError: unknown) => {
+          if (undoError instanceof PasskeyCleanupError) throw undoError;
+        });
         throw error;
       }
       if (outcome !== true) {
@@ -536,24 +558,33 @@ export function createPasskeys(
     async revoke(accountId, credentialId) {
       // Tokens first: a registration that runs with one of them fails its check after the insert.
       const revokedTokens = await store.enrollment.revokeAllForAccount(accountId, clock.now());
-      const removed = await store.credentials.delete(credentialId, accountId);
+      const tokensEvent =
+        revokedTokens > 0
+          ? ({ type: "enrollment.revoked", accountId, reason: "passkey_revoked" } as const)
+          : null;
       const removedEvent = {
         type: "passkey.removed",
         accountId,
         credentialId,
         reason: "administrative",
       } as const;
-      // Always, also when the passkey is gone: a retry after a failed revocation must still
-      // end the sessions. Revoke before the audit events, so a failing sink skips nothing.
-      await revokeRecordingRemoval(
-        () => sessions.revokeAll(accountId),
-        removed ? removedEvent : null,
-      );
-      // The removal first: a retry finds no passkey and cannot record it any more.
-      if (removed) await ctx.emit(removedEvent);
-      if (revokedTokens > 0) {
-        await ctx.emit({ type: "enrollment.revoked", accountId, reason: "passkey_revoked" });
+      let removed: boolean;
+      try {
+        removed = await store.credentials.delete(credentialId, accountId);
+        // Always, also when the passkey is gone: a retry after a failed revocation must still
+        // end the sessions. Revoke before the audit events, so a failing sink skips nothing.
+        await revokeRecordingRemoval(
+          () => sessions.revokeAll(accountId),
+          removed ? removedEvent : null,
+        );
+        // The removal first: a retry finds no passkey and cannot record it any more.
+        if (removed) await ctx.emit(removedEvent);
+      } catch (error) {
+        // A retry finds no open token and cannot record the token revocation any more.
+        if (tokensEvent) await ctx.emit(tokensEvent).catch(() => undefined);
+        throw error;
       }
+      if (tokensEvent) await ctx.emit(tokensEvent);
       return removed;
     },
 

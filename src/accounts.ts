@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { randomId } from "./crypto.js";
 import { normalizeEmail } from "./email.js";
 import { throttleKey as otpThrottleKey } from "./email-otp.js";
-import { enrolmentThrottleKey, throttleKey as totpThrottleKey } from "./totp.js";
+import { totpEnrolmentThrottleKey, totpThrottleKey } from "./throttle-keys.js";
 import type { AccountRecord } from "./storage/types.js";
 
 export interface AccountView {
@@ -37,7 +37,8 @@ export interface Accounts {
    * Lifts the failure locks of the account: e-mail codes of its address (sign-in and step-up)
    * and TOTP (checks and enrolment confirmation). Clears the lock, the lock length and both
    * failure counts, as a success would. Returns false if the account does not exist.
-   * Operator only: a caller who can unlock can guess without limit.
+   * Operator only: a caller who can unlock can guess without limit. The audit event
+   * `lockout.released` is written before the resets: if a reset throws, call again.
    */
   unlock(accountId: string): Promise<boolean>;
   /**
@@ -77,12 +78,10 @@ export function createAccounts(
 ): Accounts {
   const { store, clock, hasher } = ctx;
 
-  /** Resets the e-mail code throttles of a normalized address. Returns its digest. */
-  async function releaseAddress(email: string): Promise<string> {
-    const addressDigest = await hasher.digest("address", email);
+  /** Resets the e-mail code throttles of an address digest. */
+  async function releaseAddress(addressDigest: string): Promise<void> {
     await store.throttle.reset(otpThrottleKey("sign_in", addressDigest));
     await store.throttle.reset(otpThrottleKey("step_up", addressDigest));
-    return addressDigest;
   }
 
   return {
@@ -105,20 +104,33 @@ export function createAccounts(
     async unlock(accountId) {
       const record = await store.accounts.findById(accountId);
       if (!record) return false;
-      const addressDigest = await releaseAddress(record.email);
-      await store.throttle.reset(totpThrottleKey(accountId));
-      await store.throttle.reset(enrolmentThrottleKey(accountId));
+      // Normalized like a code request, also for a row written outside identkit. A malformed
+      // address never got a code lock (every code path normalizes first), so keep it as is.
+      let email = record.email;
+      try {
+        email = normalizeEmail(record.email);
+      } catch {
+        // Keep the stored value: its TOTP locks must still be lifted.
+      }
+      const addressDigest = await hasher.digest("address", email);
+      // The event first: a reset that fails after an earlier one lifted a lock must not leave
+      // a released lock without its audit record. A retry writes the event again.
       await ctx.emit({
         type: "lockout.released",
         accountId,
         addressDigest,
         reason: "administrative",
       });
+      await releaseAddress(addressDigest);
+      await store.throttle.reset(totpThrottleKey(accountId));
+      await store.throttle.reset(totpEnrolmentThrottleKey(accountId));
       return true;
     },
     async unlockAddress(email) {
-      const addressDigest = await releaseAddress(normalizeEmail(email));
+      const addressDigest = await hasher.digest("address", normalizeEmail(email));
+      // The event first, as in `unlock`.
       await ctx.emit({ type: "lockout.released", addressDigest, reason: "administrative" });
+      await releaseAddress(addressDigest);
     },
     async disable(accountId) {
       const record = await store.accounts.findById(accountId);

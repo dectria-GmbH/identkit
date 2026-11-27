@@ -169,6 +169,63 @@ describe.skipIf(!url)("postgresql", () => {
     expect(approvals.filter((a) => a.status === "approved")).toHaveLength(1);
   });
 
+  it("enrollment: revokeAllForAccount waits for the account row lock that issue takes", async () => {
+    const database = db;
+    if (!database) throw new Error("database not initialised");
+    const t = setup({ store: requireStore() });
+    const created = await t.ik.accounts.create({ email: "pg-enrollment@example.org" });
+    if (created.status !== "created") throw new Error("not created");
+    const accountId = created.account.id;
+    const at = t.clock.now();
+
+    // A transaction that holds the account row lock, as a running `issue` does, and inserts a
+    // token only after the revocation started.
+    let lockTaken!: () => void;
+    const locked = new Promise<void>((resolve) => (lockTaken = resolve));
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => (release = resolve));
+    const holder = database.transaction().execute(async (trx) => {
+      await trx
+        .selectFrom("identkit_accounts")
+        .select("id")
+        .where("id", "=", accountId)
+        .forUpdate()
+        .executeTakeFirst();
+      lockTaken();
+      await released;
+      await trx
+        .insertInto("identkit_enrollment_tokens")
+        .values({
+          token_digest: `pg-lock-${randomBytes(8).toString("hex")}`,
+          account_id: accountId,
+          created_at: at,
+          expires_at: new Date(at.getTime() + 60_000),
+          consumed_at: null,
+          revoked_at: null,
+        })
+        .execute();
+    });
+    await locked;
+
+    let settled = false;
+    const revoking = requireStore()
+      .enrollment.revokeAllForAccount(accountId, at)
+      .then((count) => {
+        settled = true;
+        return count;
+      });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      // Without the row lock the revocation would finish now and miss the token below.
+      expect(settled).toBe(false);
+    } finally {
+      // Never leave the transaction open: it would block the schema drop.
+      release();
+      await holder;
+    }
+    expect(await revoking).toBe(1);
+  });
+
   it("flows: session timeouts and revocation against PostgreSQL", async () => {
     const t = setup({ store: requireStore() });
     const { token } = await t.signIn("pg-session@example.org");

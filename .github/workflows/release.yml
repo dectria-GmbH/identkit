@@ -108,4 +108,9 @@ jobs:
             echo "Expected one tarball in pack/, found $#" >&2
             exit 1
           fi
+          # An unmatched glob stays literal, so "$#" is 1 also when pack/ holds no tarball.
+          if [ ! -f "$1" ]; then
+            echo "No tarball in pack/: the artifact download produced no .tgz file" >&2
+            exit 1
+          fi
           npm publish "./$1" --provenance --access public
