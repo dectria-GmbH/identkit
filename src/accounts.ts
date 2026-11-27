@@ -4,6 +4,7 @@ import { randomId } from "./crypto.js";
 import { normalizeEmail } from "./email.js";
 import { throttleKey as otpThrottleKey } from "./email-otp.js";
 import { totpEnrolmentThrottleKey, totpThrottleKey } from "./throttle-keys.js";
+import { finishThenRunHook, type RunHook } from "./sessions.js";
 import type { AccountRecord } from "./storage/types.js";
 
 export interface AccountView {
@@ -74,7 +75,7 @@ export function newAccountRecord(email: string, createdAt: Date): AccountRecord 
 
 export function createAccounts(
   ctx: Context,
-  revokeAll: (accountId: string) => Promise<{ count: number; runHook: () => Promise<void> }>,
+  revokeAll: (accountId: string) => Promise<{ count: number; runHook: RunHook }>,
 ): Accounts {
   const { store, clock, hasher } = ctx;
 
@@ -137,9 +138,9 @@ export function createAccounts(
       if (!record) return;
       await store.accounts.setStatus(accountId, "disabled");
       const { runHook } = await revokeAll(accountId);
-      await ctx.emit({ type: "account.disabled", accountId });
-      // Last: a throwing hook must not skip the audit event. A retry reaches it again.
-      await runHook();
+      // Hook last: a throwing hook must not skip the audit event, nor a throwing sink the hook.
+      // A retry reaches both again.
+      await finishThenRunHook(runHook, () => ctx.emit({ type: "account.disabled", accountId }));
     },
   };
 }

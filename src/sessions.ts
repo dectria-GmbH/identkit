@@ -72,13 +72,40 @@ export interface SessionInternals {
   /**
    * Revokes like `sessions.revokeAll` but does not call the hook. The caller finishes its own
    * writes and audit events first and then calls `runHook`, so a throwing hook cannot leave
-   * identkit's state half-written or skip an audit event. `runHook` throws
-   * `AllSessionsRevokedHookError`.
+   * identkit's state half-written or skip an audit event. Use `finishThenRunHook` for the
+   * caller's events, so a throwing audit sink cannot skip the hook either. `runHook` throws
+   * `AllSessionsRevokedHookError`. If the sink throws on a `session.revoked` event here, this
+   * call runs the hook and then throws.
    */
   revokeAllDeferringHook(
     accountId: string,
     options?: { exceptSessionId?: string },
-  ): Promise<{ count: number; runHook: () => Promise<void> }>;
+  ): Promise<{ count: number; runHook: RunHook }>;
+}
+
+/**
+ * Runs the deferred `onAllSessionsRevoked` hook. `auditError` is the audit sink's error if the
+ * sink threw on an event of the same operation; a hook failure then carries it.
+ */
+export type RunHook = (options?: { auditError: unknown }) => Promise<void>;
+
+/**
+ * Runs `events`, the caller's own audit events (and the writes that follow them), then
+ * `runHook`, also when `events` throws: a throwing audit sink cannot skip the hook. If only
+ * `events` throws, its error goes up after the hook ran. If the hook throws, its
+ * `AllSessionsRevokedHookError` goes up and carries the error of `events` as `auditError`.
+ */
+export async function finishThenRunHook(
+  runHook: RunHook,
+  events: () => Promise<void>,
+): Promise<void> {
+  try {
+    await events();
+  } catch (error) {
+    await runHook({ auditError: error });
+    throw error;
+  }
+  await runHook();
 }
 
 /** What `onAllSessionsRevoked` receives after `sessions.revokeAll`. */
@@ -297,26 +324,35 @@ export function createSessions(
   async function revokeAllDeferringHook(
     accountId: string,
     options?: { exceptSessionId?: string },
-  ): Promise<{ count: number; runHook: () => Promise<void> }> {
+  ): Promise<{ count: number; runHook: RunHook }> {
     const ids = await store.sessions.revokeAllForAccount(
       accountId,
       clock.now(),
       "revoked_all",
       options?.exceptSessionId,
     );
-    for (const sessionId of ids) {
-      await ctx.emit({ type: "session.revoked", accountId, sessionId, reason: "revoked_all" });
-    }
     const exceptSessionId = options?.exceptSessionId ?? null;
     // Called also when no session was live, so a repeated `revokeAll` re-runs the hook.
-    const runHook = async () => {
+    const runHook: RunHook = async (hookOptions) => {
       if (!onAllSessionsRevoked) return;
       try {
         await onAllSessionsRevoked({ accountId, exceptSessionId, revokedSessionIds: [...ids] });
       } catch (error) {
-        throw new AllSessionsRevokedHookError(accountId, exceptSessionId, { cause: error });
+        throw new AllSessionsRevokedHookError(accountId, exceptSessionId, {
+          cause: error,
+          ...(hookOptions ? { auditError: hookOptions.auditError } : {}),
+        });
       }
     };
+    // The sessions are revoked: a throwing audit sink must not skip the hook.
+    try {
+      for (const sessionId of ids) {
+        await ctx.emit({ type: "session.revoked", accountId, sessionId, reason: "revoked_all" });
+      }
+    } catch (error) {
+      await runHook({ auditError: error });
+      throw error;
+    }
     return { count: ids.length, runHook };
   }
 

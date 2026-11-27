@@ -58,20 +58,26 @@ export class PasskeyCleanupError extends IdentkitError {
 
 /**
  * The option `onAllSessionsRevoked` threw. identkit finished its own work before it called the
- * hook: the identkit sessions are revoked, and the calling operation's writes and audit events
- * are complete. To re-run the hook, call
+ * hook: the identkit sessions are revoked, and the calling operation's writes are complete. Its
+ * audit events are complete too, unless `auditError` is set. To re-run the hook, call
  * `sessions.revokeAll(error.accountId, error.revokeAllOptions)`; that call is idempotent.
  * `cause` holds the hook's error.
  */
 export class AllSessionsRevokedHookError extends IdentkitError {
   /** The options for `sessions.revokeAll` that re-run the hook for the same sessions. */
   readonly revokeAllOptions: { exceptSessionId?: string };
+  /**
+   * The audit sink's error if the sink also threw on an audit event of the same operation, else
+   * undefined. identkit runs the hook also after a failing sink, and this error then wins,
+   * because only the hook needs a re-run. The audit event the sink refused may be missing.
+   */
+  readonly auditError: unknown;
 
   constructor(
     readonly accountId: string,
     /** The session that stayed live, or null. */
     readonly exceptSessionId: string | null,
-    options?: ErrorOptions,
+    options?: ErrorOptions & { auditError?: unknown },
   ) {
     super(
       "all_sessions_revoked_hook_failed",
@@ -79,5 +85,6 @@ export class AllSessionsRevokedHookError extends IdentkitError {
       options,
     );
     this.revokeAllOptions = exceptSessionId === null ? {} : { exceptSessionId };
+    this.auditError = options?.auditError;
   }
 }

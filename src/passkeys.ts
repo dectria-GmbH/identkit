@@ -6,7 +6,13 @@ import { assertMethodAllowed } from "./email-otp.js";
 import { PasskeyCleanupError } from "./errors.js";
 import type { PasskeyCore } from "./passkey-core.js";
 import { toAccountView, type AccountView } from "./accounts.js";
-import type { IssuedSession, SessionInternals, Sessions } from "./sessions.js";
+import {
+  finishThenRunHook,
+  type IssuedSession,
+  type RunHook,
+  type SessionInternals,
+  type Sessions,
+} from "./sessions.js";
 import type { AccountRecord, CredentialRecord, SessionRecord } from "./storage/types.js";
 import {
   authenticationOptions,
@@ -339,10 +345,10 @@ export function createPasskeys(
       // Returns the session hook, so the caller runs it after its own audit event. If `undo`
       // fails, it runs the hook best effort and throws its own failure, which the hook must not
       // replace.
-      const undo = async (): Promise<() => Promise<void>> => {
+      const undo = async (): Promise<RunHook> => {
         let failed = false;
         let failure: unknown;
-        let runHook = noHook;
+        let runHook: RunHook = noHook;
         try {
           // One retry: a passkey that survives here could sign in again later.
           await remove().catch(remove);
@@ -423,16 +429,17 @@ export function createPasskeys(
       }
       if (outcome !== true) {
         // Not activated means this registration's row is gone: nothing was usable, nothing to end.
-        let runHook = noHook;
+        let runHook: RunHook = noHook;
         if (activated) runHook = await undo();
         else await remove();
-        await ctx.emit({
-          type: "passkey.registration_failed",
-          accountId: account.id,
-          reason: "grant_changed",
-        });
-        // Last: a throwing hook must not skip the audit event.
-        await runHook();
+        // Hook last: a throwing hook must not skip the audit event, nor a throwing sink the hook.
+        await finishThenRunHook(runHook, () =>
+          ctx.emit({
+            type: "passkey.registration_failed",
+            accountId: account.id,
+            reason: "grant_changed",
+          }),
+        );
         return outcome;
       }
       // Revoke first: if the audit sink fails afterwards, no other session survives.
@@ -440,15 +447,17 @@ export function createPasskeys(
         account.id,
         resolved.sessionId ? { exceptSessionId: resolved.sessionId } : undefined,
       );
-      await ctx.emit({
-        type: "passkey.registered",
-        accountId: account.id,
-        credentialId: verified.credentialId,
-        method: resolved.enrollmentTokenDigest ? "enrollment_token" : "session",
-      });
-      // Last: the passkey is registered and recorded. A throwing hook surfaces as
+      // Hook last, also when the audit sink throws: the passkey is registered and a retried
+      // registration cannot reach the hook. A throwing hook surfaces as
       // `AllSessionsRevokedHookError`, which names how to re-run it.
-      await runHook();
+      await finishThenRunHook(runHook, () =>
+        ctx.emit({
+          type: "passkey.registered",
+          accountId: account.id,
+          credentialId: verified.credentialId,
+          method: resolved.enrollmentTokenDigest ? "enrollment_token" : "session",
+        }),
+      );
       return { status: "registered", credentialId: verified.credentialId, revokedSessions };
     },
 
@@ -573,9 +582,10 @@ export function createPasskeys(
           }),
         removed ? removedEvent : null,
       );
-      if (removed) await ctx.emit(removedEvent);
-      // Last: a throwing hook must not skip the audit event.
-      await runHook();
+      // Hook last: a throwing hook must not skip the audit event, nor a throwing sink the hook.
+      await finishThenRunHook(runHook, async () => {
+        if (removed) await ctx.emit(removedEvent);
+      });
       return removed ? { status: "removed" } : { status: "denied", reason: "not_found" };
     },
 
@@ -592,8 +602,12 @@ export function createPasskeys(
         credentialId,
         reason: "administrative",
       } as const;
+      // A retry finds no open token and cannot record the token revocation any more.
+      const recordTokensBestEffort = async () => {
+        if (tokensEvent) await ctx.emit(tokensEvent).catch(() => undefined);
+      };
       let removed: boolean;
-      let runHook: () => Promise<void>;
+      let runHook: RunHook;
       try {
         removed = await store.credentials.delete(credentialId, accountId);
         // Always, also when the passkey is gone: a retry after a failed revocation must still
@@ -602,16 +616,21 @@ export function createPasskeys(
           () => internals.revokeAllDeferringHook(accountId),
           removed ? removedEvent : null,
         ));
-        // The removal first: a retry finds no passkey and cannot record it any more.
-        if (removed) await ctx.emit(removedEvent);
       } catch (error) {
-        // A retry finds no open token and cannot record the token revocation any more.
-        if (tokensEvent) await ctx.emit(tokensEvent).catch(() => undefined);
+        await recordTokensBestEffort();
         throw error;
       }
-      if (tokensEvent) await ctx.emit(tokensEvent);
-      // Last: a throwing hook must not skip the audit events.
-      await runHook();
+      // Hook last: a throwing hook must not skip the audit events, nor a throwing sink the hook.
+      await finishThenRunHook(runHook, async () => {
+        try {
+          // The removal first: a retry finds no passkey and cannot record it any more.
+          if (removed) await ctx.emit(removedEvent);
+        } catch (error) {
+          await recordTokensBestEffort();
+          throw error;
+        }
+        if (tokensEvent) await ctx.emit(tokensEvent);
+      });
       return removed;
     },
 

@@ -349,8 +349,15 @@ Sessions:
   `totp.remove` whose factor is gone), so re-run the hook with
   `sessions.revokeAll(error.accountId, error.revokeAllOptions)`.
   `revokeAll` is idempotent and calls the hook also when no session was live. Make the hook
-  idempotent too. If an operation fails for another reason and rolls back (a failed passkey
-  registration or TOTP enrolment), the hook runs best effort and the original error goes up.
+  idempotent too. On such a re-run `revokedSessionIds` is empty, because the sessions are already
+  revoked: do not depend on it to find the sessions to end. If an operation fails for another
+  reason and rolls back (a failed passkey registration or TOTP enrolment), the hook runs best
+  effort and the original error goes up.
+- The hook runs also when the audit sink throws on the operation's own events, so a failing
+  sink cannot leave your application's sessions live. Then the sink's error goes up after the
+  hook ran. If the hook throws as well, `AllSessionsRevokedHookError` goes up, because only the
+  hook needs a re-run, and its `auditError` holds the sink's error: that audit event may be
+  missing. Without a sink failure, `auditError` is undefined.
 
 Passkeys:
 
@@ -395,8 +402,9 @@ Passkeys:
 - A registration that is already running is cancelled only by revocation, not by a token
   rotation: `rotate` and step-ups keep the session, so a registration started before them
   completes. Use `sessions.revokeById` or `revokeAll` to cut off a stolen session.
-- Registration, removal and revocation of a passkey revoke sessions before the audit event, so
-  a failing audit sink cannot skip the revocation.
+- Registration, removal and revocation of a passkey revoke sessions before the audit event and
+  call `onAllSessionsRevoked` after it, also when the audit sink throws. So a failing audit sink
+  skips neither the revocation nor the hook.
 - An e-mail sign-in checks the second-factor rule again after it created the session, so a first
   passkey registered at the same moment cannot leave a full session from a code alone.
 

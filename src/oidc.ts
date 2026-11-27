@@ -31,7 +31,12 @@ import {
   type ProviderInternals,
 } from "./oidc-providers.js";
 import type { SecretSealer } from "./sealer.js";
-import type { IssuedSession, SessionInternals } from "./sessions.js";
+import {
+  finishThenRunHook,
+  type IssuedSession,
+  type RunHook,
+  type SessionInternals,
+} from "./sessions.js";
 import type {
   AccountRecord,
   IdentkitStore,
@@ -782,7 +787,7 @@ export function createOidc(ctx: Context, internals: SessionInternals, options: O
       // Sessions before the audit event, so a failing sink cannot leave sessions of the removed
       // subject. Always, also when the link is gone: a retry must still reach the revocation
       // and the session hook.
-      let runHook: () => Promise<void>;
+      let runHook: RunHook;
       try {
         ({ runHook } = await internals.revokeAllDeferringHook(accountId));
       } catch (error) {
@@ -790,9 +795,10 @@ export function createOidc(ctx: Context, internals: SessionInternals, options: O
         if (removed && removedEvent) await ctx.emit(removedEvent).catch(() => undefined);
         throw error;
       }
-      if (removed && removedEvent) await ctx.emit(removedEvent);
-      // Last: a throwing hook must not skip the audit event.
-      await runHook();
+      // Hook last: a throwing hook must not skip the audit event, nor a throwing sink the hook.
+      await finishThenRunHook(runHook, async () => {
+        if (removed && removedEvent) await ctx.emit(removedEvent);
+      });
       return removed;
     },
   };
