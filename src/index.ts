@@ -54,6 +54,7 @@ export {
   NotConfiguredError,
   PasskeyCleanupError,
 } from "./errors.js";
+export { NodeCryptoUnavailableError } from "./node-crypto.js";
 export { normalizeEmail, InvalidEmailError } from "./email.js";
 export type { RequestCodeResult, CodeFailure } from "./email-otp.js";
 export type { EmailSignIn, EmailSignInResult } from "./email-sign-in.js";
@@ -70,7 +71,9 @@ export type { StepUp, StepUpResult } from "./step-up.js";
 export type { Sessions, SessionView, IssuedSession, StepUpCheck } from "./sessions.js";
 export {
   approvalChallenge,
+  approvalChallengeAsync,
   hashPayload,
+  hashPayloadAsync,
   checkApprovalEvidence,
   type Approvals,
   type ApprovalProof,

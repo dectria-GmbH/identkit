@@ -197,4 +197,11 @@ export const APPROVAL_CHALLENGES: [string, string, string, string][] = [
     "account-1",
     "_esywGNfViulcWWORfF3ijNSGn0PYRBbxJna0zYwDKo",
   ],
+  // A vector that a consumer pins in its documentation.
+  [
+    "q1w2e3r4t5y6u7i8o9p0aA",
+    "4f6066c89d67ce45f43d8b020042199188957dfbdb4e927c516c86a32788c5ce",
+    "00000000-0000-4000-8000-0000000000b1",
+    "iv-DzjO4su3htLYEbbm5iOKg3VYR60qzLHDhcZvjdYg",
+  ],
 ];

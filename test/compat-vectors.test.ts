@@ -2,9 +2,11 @@ import { createDecipheriv } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   approvalChallenge,
+  approvalChallengeAsync,
   createAesGcmSealer,
   createHmacHasher,
   hashPayload,
+  hashPayloadAsync,
   type HashPurpose,
 } from "../src/index.js";
 import {
@@ -64,13 +66,20 @@ describe("compatibility with values stored by identkit 0.1.1", () => {
     expect(Buffer.from(iv ?? "", "base64url").byteLength).toBe(12);
   });
 
-  it("rule: payload hashes and approval challenges match 0.1.1", () => {
+  it("rule: payload hashes match 0.1.1, sync and async", async () => {
     for (const [payload, digest] of PAYLOAD_HASHES) {
       const input = payload.startsWith("bytes:") ? hex(payload.slice(6)) : payload;
-      expect(hashPayload(input), payload).toBe(digest);
+      expect(hashPayload(input), `sync ${payload}`).toBe(digest);
+      expect(await hashPayloadAsync(input), `async ${payload}`).toBe(digest);
     }
+  });
+
+  it("rule: approval challenges match 0.1.1, sync and async", async () => {
     for (const [nonce, payloadHash, accountId, challenge] of APPROVAL_CHALLENGES) {
-      expect(approvalChallenge(nonce, payloadHash, accountId)).toBe(challenge);
+      expect(approvalChallenge(nonce, payloadHash, accountId), `sync ${nonce}`).toBe(challenge);
+      expect(await approvalChallengeAsync(nonce, payloadHash, accountId), `async ${nonce}`).toBe(
+        challenge,
+      );
     }
   });
 });

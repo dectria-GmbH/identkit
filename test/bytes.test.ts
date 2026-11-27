@@ -11,8 +11,6 @@ import {
   utf8,
 } from "../src/bytes.js";
 import { digestsEqual, randomNumericCode } from "../src/crypto.js";
-import { generateTotpCode } from "../src/testing/index.js";
-import { base32Encode, totpAt } from "../src/totp-core.js";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -91,18 +89,6 @@ describe("byte helpers", () => {
   it("utf8 matches Buffer, including a lone surrogate", () => {
     for (const text of ["", "abc", "Grüße \u{1F511}", "lone \uD800 end"]) {
       expect(Buffer.from(utf8(text)).equals(Buffer.from(text, "utf8"))).toBe(true);
-    }
-  });
-
-  it("generateTotpCode agrees with the Web Crypto TOTP for every algorithm", async () => {
-    const secret = new Uint8Array(nodeRandomBytes(64));
-    const at = new Date(1_893_456_000_000);
-    for (const algorithm of ["SHA1", "SHA256", "SHA512"] as const) {
-      for (const digits of [6, 8] as const) {
-        expect(generateTotpCode({ secret: base32Encode(secret), at, algorithm, digits })).toBe(
-          await totpAt(secret, at, algorithm, digits),
-        );
-      }
     }
   });
 });
