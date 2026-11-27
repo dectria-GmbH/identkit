@@ -391,13 +391,14 @@ export function createTokenEndpoint(internals: OAuthInternals) {
   /**
    * Rotates the grant for a presented refresh token: `presented.ref` is its fixed part, which
    * the new token keeps, and `presented.digest` the digest of the whole token. `lookup` is the
-   * grant that the ref names.
+   * grant that the ref names. `requestedResource` is the request's `resource`, if sent.
    */
   async function refreshGrant(
     client: OAuthClientRecord,
     lookup: OAuthGrantLookup,
     presented: { ref: string; digest: string },
     requestedScopes: string[] | null,
+    requestedResource?: string,
   ): Promise<OAuthEndpointResult> {
     const presentedDigest = presented.digest;
     const { grant } = lookup;
@@ -427,6 +428,8 @@ export function createTokenEndpoint(internals: OAuthInternals) {
       // An older token of this grant: a copy is in other hands. End the grant (RFC 9700 4.14.2).
       const ended = await store.deleteGrant(grant.id, { clientId: client.id });
       if (ended) await grantEnded(ended, "refresh_reuse");
+      // A concurrent call ended it first; record the attempt all the same.
+      else await failed(client, "refresh_unknown");
       return invalidGrant("The refresh token is invalid.");
     }
     if (
@@ -443,6 +446,11 @@ export function createTokenEndpoint(internals: OAuthInternals) {
     }
     if (requestedScopes !== null && !requestedScopes.every((s) => grant.scopes.includes(s))) {
       return errorResult(400, "invalid_scope", "The scope exceeds the grant.");
+    }
+    // The audience stays the grant's; another one is refused, as at the exchange (RFC 8707).
+    if (requestedResource !== undefined && requestedResource !== grant.resource) {
+      await failed(client, "resource_mismatch");
+      return errorResult(400, "invalid_target", "The resource differs from the authorization.");
     }
     // The policy may refuse; the grant then stays, as a personal token would.
     const refusal = await admitted(client, grant.accountId, "refresh", grant.scopes);
@@ -519,6 +527,7 @@ export function createTokenEndpoint(internals: OAuthInternals) {
       lookup,
       { ref, digest: await hasher.digest("oauth-refresh-token", token) },
       requestedScopes,
+      params.get("resource"),
     );
   }
 

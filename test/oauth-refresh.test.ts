@@ -137,6 +137,30 @@ describe("oauth refresh", () => {
     ]);
   });
 
+  it("refuses another resource at a refresh with invalid_target and keeps the grant", async () => {
+    const { ik, client, refreshToken, audit, accountId } = await connected();
+    const other = await client.refresh(refreshToken, { resource: "https://example.com" });
+    expect(other.body?.["error"]).toBe("invalid_target");
+    expect(audit.ofType("oauth.token_failed").map((e) => e.reason)).toEqual(["resource_mismatch"]);
+    expect(await ik.oauth.listGrants(accountId)).toHaveLength(1);
+    const same = await client.refresh(refreshToken, { resource: "https://example.com/mcp" });
+    expect(same.httpStatus).toBe(200);
+  });
+
+  it("records refresh_unknown when a reused token's grant was already ended", async () => {
+    const { client, refreshToken, audit, store, clock } = await connected();
+    const next = tokensOf(await client.refresh(refreshToken));
+    expect(next.refresh).toMatch(/^ikrt_/);
+    clock.advanceSeconds(60);
+    const oauthStore = store.oauth;
+    if (!oauthStore) throw new Error("no oauth store");
+    // A concurrent call ends the grant between the read and the delete.
+    oauthStore.deleteGrant = () => Promise.resolve(null);
+    expect((await client.refresh(refreshToken)).body?.["error"]).toBe("invalid_grant");
+    expect(audit.ofType("oauth.token_failed").map((e) => e.reason)).toEqual(["refresh_unknown"]);
+    expect(audit.ofType("oauth.grant_ended")).toEqual([]);
+  });
+
   it("refuses a malformed or unknown refresh token without ending anything", async () => {
     const { ik, client, accountId, audit } = await connected();
     for (const token of ["garbage", `ikrt_${"a".repeat(22)}.${"b".repeat(43)}`]) {
