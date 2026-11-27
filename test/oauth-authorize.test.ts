@@ -284,6 +284,17 @@ describe("oauth authorize.approve and deny", () => {
     expect(audit.ofType("oauth.consent_approved")).toEqual([]);
   });
 
+  it("deny with a gone client renders invalid_ticket and records nothing", async () => {
+    const { ik, audit, ticket, accountId, client } = await consent();
+    await ik.oauth.deleteClient(client.clientId);
+    expect(await ik.oauth.authorize.deny({ ticket, accountId })).toEqual({
+      status: "invalid",
+      error: "invalid_ticket",
+      description: "The request is invalid.",
+    });
+    expect(audit.ofType("oauth.consent_denied")).toEqual([]);
+  });
+
   it("a request without state redirects without state", async () => {
     const { ik, ticket, accountId } = await consent({}, { state: null });
     const approved = await ik.oauth.authorize.approve({ ticket, accountId });

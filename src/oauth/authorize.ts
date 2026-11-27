@@ -90,7 +90,10 @@ export interface OAuthAuthorize {
     accountId: string;
     optInScopes?: string[];
   }): Promise<AuthorizeDecisionResult>;
-  /** The person denied. Returns the redirect with `error=access_denied`, `state` and `iss`. */
+  /**
+   * The person denied. Returns the redirect with `error=access_denied`, `state` and `iss`. If
+   * the client is gone, or no longer has the redirect URI, returns `invalid_ticket` instead.
+   */
   deny(input: { ticket: string; accountId: string }): Promise<AuthorizeDecisionResult>;
 }
 
@@ -153,6 +156,12 @@ function redirectTo(uri: string, values: Record<string, string | null>): string 
   return `${uri}${separator}${query.toString()}`;
 }
 
+const invalidTicket = (): AuthorizeDecisionResult => ({
+  status: "invalid",
+  error: "invalid_ticket",
+  description: "The request is invalid.",
+});
+
 const invalid = (error: AuthorizeError, description: string): AuthorizeBeginResult => ({
   status: "invalid",
   error,
@@ -189,6 +198,18 @@ export function createAuthorize(internals: OAuthInternals): OAuthAuthorize {
     if (!found) return { refused: "no_account" as const };
     if (found.status !== "active") return { refused: "account_disabled" as const };
     return { account: found };
+  }
+
+  /**
+   * The client of a decision's ticket, or null if the client is gone or no longer has the
+   * ticket's redirect URI: both may change while the consent page is open.
+   */
+  async function ticketClient(ticket: Ticket): Promise<OAuthClientRecord | null> {
+    const client = await store.findClient(ticket.clientId);
+    if (!client || matchRedirectUri(client.redirectUris, ticket.redirectUri, rules) === null) {
+      return null;
+    }
+    return client;
   }
 
   /** The ticket of a decision, checked against the time and the account, or the reason. */
@@ -326,15 +347,8 @@ export function createAuthorize(internals: OAuthInternals): OAuthAuthorize {
       const { ticket, accountId } = decided;
       const checked = await account(accountId);
       if ("refused" in checked) return { status: "refused", reason: checked.refused };
-      // The client may be gone, or its redirect URIs changed, since the consent page opened.
-      const client = await store.findClient(ticket.clientId);
-      if (!client || matchRedirectUri(client.redirectUris, ticket.redirectUri, rules) === null) {
-        return {
-          status: "invalid",
-          error: "invalid_ticket",
-          description: "The request is invalid.",
-        };
-      }
+      const client = await ticketClient(ticket);
+      if (!client) return invalidTicket();
       const scopes = orderedScopes(settings, optIn);
       // Asked again: the policy may have changed while the consent page was open.
       const allowed = await admits(internals, {
@@ -380,6 +394,7 @@ export function createAuthorize(internals: OAuthInternals): OAuthAuthorize {
       const decided = await decisionTicket(input);
       if ("status" in decided) return decided;
       const { ticket, accountId } = decided;
+      if (!(await ticketClient(ticket))) return invalidTicket();
       await ctx.emit({
         type: "oauth.consent_denied",
         accountId,
