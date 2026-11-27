@@ -144,7 +144,8 @@ describe("oauth security review list", () => {
     const missing = await ik.oauth.token(
       web.credentials({ grant_type: "authorization_code", code, code_verifier: verifier }),
     );
-    expect(errorOf(missing)).toBe("invalid_request");
+    // The authorization request named it, so the token request must too (RFC 6749 4.1.3).
+    expect(errorOf(missing)).toBe("invalid_grant");
     // A loopback request that changed the port must repeat that exact URI.
     const loop = await createOAuthTestClient(ik.oauth);
     const ported = await loop.authorize(accountId, {

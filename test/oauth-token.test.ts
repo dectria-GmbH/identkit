@@ -188,6 +188,32 @@ describe("oauth token endpoint: code exchange", () => {
     );
   });
 
+  it("needs redirect_uri at the token endpoint only if the authorization request named it", async () => {
+    const { ik, client, accountId, audit } = await connected();
+    const withoutUri = (code: string, verifier: string) =>
+      ik.oauth.token(
+        client.credentials({ grant_type: "authorization_code", code, code_verifier: verifier }),
+      );
+    const omitted = await client.authorize(accountId, { redirectUri: null });
+    expect((await withoutUri(omitted.code, omitted.verifier)).httpStatus).toBe(200);
+    const omittedThenSent = await client.authorize(accountId, { redirectUri: null });
+    expect((await client.exchange(omittedThenSent.code, omittedThenSent.verifier)).httpStatus).toBe(
+      200,
+    );
+    const omittedThenWrong = await client.authorize(accountId, { redirectUri: null });
+    const wrong = await client.exchange(omittedThenWrong.code, omittedThenWrong.verifier, {
+      redirect_uri: "http://127.0.0.1/other",
+    });
+    expect(wrong.body?.["error"]).toBe("invalid_grant");
+    const named = await client.authorize(accountId);
+    const missing = await withoutUri(named.code, named.verifier);
+    expect(missing.body?.["error"]).toBe("invalid_grant");
+    expect(audit.ofType("oauth.token_failed").map((e) => e.reason)).toEqual([
+      "redirect_mismatch",
+      "redirect_mismatch",
+    ]);
+  });
+
   it("refuses an expired code, a disabled account and a policy refusal, each with token_failed", async () => {
     let verdict = true;
     const { ik, client, accountId, clock, audit } = await connected({

@@ -279,12 +279,8 @@ export function createTokenEndpoint(internals: OAuthInternals) {
     const code = params.get("code");
     const redirectUri = params.get("redirect_uri");
     const verifier = params.get("code_verifier");
-    if (code === undefined || redirectUri === undefined || verifier === undefined) {
-      return errorResult(
-        400,
-        "invalid_request",
-        "code, redirect_uri and code_verifier are required.",
-      );
+    if (code === undefined || verifier === undefined) {
+      return errorResult(400, "invalid_request", "code and code_verifier are required.");
     }
     if (!shapedAs(code, settings.prefixes.code)) {
       await failed(client, "code_unknown");
@@ -304,8 +300,13 @@ export function createTokenEndpoint(internals: OAuthInternals) {
     let failure: OAuthTokenFailure | null = null;
     if (now.getTime() >= record.expiresAt.getTime()) failure = "code_expired";
     else if (record.clientId !== client.id) failure = "client_mismatch";
-    else if (record.redirectUri !== redirectUri) failure = "redirect_mismatch";
+    // Required if the authorization request named it (RFC 6749 section 4.1.3); it must match
+    // whenever it is sent.
     else if (
+      redirectUri === undefined ? record.redirectUriExplicit : record.redirectUri !== redirectUri
+    ) {
+      failure = "redirect_mismatch";
+    } else if (
       !CODE_VERIFIER.test(verifier) ||
       !bytesEqual(utf8(toBase64Url(await sha256(utf8(verifier)))), utf8(record.codeChallenge))
     ) {

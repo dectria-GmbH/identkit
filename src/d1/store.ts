@@ -197,8 +197,8 @@ const OAUTH_GRANT_COLUMNS =
   "refresh_ref_digest, refresh_digest, refresh_digest_algorithm, previous_refresh_digest, " +
   "refreshed_at, refresh_expires_at, code_digest, source";
 const OAUTH_CODE_COLUMNS =
-  "digest, client_id, account_id, redirect_uri, code_challenge, resource, scopes, created_at, " +
-  "expires_at";
+  "digest, client_id, account_id, redirect_uri, redirect_uri_explicit, code_challenge, resource, " +
+  "scopes, created_at, expires_at";
 const OAUTH_ACCESS_TOKEN_COLUMNS = "digest, grant_id, generation, scopes, created_at, expires_at";
 /** The grant columns with the alias `g.`, for joins. */
 const OAUTH_GRANT_COLUMNS_G = OAUTH_GRANT_COLUMNS.split(", ")
@@ -242,6 +242,7 @@ const toOAuthCode = (r: Row): OAuthCodeRecord => ({
   clientId: text(r["client_id"]),
   accountId: text(r["account_id"]),
   redirectUri: text(r["redirect_uri"]),
+  redirectUriExplicit: integer(r["redirect_uri_explicit"]) === 1,
   codeChallenge: text(r["code_challenge"]),
   resource: text(r["resource"]),
   scopes: stringList(r["scopes"]),
@@ -1358,11 +1359,12 @@ export function createD1Store(db: D1DatabaseLike, options: D1StoreOptions = {}):
       async insertCode(code) {
         await run(
           `INSERT INTO identkit_oauth_codes (${OAUTH_CODE_COLUMNS})
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`,
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
           code.digest,
           code.clientId,
           code.accountId,
           code.redirectUri,
+          code.redirectUriExplicit ? 1 : 0,
           code.codeChallenge,
           code.resource,
           JSON.stringify(code.scopes),

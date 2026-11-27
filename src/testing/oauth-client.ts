@@ -34,8 +34,11 @@ export interface OAuthTestAuthorizeOptions {
   state?: string;
   resource?: string;
   scope?: string;
-  /** The redirect URI to request; default the registered one. */
-  redirectUri?: string;
+  /**
+   * The redirect URI to request; default the registered one. `null` leaves `redirect_uri` out,
+   * which a client with one registered URI may do.
+   */
+  redirectUri?: string | null;
 }
 
 export interface OAuthTestClient {
@@ -127,10 +130,12 @@ export async function createOAuthTestClient(
       const params = new URLSearchParams({
         response_type: "code",
         client_id: clientId,
-        redirect_uri: authorizeOptions.redirectUri ?? redirectUri,
         code_challenge: pkce.challenge,
         code_challenge_method: "S256",
       });
+      if (authorizeOptions.redirectUri !== null) {
+        params.set("redirect_uri", authorizeOptions.redirectUri ?? redirectUri);
+      }
       if (authorizeOptions.state !== undefined) params.set("state", authorizeOptions.state);
       if (authorizeOptions.resource !== undefined)
         params.set("resource", authorizeOptions.resource);

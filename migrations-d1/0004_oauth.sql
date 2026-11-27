@@ -60,6 +60,8 @@ CREATE TABLE identkit_oauth_codes (
   client_id TEXT NOT NULL REFERENCES identkit_oauth_clients (id) ON DELETE CASCADE,
   account_id TEXT NOT NULL REFERENCES identkit_accounts (id) ON DELETE CASCADE,
   redirect_uri TEXT NOT NULL,
+  -- 1 if the authorization request named redirect_uri; the token request must then name it.
+  redirect_uri_explicit INTEGER NOT NULL CHECK (redirect_uri_explicit IN (0, 1)),
   code_challenge TEXT NOT NULL,
   resource TEXT NOT NULL,
   scopes TEXT NOT NULL,

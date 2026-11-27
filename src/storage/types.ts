@@ -335,6 +335,11 @@ export interface OAuthCodeRecord {
   accountId: string;
   /** The redirect URI of the authorization request, exactly. */
   redirectUri: string;
+  /**
+   * True if the authorization request named `redirect_uri`. Only then must the token request
+   * name it too (RFC 6749 section 4.1.3); a token request that names it must match either way.
+   */
+  redirectUriExplicit: boolean;
   /** The S256 code challenge (RFC 7636). */
   codeChallenge: string;
   resource: string;

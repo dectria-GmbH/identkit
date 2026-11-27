@@ -186,6 +186,7 @@ function oauthCode(
     clientId,
     accountId,
     redirectUri: "http://127.0.0.1:5000/cb",
+    redirectUriExplicit: true,
     codeChallenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
     resource: "https://example.com/mcp",
     scopes: ["mcp:read"],

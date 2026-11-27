@@ -98,6 +98,8 @@ interface Ticket {
   accountId: string;
   clientId: string;
   redirectUri: string;
+  /** True if the request named `redirect_uri`. */
+  redirectUriExplicit: boolean;
   codeChallenge: string;
   resource: string;
   state: string | null;
@@ -113,11 +115,12 @@ function parseTicket(bytes: Uint8Array): Ticket | null {
     return null;
   }
   if (!isRecord(value) || value["v"] !== 1) return null;
-  const { a, c, r, p, s, st, o, x } = value;
+  const { a, c, r, re, p, s, st, o, x } = value;
   if (
     typeof a !== "string" ||
     typeof c !== "string" ||
     typeof r !== "string" ||
+    typeof re !== "boolean" ||
     typeof p !== "string" ||
     typeof s !== "string" ||
     (st !== null && typeof st !== "string") ||
@@ -131,6 +134,7 @@ function parseTicket(bytes: Uint8Array): Ticket | null {
     accountId: a,
     clientId: c,
     redirectUri: r,
+    redirectUriExplicit: re,
     codeChallenge: p,
     resource: s,
     state: st,
@@ -230,11 +234,8 @@ export function createAuthorize(internals: OAuthInternals): OAuthAuthorize {
       }
       const client: OAuthClientRecord | null = await store.findClient(clientId);
       if (!client) return invalid("invalid_client", "The client is not registered.");
-      const redirectUri = matchRedirectUri(
-        client.redirectUris,
-        params.get("redirect_uri") ?? null,
-        rules,
-      );
+      const requestedRedirectUri = params.get("redirect_uri") ?? null;
+      const redirectUri = matchRedirectUri(client.redirectUris, requestedRedirectUri, rules);
       if (redirectUri === null) {
         return invalid(
           "invalid_redirect_uri",
@@ -289,6 +290,7 @@ export function createAuthorize(internals: OAuthInternals): OAuthAuthorize {
             a: accountId,
             c: client.id,
             r: redirectUri,
+            re: requestedRedirectUri !== null,
             p: codeChallenge,
             s: resource,
             st: state,
@@ -357,6 +359,7 @@ export function createAuthorize(internals: OAuthInternals): OAuthAuthorize {
         clientId: client.id,
         accountId,
         redirectUri: ticket.redirectUri,
+        redirectUriExplicit: ticket.redirectUriExplicit,
         codeChallenge: ticket.codeChallenge,
         resource: ticket.resource,
         scopes,

@@ -176,6 +176,7 @@ export interface IdentkitDatabase {
     client_id: string;
     account_id: string;
     redirect_uri: string;
+    redirect_uri_explicit: boolean;
     code_challenge: string;
     resource: string;
     scopes: string[];
