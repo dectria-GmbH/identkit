@@ -673,7 +673,9 @@ export interface IdentkitStore {
      * Atomically: if the account is active and holds fewer than `limit.maxOtherGrants` live
      * grants (`expiresAt` after `limit.at`) of other clients, deletes the account's grant of
      * this client (returned as `replaced`), inserts the grant and its first access token.
-     * Concurrent inserts for one account never exceed the limit.
+     * Concurrent inserts for one account never exceed the limit. Throws if the client does not
+     * exist. Against a concurrent `deleteClient`, one of the two waits for the other: the grant
+     * is either returned by that delete or refused for its missing client.
      */
     insertGrant(
       grant: OAuthGrantRecord,

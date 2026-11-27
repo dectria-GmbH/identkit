@@ -1,4 +1,4 @@
-import { sql, type Kysely, type Selectable } from "kysely";
+import { sql, type Kysely, type Selectable, type Transaction } from "kysely";
 import { addSeconds } from "../clock.js";
 import { knownAuthMethods } from "../storage/auth-methods.js";
 import { applyThrottle } from "../storage/throttle-logic.js";
@@ -40,6 +40,26 @@ function isUniqueViolation(error: unknown): boolean {
 function isLostRace(error: unknown): boolean {
   const code = sqlState(error);
   return typeof code === "string" && LOST_RACE.has(code);
+}
+
+/**
+ * Locks the client row FOR KEY SHARE inside a grant insert or import, right after the account
+ * lock and before any grant row is touched. The foreign key check of the grant insert takes the
+ * same lock, but only at the insert: by then a replacing insert holds the row lock of the grant it
+ * deleted, and `deleteClient` (client FOR UPDATE, then the client's grants) could wait on it in
+ * a cycle. Throws, as the foreign key would, if the client does not exist.
+ */
+async function lockClientForGrant(
+  trx: Transaction<IdentkitDatabase>,
+  clientId: string,
+): Promise<void> {
+  const client = await trx
+    .selectFrom("identkit_oauth_clients")
+    .select("id")
+    .where("id", "=", clientId)
+    .forKeyShare()
+    .executeTakeFirst();
+  if (!client) throw new Error("oauth grant references a missing client");
 }
 
 /** Checks a value read from the database against the allowed set. */
@@ -1226,9 +1246,12 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           .transaction()
           .setIsolationLevel("read committed")
           .execute(async (trx) => {
-            // The row lock first: a concurrent grant insert takes a key share lock on the client
-            // for its foreign key and waits, then fails on the deleted client. Without it, the
-            // client delete could cascade a grant committed after the grant delete below.
+            // The row lock first: a concurrent grant insert or import takes a key share lock on
+            // the client before it touches any grant row, so it waits here, then fails on the
+            // deleted client. Without this lock, the client delete could cascade a grant committed
+            // after the grant delete below. Both sides lock the client before any grant row, so
+            // they never wait on each other in a cycle (a replacing insert holds the row lock of
+            // the grant it deletes).
             const client = await trx
               .selectFrom("identkit_oauth_clients")
               .select("id")
@@ -1303,7 +1326,8 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           .execute(async (trx) => {
             // The account row lock serializes grant inserts and imports for one account, so
             // the count and the insert cannot interleave with another one's. FOR NO KEY UPDATE,
-            // as at `apiTokens.insert`, so foreign key checks of other rows do not wait.
+            // as at `apiTokens.insert`, so foreign key checks of other rows do not wait. Then
+            // the client row, before any grant row (see `lockClientForGrant`).
             const account = await trx
               .selectFrom("identkit_accounts")
               .select("status")
@@ -1313,6 +1337,7 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
             if (!account || account.status !== "active") {
               return { status: "account_inactive" } as const;
             }
+            await lockClientForGrant(trx, grant.clientId);
             const { live } = await trx
               .selectFrom("identkit_oauth_grants")
               .select((eb) => eb.fn.countAll<string>().as("live"))
@@ -1343,13 +1368,14 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
           .transaction()
           .setIsolationLevel("read committed")
           .execute(async (trx) => {
-            // The same account row lock as `insertGrant`.
+            // The same account and client row locks as `insertGrant`.
             const account = await trx
               .selectFrom("identkit_accounts")
               .select("status")
               .where("id", "=", grant.accountId)
               .forNoKeyUpdate()
               .executeTakeFirst();
+            if (account) await lockClientForGrant(trx, grant.clientId);
             const sameId = await trx
               .selectFrom("identkit_oauth_grants")
               .select("id")

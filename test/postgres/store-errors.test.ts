@@ -15,7 +15,11 @@ import {
 } from "kysely";
 import { describe, expect, it } from "vitest";
 import { createPostgresStore, type IdentkitDatabase } from "../../src/postgres/index.js";
-import type { ApiTokenRecord } from "../../src/storage/types.js";
+import type {
+  ApiTokenRecord,
+  OAuthAccessTokenRecord,
+  OAuthGrantRecord,
+} from "../../src/storage/types.js";
 
 type Answer = (query: CompiledQuery) => QueryResult<unknown> | Error;
 
@@ -62,6 +66,15 @@ function scriptedStore(answer: Answer) {
 }
 
 const sqlError = (code: string) => Object.assign(new Error(`sqlstate ${code}`), { code });
+
+/** Answers of an active account, an existing client and no grants. */
+const grantAnswer = (query: CompiledQuery): QueryResult<unknown> => {
+  if (query.sql.includes('from "identkit_accounts"')) return { rows: [{ status: "active" }] };
+  if (query.sql.includes('from "identkit_oauth_clients"')) return { rows: [{ id: "c1" }] };
+  if (query.sql.includes("count(*)")) return { rows: [{ live: "0" }] };
+  if (query.sql.startsWith("insert")) return { rows: [{ id: "g1" }] };
+  return { rows: [] };
+};
 
 describe("postgresql store without a database", () => {
   it("rule: markUsed treats a serialization failure or deadlock as a lost race", async () => {
@@ -137,5 +150,64 @@ describe("postgresql store without a database", () => {
       '"identkit_oauth_codes"',
       "ROLLBACK",
     ]);
+  });
+
+  it("rule: insertGrant and importGrant lock the account, then the client, before any grant row", async () => {
+    const at = new Date();
+    const grant: OAuthGrantRecord = {
+      id: "g1",
+      accountId: "a1",
+      clientId: "c1",
+      scopes: ["mcp:read"],
+      resource: "https://example.com/mcp",
+      createdAt: at,
+      expiresAt: new Date(at.getTime() + 60_000),
+      generation: 1,
+      refreshRefDigest: null,
+      refreshDigest: null,
+      refreshDigestAlgorithm: null,
+      previousRefreshDigest: null,
+      refreshedAt: null,
+      refreshExpiresAt: null,
+      codeDigest: null,
+      source: "import",
+    };
+    const token: OAuthAccessTokenRecord = {
+      digest: "d",
+      grantId: "g1",
+      generation: 1,
+      scopes: ["mcp:read"],
+      createdAt: at,
+      expiresAt: grant.expiresAt,
+    };
+    // Review a2 r2 L1: the client row was locked only by the foreign key check of the insert,
+    // after a replacing insert held its grant row lock, so deleteClient could deadlock with it.
+    const calls = [
+      (s: ReturnType<typeof scriptedStore>) =>
+        s.oauth.insertGrant(grant, token, { maxOtherGrants: 5, at }),
+      (s: ReturnType<typeof scriptedStore>) =>
+        s.oauth.importGrant(grant, { maxOtherGrants: 5, at }),
+    ];
+    for (const call of calls) {
+      const scripted = scriptedStore(grantAnswer);
+      await call(scripted);
+      const { sqls } = scripted;
+      const account = sqls.findIndex((q) => q.includes('from "identkit_accounts"'));
+      const client = sqls.findIndex((q) => q.includes('from "identkit_oauth_clients"'));
+      const firstGrant = sqls.findIndex((q) => q.includes('"identkit_oauth_grants"'));
+      expect(sqls[account]).toMatch(/ for no key update$/);
+      expect(sqls[client]).toMatch(/ for key share$/);
+      expect(account).toBeGreaterThanOrEqual(0);
+      expect(client).toBeGreaterThan(account);
+      expect(firstGrant).toBeGreaterThan(client);
+    }
+    // A missing client fails before any grant row is touched, as the foreign key would.
+    const missing = scriptedStore((query) =>
+      query.sql.includes('from "identkit_oauth_clients"') ? { rows: [] } : grantAnswer(query),
+    );
+    await expect(
+      missing.oauth.insertGrant(grant, token, { maxOtherGrants: 5, at }),
+    ).rejects.toThrow("oauth grant references a missing client");
+    expect(missing.sqls.some((q) => q.includes('"identkit_oauth_grants"'))).toBe(false);
   });
 });
