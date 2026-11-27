@@ -583,6 +583,8 @@ const result = await identkit.oidc.finish({
   transaction: cookie("__Host-oidc"),
   params: new URL(request.url).searchParams,
 });
+// Single use: clear the transaction cookie after every finish, success or failure.
+deleteCookie("__Host-oidc");
 if (result.status === "signed_in") setSessionCookie(result.token);
 ```
 
@@ -602,6 +604,10 @@ Providers:
   any other provider. No discovery request: you give the endpoints. `iss` must equal `issuer`.
 - The client secret is not a property of the returned object; identkit sends it only to the
   token endpoint. Endpoints and the redirect URI must be https (plain http only for localhost).
+  identkit follows no redirect from a provider endpoint: a redirect fails the request, so the
+  secret never goes to a redirect target.
+- Every factory takes `extraAudiences` (default none): audiences besides the client id that you
+  trust in an ID token. A token with any other audience is refused.
 
 The flow:
 
@@ -611,13 +617,22 @@ The flow:
   `SameSite=Lax`, since the callback is a top-level GET from the provider). The cookie binds the
   flow to the browser that started it: a callback with another flow's `state` fails
   (`state_mismatch`) before any request to the provider.
+- identkit keeps no state per flow, so it cannot make `transaction` single use: within its
+  lifetime it opens again for another code from the same authorization URL. So clear the cookie
+  after `finish`, whatever the result. Serve the callback route with `Referrer-Policy:
+no-referrer`, and never redirect from it to a value from the query: a code that leaks from the
+  callback URL (Referer header, logs, an open redirect) could otherwise complete a flow that an
+  attacker started (RFC 9700, section 4.5.3). PKCE and the nonce do not help there, because the
+  attacker started that flow.
 - `finish` opens the transaction, checks its lifetime and `state`, exchanges the code with the
   verifier (client secret by `client_secret_post` for the presets, `client_secret_basic` by
   default for `oidcProvider`), and verifies the ID token: signature with the provider's keys
   (RS256 with at least 2048 bits; ES256 for `oidcProvider` if listed in `algorithms`; never
   `none` or HMAC; a token with `crit` is refused; keys come only from the configured JWKS URI),
-  `iss`, `aud` contains the client id, `azp` is the client id when present and required with
-  several audiences, `exp`, `nbf` and `iat` with `clockSkewSeconds`, and `nonce`.
+  `iss`, `aud` contains the client id and no audience outside `extraAudiences`, `azp` is the
+  client id when present and required with several audiences, `exp`, `nbf` and `iat` with
+  `clockSkewSeconds`, and `nonce`. An RSA key must have at least 2048 bits and the exponent 65537.
+  Provider responses are limited in bytes.
 - Keys are cached per JWKS URI for `jwksCacheSeconds`. A token with an unknown key id causes one
   more fetch, at most one per `jwksRefetchIntervalSeconds`. Concurrent fetches are shared. So one
   `finish` makes at most two outgoing requests (token and keys), and one with a warm cache. Pass

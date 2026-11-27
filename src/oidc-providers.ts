@@ -57,6 +57,8 @@ export interface ProviderInternals {
   tokenEndpointAuthMethod: "client_secret_basic" | "client_secret_post";
   algorithms: readonly IdTokenAlgorithm[];
   prompt: string | null;
+  /** Audiences besides the client id that an ID token may carry. Empty by default. */
+  extraAudiences: ReadonlySet<string>;
   /** Checks the issuer and the provider-specific claims, and derives the link key. */
   identify(claims: Record<string, unknown>): IdentifyResult;
 }
@@ -166,13 +168,19 @@ interface CommonOptions {
   redirectUri: string;
   /** Default `["openid", "email", "profile"]`. Must include `openid`. */
   scopes?: string[];
+  /**
+   * Audiences besides the client id that you trust in an ID token. Default none: a token
+   * with another audience is refused (OpenID Connect Core 3.1.3.7). With several audiences,
+   * `azp` must still be the client id.
+   */
+  extraAudiences?: string[];
 }
 
 function register(
   options: CommonOptions & { id: string },
   kind: OidcProviderKind,
   endpoints: { authorizationEndpoint: string; tokenEndpoint: string; jwksUri: string },
-  internals: ProviderInternals,
+  internals: Omit<ProviderInternals, "extraAudiences">,
 ): OidcProvider {
   if (typeof options.id !== "string" || !PROVIDER_ID.test(options.id)) {
     throw new InvalidArgumentError("provider id must match [a-z0-9][a-z0-9_-]{0,63}");
@@ -188,7 +196,14 @@ function register(
     scopes: requireScopes(options.scopes),
   });
   requireString(internals.clientSecret, "clientSecret", 4096);
-  registry.set(provider, internals);
+  const extra = options.extraAudiences;
+  if (
+    extra !== undefined &&
+    (!Array.isArray(extra) || !extra.every((a) => typeof a === "string" && a.length > 0))
+  ) {
+    throw new InvalidArgumentError("extraAudiences must be non-empty strings");
+  }
+  registry.set(provider, { ...internals, extraAudiences: new Set(extra ?? []) });
   return provider;
 }
 

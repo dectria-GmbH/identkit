@@ -16,8 +16,33 @@ export class ProviderRequestError extends Error {
   }
 }
 
+/** Reads the body as bytes and stops as soon as it exceeds `maxBytes`. */
+async function readLimited(response: Response, maxBytes: number): Promise<Uint8Array> {
+  if (!response.body) return new Uint8Array(0);
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => undefined);
+      throw new ProviderRequestError("response too large");
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
 /**
- * Reads a JSON object from a provider response, with a size limit. Throws
+ * Reads a JSON object from a provider response, with a size limit in bytes. Throws
  * `ProviderRequestError` for anything else.
  */
 export async function readJson(
@@ -26,8 +51,19 @@ export async function readJson(
 ): Promise<{ status: number; body: Record<string, unknown> }> {
   const declared = Number(response.headers.get("content-length") ?? "0");
   if (declared > maxBytes) throw new ProviderRequestError("response too large");
-  const text = await response.text();
-  if (text.length > maxBytes) throw new ProviderRequestError("response too large");
+  let bytes: Uint8Array;
+  try {
+    bytes = await readLimited(response, maxBytes);
+  } catch (error) {
+    if (error instanceof ProviderRequestError) throw error;
+    throw new ProviderRequestError("network error or timeout");
+  }
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new ProviderRequestError("response is not UTF-8");
+  }
   let body: unknown;
   try {
     body = JSON.parse(text);
@@ -45,11 +81,24 @@ export async function providerFetch(
   init: RequestInit,
   timeoutMs: number,
 ): Promise<Response> {
+  let response: Response;
   try {
-    return await fetcher(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+    // Never follow a redirect: a 307 or 308 from the token endpoint would send the client
+    // secret again, to the redirect target. `manual` instead of `error`, which not every
+    // runtime accepts; a redirect answer then fails here.
+    response = await fetcher(url, {
+      ...init,
+      redirect: "manual",
+      signal: AbortSignal.timeout(timeoutMs),
+    });
   } catch {
     throw new ProviderRequestError("network error or timeout");
   }
+  if (response.type === "opaqueredirect" || (response.status >= 300 && response.status < 400)) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new ProviderRequestError("redirect refused");
+  }
+  return response;
 }
 
 interface Entry {

@@ -171,12 +171,31 @@ describe("oidc ID token verification", () => {
     expect((await signIn()).status).toBe("failed");
     resignNext(t.fakes.google, (c) => ({ ...c, azp: "another-client" }));
     expect((await signIn()).status).toBe("failed");
+    // An extra audience is refused unless the operator trusts it, also with azp.
     resignNext(t.fakes.google, (c) => ({
       ...c,
       aud: [GOOGLE.clientId, "another-client"],
       azp: GOOGLE.clientId,
     }));
-    expect((await signIn()).status).toBe("signed_in");
+    expect((await signIn()).status).toBe("failed");
+
+    const trusting = await oidcSetup({ google: { extraAudiences: ["another-client"] } });
+    const signInTrusting = () => trusting.signInWith("google", googleClaims("b@example.org"));
+    resignNext(trusting.fakes.google, (c) => ({
+      ...c,
+      aud: [GOOGLE.clientId, "another-client"],
+      azp: GOOGLE.clientId,
+    }));
+    expect((await signInTrusting()).status).toBe("signed_in");
+    resignNext(trusting.fakes.google, (c) => ({
+      ...c,
+      aud: [GOOGLE.clientId, "third-client"],
+      azp: GOOGLE.clientId,
+    }));
+    expect((await signInTrusting()).status).toBe("failed");
+    // Without azp, several audiences stay refused.
+    resignNext(trusting.fakes.google, (c) => ({ ...c, aud: [GOOGLE.clientId, "another-client"] }));
+    expect((await signInTrusting()).status).toBe("failed");
   });
 
   it("rule: times - exp, iat and nbf apply with the configured clock skew", async () => {

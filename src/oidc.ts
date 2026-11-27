@@ -480,6 +480,8 @@ export function createOidc(ctx: Context, internals: SessionInternals, options: O
     const { exp, iat, nbf } = claims;
     const valid =
       audiences.includes(provider.clientId) &&
+      // Every other audience must be one the operator trusts (OpenID Connect Core 3.1.3.7).
+      audiences.every((a) => a === provider.clientId || internal.extraAudiences.has(a)) &&
       // OpenID Connect Core 3.1.3.7: with several audiences, azp names the client.
       (audiences.length === 1 || azp !== undefined) &&
       (azp === undefined || azp === provider.clientId) &&

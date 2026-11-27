@@ -417,7 +417,7 @@ export function createMemoryStore(): IdentkitStore {
         if (options.exclusive && links.some((l) => l.accountId === link.accountId)) {
           return Promise.resolve("account_has_link");
         }
-        if (!accounts.has(link.accountId)) throw new Error("account not found");
+        if (!accounts.has(link.accountId)) return Promise.reject(new Error("account not found"));
         oidcLinks.set(link.id, copy(link));
         return Promise.resolve("inserted");
       },

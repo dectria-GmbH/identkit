@@ -9,7 +9,22 @@ export const ID_TOKEN_ALGORITHMS: readonly IdTokenAlgorithm[] = ["RS256", "ES256
 const MAX_TOKEN_LENGTH = 16_384;
 
 /** Least RSA modulus, in bytes (2048 bits). */
-const MIN_RSA_MODULUS_BYTES = 256;
+const MIN_RSA_MODULUS_BITS = 2048;
+
+/** Bit length of a big-endian unsigned integer. */
+function bitLength(bytes: Uint8Array): number {
+  let i = 0;
+  while (i < bytes.length && bytes[i] === 0) i += 1;
+  if (i === bytes.length) return 0;
+  return (bytes.length - i - 1) * 8 + (32 - Math.clz32(bytes[i] ?? 0));
+}
+
+/** True if the big-endian bytes are the RSA public exponent 65537 (0x010001). */
+function isF4(bytes: Uint8Array): boolean {
+  let i = 0;
+  while (i < bytes.length && bytes[i] === 0) i += 1;
+  return bytes.length - i === 3 && bytes[i] === 1 && bytes[i + 1] === 0 && bytes[i + 2] === 1;
+}
 
 export interface DecodedJwt {
   header: Record<string, unknown>;
@@ -96,10 +111,11 @@ export async function importJwk(jwk: unknown): Promise<VerificationKey | null> {
       const n = str(entry["n"]);
       const e = str(entry["e"]);
       const modulus = n === null ? null : fromBase64Url(n);
-      if (!n || !e || !modulus) return null;
-      // A leading zero byte does not count towards the modulus length.
-      const length = modulus[0] === 0 ? modulus.byteLength - 1 : modulus.byteLength;
-      if (length < MIN_RSA_MODULUS_BYTES) return null;
+      const exponent = e === null ? null : fromBase64Url(e);
+      if (!n || !e || !modulus || !exponent) return null;
+      // At least 2048 bits, leading zeros not counted. The exponent must be 65537, the only one
+      // providers use; e = 1 or another small value would make the key worthless.
+      if (bitLength(modulus) < MIN_RSA_MODULUS_BITS || !isF4(exponent)) return null;
       const key = await crypto.subtle.importKey(
         "jwk",
         { kty: "RSA", n, e },
