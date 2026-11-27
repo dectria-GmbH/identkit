@@ -256,9 +256,11 @@ E-mail codes:
   as the attacker goes on.
 - The way out is the operator call `accounts.unlock(accountId)`, or `accounts.unlockAddress(email)`
   for an address without an account. It clears the lock, the lock length and both counts of the
-  address (sign-in and step-up) and, for `unlock`, of the account's TOTP, and writes the audit
-  event `lockout.released`. Restrict it to an operator role: whoever can call it can guess
-  without limit. A passkey sign-in is not affected by the e-mail or TOTP locks.
+  address (sign-in and step-up) and, for `unlock`, of the account's TOTP. It writes the audit
+  event `lockout.released` before it clears anything, so a lock is never lifted without the
+  event; if the call throws, some locks may be lifted and others not, so call it again. Restrict
+  it to an operator role: whoever can call it can guess without limit. A passkey sign-in is not
+  affected by the e-mail or TOTP locks.
 - A person who can request codes for an address can trigger a lock: it trades a denial of
   service for brute-force protection. Escalation makes the brute-force bound stronger and a
   lasting lockout cheaper: once the consecutive limit is reached, two attempts at the end of
