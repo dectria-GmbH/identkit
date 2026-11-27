@@ -23,9 +23,33 @@ pnpm add kysely pg
 
 ## Requirements
 
-- Node.js 24 or later, ESM only.
-- For the PostgreSQL store: PostgreSQL 17 (the version the test suite runs against) and
-  [Kysely](https://kysely.dev) 0.29 (optional peer dependency).
+- ESM only.
+- Root entry `identkit` and `identkit/testing`: Node.js 24 or later, or a runtime with the Web
+  Crypto API (`globalThis.crypto`) such as Cloudflare Workers, also without `nodejs_compat`.
+  They import no Node built-in module. CI checks this statically with `pnpm check:runtime` and
+  runs the built entries in workerd without `nodejs_compat` with `pnpm check:workerd`.
+- `identkit/postgres`: Node.js 24 or later, PostgreSQL 17 (the version the test suite runs
+  against) and [Kysely](https://kysely.dev) 0.29 (optional peer dependency).
+
+### Sync and async pairs
+
+Web Crypto has no synchronous hash, HMAC or signature. A few functions that were synchronous
+before Web Crypto support keep their signature and results, but they work only on Node: they
+load `node:crypto` when called and throw `NodeCryptoUnavailableError` (code
+`node_crypto_unavailable`) elsewhere. Each has an async sibling with the same result that works
+everywhere:
+
+| Node only, sync              | Any runtime, async                |
+| ---------------------------- | --------------------------------- |
+| `hashPayload`                | `hashPayloadAsync`                |
+| `approvalChallenge`          | `approvalChallengeAsync`          |
+| `generateTotpCode` (testing) | `generateTotpCodeAsync` (testing) |
+| fake adapter `callbackFor`   | fake adapter `callbackForAsync`   |
+
+`createSoftwareAuthenticator` (testing) has no async form: its `register` and `assert` sign with
+`node:crypto` and need Node. identkit's own code uses only the async forms. On Web Crypto
+runtimes, create keys with `crypto.getRandomValues(new Uint8Array(32))` instead of
+`randomBytes(32)` from the quick start.
 
 ## Quick start
 
@@ -95,7 +119,8 @@ or check ownership yourself before you pass client input: all of `accounts`,
 `identityVerification.get`.
 
 Standalone functions: `checkApprovalEvidence({ evidence, verifier | hasher })`, `hashPayload(payload)`,
-`approvalChallenge(nonce, payloadHash, accountId)`, `normalizeEmail(input)`, `parseConfig(input)`,
+`hashPayloadAsync(payload)`, `approvalChallenge(nonce, payloadHash, accountId)`,
+`approvalChallengeAsync(nonce, payloadHash, accountId)`, `normalizeEmail(input)`, `parseConfig(input)`,
 `createAesGcmSealer({ keys, activeKeyId })`, `applyThrottle(state, at, rule)`, `lockDuration(rule, lockCount)` and the type `ThrottleState` (for custom stores). Constant `TOTP_INTEROPERABLE_PARAMETERS`
 (`{ algorithm: "SHA1", digits: 6 }`).
 
@@ -117,8 +142,8 @@ Subpath `identkit/postgres`: `createPostgresStore(db)`, `migrateIdentkit(db)`, `
 
 Subpath `identkit/testing`: `createFakeClock`, `createRecordingMailSender`,
 `createRecordingAuditSink`, `createFakeIdentityVerificationAdapter`,
-`createSoftwareAuthenticator`, `createTestSealer`, `generateTotpCode`. These are for tests and
-demos only.
+`createSoftwareAuthenticator`, `createTestSealer`, `generateTotpCode`, `generateTotpCodeAsync`.
+These are for tests and demos only.
 
 Passkey options and responses use the WebAuthn JSON forms, so a browser can pass them to
 `PublicKeyCredential.parseCreationOptionsFromJSON()` and send back `credential.toJSON()`.

@@ -1,4 +1,5 @@
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes, sha256, toBase64Url, toHex, utf8 } from "./bytes.js";
+import { nodeCrypto } from "./node-crypto.js";
 import { addSeconds } from "./clock.js";
 import type { ApprovalEvidenceLevel } from "./config.js";
 import type { Context } from "./context.js";
@@ -144,19 +145,50 @@ export interface Approvals {
   verify(input: ApprovalVerifyInput): Promise<VerifyApprovalResult>;
 }
 
+const challengeInput = (nonce: string, payloadHash: string, accountId: string) =>
+  `${APPROVAL_DOMAIN}\u0000${nonce}\u0000${payloadHash}\u0000${accountId}`;
+
 /**
  * The challenge for an approval: SHA-256 over a domain label, the nonce, the payload hash
  * and the account id. The signature therefore covers who approves what.
  */
+export async function approvalChallengeAsync(
+  nonce: string,
+  payloadHash: string,
+  accountId: string,
+): Promise<string> {
+  return toBase64Url(await sha256(utf8(challengeInput(nonce, payloadHash, accountId))));
+}
+
+/**
+ * Same result as `approvalChallengeAsync`, computed synchronously.
+ *
+ * Node only; use approvalChallengeAsync on Web Crypto runtimes. Elsewhere it throws
+ * `NodeCryptoUnavailableError`.
+ */
 export function approvalChallenge(nonce: string, payloadHash: string, accountId: string): string {
-  return createHash("sha256")
-    .update(`${APPROVAL_DOMAIN}\u0000${nonce}\u0000${payloadHash}\u0000${accountId}`, "utf8")
+  return nodeCrypto("approvalChallenge", "approvalChallengeAsync")
+    .createHash("sha256")
+    .update(challengeInput(nonce, payloadHash, accountId), "utf8")
     .digest("base64url");
 }
 
-/** SHA-256 hex of a payload, for use as `payloadHash`. */
+/** SHA-256 hex of a payload, for use as `payloadHash`. A string payload is hashed as UTF-8. */
+export async function hashPayloadAsync(payload: Uint8Array | string): Promise<string> {
+  return toHex(await sha256(typeof payload === "string" ? utf8(payload) : payload));
+}
+
+/**
+ * Same result as `hashPayloadAsync`, computed synchronously.
+ *
+ * Node only; use hashPayloadAsync on Web Crypto runtimes. Elsewhere it throws
+ * `NodeCryptoUnavailableError`.
+ */
 export function hashPayload(payload: Uint8Array | string): string {
-  return createHash("sha256").update(payload).digest("hex");
+  return nodeCrypto("hashPayload", "hashPayloadAsync")
+    .createHash("sha256")
+    .update(payload)
+    .digest("hex");
 }
 
 /** The fields the evidence HMAC covers, in a fixed, unambiguous encoding. */
@@ -370,8 +402,8 @@ export function createApprovals(
     session: { id: string; accountId: string },
     allow: { id: string; transports: string[] }[],
   ): Promise<StartApprovalResult> {
-    const nonce = randomBytes(32).toString("base64url");
-    const challenge = approvalChallenge(nonce, input.payloadHash, session.accountId);
+    const nonce = toBase64Url(randomBytes(32));
+    const challenge = await approvalChallengeAsync(nonce, input.payloadHash, session.accountId);
     const { record } = await core.issueChallenge(
       "approval",
       {
@@ -422,7 +454,7 @@ export function createApprovals(
       return failed("challenge", input.payloadHash, session.accountId, level);
     }
     // The challenge the person signed must commit to the payload hash given now.
-    const expectedChallenge = approvalChallenge(
+    const expectedChallenge = await approvalChallengeAsync(
       consumed.record.nonce,
       input.payloadHash,
       session.accountId,
@@ -598,7 +630,11 @@ async function verifySignatureEvidence(
   verifier: ApprovalEvidenceVerifier,
 ): Promise<boolean> {
   if (proof.rpId !== verifier.rpId) return false;
-  const expectedChallenge = approvalChallenge(proof.nonce, proof.payloadHash, proof.accountId);
+  const expectedChallenge = await approvalChallengeAsync(
+    proof.nonce,
+    proof.payloadHash,
+    proof.accountId,
+  );
   if (readClientChallenge(proof.assertion?.clientDataJSON) !== expectedChallenge) return false;
   const rp: RelyingParty = { rpId: verifier.rpId, rpName: "", origins: verifier.origins };
   try {

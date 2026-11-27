@@ -473,8 +473,8 @@ describe("TOTP enrolment", () => {
     expect(row?.id).toBe(factorId);
     const stored = JSON.stringify(row);
     expect(stored).not.toContain(secret);
-    expect(stored).not.toContain(base32Decode(secret).toString("hex"));
-    expect(stored).not.toContain(base32Decode(secret).toString("base64url"));
+    expect(stored).not.toContain(Buffer.from(base32Decode(secret)).toString("hex"));
+    expect(stored).not.toContain(Buffer.from(base32Decode(secret)).toString("base64url"));
   });
 });
 
@@ -853,7 +853,7 @@ describe("TOTP secrets", () => {
     const user = await t.signIn("person@example.org");
     const start = await t.ik.totp.startEnrolment(user.token);
     if (start.status !== "ok") throw new Error("denied");
-    const secretBytes = base32Decode(start.secret);
+    const secretBytes = Buffer.from(base32Decode(start.secret));
     const codes: string[] = [];
     const code = (offset = 0) => {
       const value = t.totpCode(start.secret, offset);

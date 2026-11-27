@@ -1,4 +1,12 @@
-import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import {
+  concatBytes,
+  fromBase64Url,
+  lazyKey,
+  randomBytes,
+  toBase64Url,
+  utf8,
+  type WebCryptoKey,
+} from "./bytes.js";
 import { IdentkitError } from "./errors.js";
 
 /**
@@ -34,7 +42,18 @@ const PART_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 /** The key id and the context are authenticated, so neither can be swapped. */
 const additionalData = (keyId: string, context: string) =>
-  Buffer.from(`identkit/sealed/${FORMAT}\u0000${keyId}\u0000${context}`, "utf8");
+  utf8(`identkit/sealed/${FORMAT}\u0000${keyId}\u0000${context}`);
+
+const gcm = (
+  iv: Uint8Array<ArrayBuffer>,
+  keyId: string,
+  context: string,
+): Parameters<typeof crypto.subtle.encrypt>[0] => ({
+  name: "AES-GCM",
+  iv,
+  additionalData: additionalData(keyId, context),
+  tagLength: TAG_BYTES * 8,
+});
 
 export interface AesGcmSealerOptions {
   /**
@@ -52,40 +71,56 @@ export interface AesGcmSealerOptions {
  * authenticated as additional data, so neither can be swapped.
  */
 export function createAesGcmSealer(options: AesGcmSealerOptions): SecretSealer {
-  const keys = new Map<string, Buffer>();
+  const keyBytes = new Map<string, Uint8Array<ArrayBuffer>>();
   for (const [id, key] of Object.entries(options.keys)) {
     if (!KEY_ID_PATTERN.test(id))
       throw new RangeError("sealer key id must match [A-Za-z0-9_-]{1,32}");
     if (key.byteLength !== SEALER_KEY_BYTES) {
       throw new RangeError(`sealer key must have exactly ${SEALER_KEY_BYTES} bytes`);
     }
-    keys.set(id, Buffer.from(key));
+    keyBytes.set(id, new Uint8Array(key));
   }
-  const activeKey = keys.get(options.activeKeyId);
-  if (!activeKey) throw new RangeError("activeKeyId must name one of the keys");
+  if (!keyBytes.has(options.activeKeyId)) {
+    throw new RangeError("activeKeyId must name one of the keys");
+  }
   const activeKeyId = options.activeKeyId;
 
+  // Keys are imported on first use, not here: some runtimes allow no crypto work while a
+  // module is loading. Imported keys are not extractable; the raw copies are wiped after import.
+  const cryptoKeys = new Map<string, () => Promise<WebCryptoKey>>();
+  for (const [id, bytes] of keyBytes) {
+    cryptoKeys.set(
+      id,
+      lazyKey(bytes, (raw) =>
+        crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]),
+      ),
+    );
+  }
+  const cryptoKey = (id: string) => cryptoKeys.get(id)?.();
+
   return {
-    seal(plaintext, context) {
+    async seal(plaintext, context) {
+      const key = cryptoKey(activeKeyId);
+      if (!key) throw new RangeError("activeKeyId must name one of the keys");
       const iv = randomBytes(IV_BYTES);
-      const cipher = createCipheriv("aes-256-gcm", activeKey, iv, { authTagLength: TAG_BYTES });
-      cipher.setAAD(additionalData(activeKeyId, context));
-      const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-      const tag = cipher.getAuthTag();
-      return Promise.resolve(
-        [
-          FORMAT,
-          activeKeyId,
-          iv.toString("base64url"),
-          ciphertext.toString("base64url"),
-          tag.toString("base64url"),
-        ].join("."),
+      const input = new Uint8Array(plaintext);
+      let sealed: Uint8Array;
+      try {
+        // Web Crypto returns the ciphertext with the tag appended.
+        sealed = new Uint8Array(
+          await crypto.subtle.encrypt(gcm(iv, activeKeyId, context), await key, input),
+        );
+      } finally {
+        input.fill(0);
+      }
+      const ciphertext = sealed.subarray(0, sealed.byteLength - TAG_BYTES);
+      const tag = sealed.subarray(sealed.byteLength - TAG_BYTES);
+      return [FORMAT, activeKeyId, toBase64Url(iv), toBase64Url(ciphertext), toBase64Url(tag)].join(
+        ".",
       );
     },
 
-    open(sealed, context) {
-      // GCM returns plaintext from `update` before the tag is checked; wipe it on any path.
-      let head: Buffer | undefined;
+    async open(sealed, context) {
       try {
         const parts = typeof sealed === "string" ? sealed.split(".") : [];
         const [format, keyId, ivText, ciphertextText, tagText] = parts;
@@ -100,28 +135,31 @@ export function createAesGcmSealer(options: AesGcmSealerOptions): SecretSealer {
         ) {
           throw new SealedSecretError();
         }
-        const key = keys.get(keyId);
-        const iv = Buffer.from(ivText, "base64url");
-        const tag = Buffer.from(tagText, "base64url");
-        if (!key || iv.byteLength !== IV_BYTES || tag.byteLength !== TAG_BYTES) {
+        const key = cryptoKey(keyId);
+        const iv = fromBase64Url(ivText);
+        const tag = fromBase64Url(tagText);
+        const ciphertext = fromBase64Url(ciphertextText);
+        if (
+          !key ||
+          !iv ||
+          !tag ||
+          !ciphertext ||
+          iv.byteLength !== IV_BYTES ||
+          tag.byteLength !== TAG_BYTES
+        ) {
           throw new SealedSecretError();
         }
-        const decipher = createDecipheriv("aes-256-gcm", key, iv, { authTagLength: TAG_BYTES });
-        decipher.setAAD(additionalData(keyId, context));
-        decipher.setAuthTag(tag);
-        head = decipher.update(Buffer.from(ciphertextText, "base64url"));
-        const tail = decipher.final();
-        const joined = Buffer.concat([head, tail]);
-        const plaintext = new Uint8Array(joined);
-        // Small buffers can come from a shared pool: wipe the intermediate copies.
-        tail.fill(0);
-        joined.fill(0);
-        return Promise.resolve(plaintext);
+        // Web Crypto checks the tag before it returns any plaintext.
+        return new Uint8Array(
+          await crypto.subtle.decrypt(
+            gcm(iv, keyId, context),
+            await key,
+            concatBytes(ciphertext, tag),
+          ),
+        );
       } catch {
         // The library error says nothing secret, but a fixed error keeps it that way.
-        return Promise.reject(new SealedSecretError());
-      } finally {
-        head?.fill(0);
+        throw new SealedSecretError();
       }
     },
   };

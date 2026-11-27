@@ -1,4 +1,5 @@
-import { createHash, generateKeyPairSync, randomBytes, sign, type KeyObject } from "node:crypto";
+import { concatBytes, fromBase64Url, randomBytes, toBase64Url, utf8 } from "../bytes.js";
+import { nodeCrypto, type NodeCrypto, type NodeKeyObject } from "../node-crypto.js";
 import type {
   AuthenticationResponseJSON,
   PasskeyCreationOptions,
@@ -9,51 +10,53 @@ import type {
 /** Minimal CBOR encoder for the shapes WebAuthn uses: integers, byte and text strings, maps. */
 type CborValue = number | string | Uint8Array | Map<CborValue, CborValue>;
 
-function head(major: number, length: number): Buffer {
-  if (length < 24) return Buffer.from([(major << 5) | length]);
-  if (length < 0x100) return Buffer.from([(major << 5) | 24, length]);
-  if (length < 0x10000) {
-    const b = Buffer.alloc(3);
-    b[0] = (major << 5) | 25;
-    b.writeUInt16BE(length, 1);
-    return b;
-  }
-  const b = Buffer.alloc(5);
+function head(major: number, length: number): Uint8Array {
+  if (length < 24) return Uint8Array.of((major << 5) | length);
+  if (length < 0x100) return Uint8Array.of((major << 5) | 24, length);
+  if (length < 0x10000) return Uint8Array.of((major << 5) | 25, length >>> 8, length & 0xff);
+  const b = new Uint8Array(5);
   b[0] = (major << 5) | 26;
-  b.writeUInt32BE(length, 1);
+  new DataView(b.buffer).setUint32(1, length);
   return b;
 }
 
-function encodeCbor(value: CborValue): Buffer {
+function encodeCbor(value: CborValue): Uint8Array {
   if (typeof value === "number") {
     return value >= 0 ? head(0, value) : head(1, -1 - value);
   }
   if (typeof value === "string") {
-    const bytes = Buffer.from(value, "utf8");
-    return Buffer.concat([head(3, bytes.byteLength), bytes]);
+    const bytes = utf8(value);
+    return concatBytes(head(3, bytes.byteLength), bytes);
   }
   if (value instanceof Uint8Array) {
-    return Buffer.concat([head(2, value.byteLength), Buffer.from(value)]);
+    return concatBytes(head(2, value.byteLength), value);
   }
-  const parts: Buffer[] = [head(5, value.size)];
+  const parts: Uint8Array[] = [head(5, value.size)];
   for (const [k, v] of value) parts.push(encodeCbor(k), encodeCbor(v));
-  return Buffer.concat(parts);
+  return concatBytes(...parts);
 }
 
-const sha256 = (data: Uint8Array | string) => createHash("sha256").update(data).digest();
+const sha256 = (node: NodeCrypto, data: Uint8Array | string) =>
+  node.createHash("sha256").update(data).digest();
 
 function clientData(type: string, challenge: string, origin: string, crossOrigin = false): string {
-  return Buffer.from(JSON.stringify({ type, challenge, origin, crossOrigin }), "utf8").toString(
-    "base64url",
-  );
+  return toBase64Url(utf8(JSON.stringify({ type, challenge, origin, crossOrigin })));
 }
+
+function base64UrlBytes(text: string | undefined): Uint8Array {
+  const bytes = fromBase64Url(text ?? "");
+  if (!bytes) throw new Error("invalid base64url");
+  return bytes;
+}
+
+const node = () => nodeCrypto("createSoftwareAuthenticator", "a Node runtime for passkey tests");
 
 const FLAG_UP = 0x01;
 const FLAG_UV = 0x04;
 const FLAG_AT = 0x40;
 
 interface StoredKey {
-  privateKey: KeyObject;
+  privateKey: NodeKeyObject;
   userHandle: string;
   counter: number;
 }
@@ -85,6 +88,9 @@ export interface SoftwareAuthenticatorOptions {
 /**
  * A software WebAuthn authenticator with P-256 keys and `none` attestation, for tests and
  * demos. It is not a security device: keys live in process memory.
+ *
+ * Node only: `register` and `assert` sign synchronously with `node:crypto`. Elsewhere they
+ * throw `NodeCryptoUnavailableError`.
  */
 export interface SoftwareAuthenticator {
   register(
@@ -105,10 +111,11 @@ export function createSoftwareAuthenticator(
     register(creation, overrides = {}) {
       const rpId = creation.rp.id;
       if (!rpId) throw new Error("options without rp.id");
-      const { privateKey, publicKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+      const crypto = node();
+      const { privateKey, publicKey } = crypto.generateKeyPairSync("ec", { namedCurve: "P-256" });
       const jwk = publicKey.export({ format: "jwk" });
       const credentialId = randomBytes(16);
-      const id = credentialId.toString("base64url");
+      const id = toBase64Url(credentialId);
       keys.set(id, { privateKey, userHandle: creation.user.id, counter: 0 });
 
       const coseKey = encodeCbor(
@@ -116,22 +123,20 @@ export function createSoftwareAuthenticator(
           [1, 2],
           [3, -7],
           [-1, 1],
-          [-2, Buffer.from(String(jwk.x), "base64url")],
-          [-3, Buffer.from(String(jwk.y), "base64url")],
+          [-2, base64UrlBytes(jwk.x)],
+          [-3, base64UrlBytes(jwk.y)],
         ]),
       );
       const flags = FLAG_UP | FLAG_AT | (overrides.userVerified === false ? 0 : FLAG_UV);
-      const length = Buffer.alloc(2);
-      length.writeUInt16BE(credentialId.byteLength);
-      const authData = Buffer.concat([
-        sha256(rpId),
-        Buffer.from([flags]),
-        Buffer.alloc(4),
-        Buffer.alloc(16),
-        length,
+      const authData = concatBytes(
+        sha256(crypto, rpId),
+        Uint8Array.of(flags),
+        new Uint8Array(4),
+        new Uint8Array(16),
+        Uint8Array.of(credentialId.byteLength >>> 8, credentialId.byteLength & 0xff),
         credentialId,
         coseKey,
-      ]);
+      );
       const attestationObject = encodeCbor(
         new Map<CborValue, CborValue>([
           ["fmt", overrides.fmt ?? "none"],
@@ -149,7 +154,7 @@ export function createSoftwareAuthenticator(
             creation.challenge,
             overrides.origin ?? options.origin,
           ),
-          attestationObject: attestationObject.toString("base64url"),
+          attestationObject: toBase64Url(attestationObject),
           transports: ["internal"],
         },
         clientExtensionResults: {},
@@ -165,20 +170,24 @@ export function createSoftwareAuthenticator(
       const rpId = overrides.rpId ?? request.rpId;
       if (!rpId) throw new Error("options without rpId");
 
+      const crypto = node();
       key.counter = overrides.counter ?? key.counter + step;
-      const counter = Buffer.alloc(4);
-      counter.writeUInt32BE(key.counter);
+      if (!Number.isInteger(key.counter) || key.counter < 0 || key.counter > 0xffffffff) {
+        throw new RangeError("counter must be an unsigned 32-bit integer");
+      }
+      const counter = new Uint8Array(4);
+      new DataView(counter.buffer).setUint32(0, key.counter);
       const flags = FLAG_UP | (overrides.userVerified === false ? 0 : FLAG_UV);
-      const authData = Buffer.concat([sha256(rpId), Buffer.from([flags]), counter]);
+      const authData = concatBytes(sha256(crypto, rpId), Uint8Array.of(flags), counter);
       const clientDataJSON = clientData(
         overrides.type ?? "webauthn.get",
         overrides.challenge ?? request.challenge,
         overrides.origin ?? options.origin,
         overrides.crossOrigin ?? false,
       );
-      const signature = sign(
+      const signature = crypto.sign(
         "sha256",
-        Buffer.concat([authData, sha256(Buffer.from(clientDataJSON, "base64url"))]),
+        concatBytes(authData, sha256(crypto, base64UrlBytes(clientDataJSON))),
         key.privateKey,
       );
       const userHandle =
@@ -189,8 +198,8 @@ export function createSoftwareAuthenticator(
         type: "public-key",
         response: {
           clientDataJSON,
-          authenticatorData: authData.toString("base64url"),
-          signature: signature.toString("base64url"),
+          authenticatorData: toBase64Url(authData),
+          signature: toBase64Url(signature),
           ...(userHandle !== undefined ? { userHandle } : {}),
         },
         clientExtensionResults: {},

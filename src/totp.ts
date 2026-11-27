@@ -157,7 +157,7 @@ export function createTotpEngine(ctx: Context): TotpEngine {
       sealContext(factor.id, factor.accountId),
     );
     try {
-      return matchTimeStep({
+      return await matchTimeStep({
         secret,
         code,
         at: clock.now(),
@@ -399,7 +399,7 @@ export function createTotp(
       );
       let step: number | null;
       try {
-        step = matchTimeStep({
+        step = await matchTimeStep({
           secret,
           code: input.code,
           at: now,
