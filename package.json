@@ -61,7 +61,7 @@
     "test:postgres": "vitest run --maxWorkers=2 test/postgres",
     "check:runtime": "node scripts/check-runtime-imports.mjs",
     "prepublishOnly": "pnpm build",
-    "check": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test && pnpm build"
+    "check": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test && pnpm build && pnpm check:runtime"
   },
   "peerDependencies": {
     "kysely": ">=0.29.0 <0.30.0"

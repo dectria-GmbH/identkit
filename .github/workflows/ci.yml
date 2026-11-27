@@ -49,6 +49,8 @@ jobs:
       # DATABASE_URL is set, so the PostgreSQL suite and the migrations run here too.
       - run: pnpm test
       - run: pnpm build
+      # The root and testing entries must not reach Node built-ins (Web Crypto runtimes).
+      - run: pnpm check:runtime
 
   dependencies:
     name: dependency scan
