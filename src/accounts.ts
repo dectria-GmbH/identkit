@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { randomId } from "./crypto.js";
 import { normalizeEmail } from "./email.js";
 import { throttleKey as otpThrottleKey } from "./email-otp.js";
-import { enrolmentThrottleKey, throttleKey as totpThrottleKey } from "./totp.js";
+import { totpEnrolmentThrottleKey, totpThrottleKey } from "./throttle-keys.js";
 import type { AccountRecord } from "./storage/types.js";
 
 export interface AccountView {
@@ -107,7 +107,7 @@ export function createAccounts(
       if (!record) return false;
       const addressDigest = await releaseAddress(record.email);
       await store.throttle.reset(totpThrottleKey(accountId));
-      await store.throttle.reset(enrolmentThrottleKey(accountId));
+      await store.throttle.reset(totpEnrolmentThrottleKey(accountId));
       await ctx.emit({
         type: "lockout.released",
         accountId,

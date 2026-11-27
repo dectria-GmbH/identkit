@@ -8,6 +8,7 @@ import type { SecretSealer } from "./sealer.js";
 import { enrolledSecondFactors, factorChangeStepUp, hasFreshStepUp } from "./second-factor.js";
 import type { IssuedSession, SessionInternals, Sessions } from "./sessions.js";
 import type { SessionRecord, TotpFactorRecord } from "./storage/types.js";
+import { totpEnrolmentThrottleKey, totpThrottleKey } from "./throttle-keys.js";
 import {
   base32Encode,
   generateTotpSecret,
@@ -123,8 +124,6 @@ export interface TotpEngine {
 export const sealContext = (factorId: string, accountId: string) =>
   `identkit/totp-secret\u0000${factorId}\u0000${accountId}`;
 
-export const throttleKey = (accountId: string) => `totp:${accountId}`;
-export const enrolmentThrottleKey = (accountId: string) => `totp-enrolment:${accountId}`;
 const FACTOR_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
 function codeShapeMatches(code: unknown, digits: TotpDigits): code is string {
@@ -199,7 +198,7 @@ export function createTotpEngine(ctx: Context): TotpEngine {
         return fail("invalid", "malformed", input, factor.id);
       }
       const now = clock.now();
-      const key = throttleKey(input.accountId);
+      const key = totpThrottleKey(input.accountId);
       if (await store.throttle.peek(key, now)) return fail("locked", "locked", input, factor.id);
       // Counted before the comparison, so concurrent guesses cannot exceed the limit.
       const throttle = await store.throttle.reserve(key, now, config.totp.lockout);
@@ -384,7 +383,7 @@ export function createTotp(
         await enrolmentFailed(record.accountId, "malformed", factor.id);
         return { status: "failed", reason: "invalid" };
       }
-      const key = enrolmentThrottleKey(record.accountId);
+      const key = totpEnrolmentThrottleKey(record.accountId);
       if (await store.throttle.peek(key, now)) {
         await enrolmentFailed(record.accountId, "locked", factor.id);
         return { status: "failed", reason: "locked" };
