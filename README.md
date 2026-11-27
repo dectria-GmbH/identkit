@@ -343,22 +343,32 @@ Sessions:
   or null) and `revokedSessionIds`. Use it to end sessions your application keeps itself, for
   example with a per-account version. It runs last: after the revocation and after the calling
   operation's own writes and audit events (the disable, the new or removed passkey, the TOTP
-  change, the removed link). If it throws, the call throws `AllSessionsRevokedHookError`, and
-  everything identkit does is done: the identkit sessions stay revoked and the audit events are
-  written, unless `auditError` is set (next point). Some calls cannot be repeated (a finished
+  change, the removed link). If it throws, the call throws `AllSessionsRevokedHookError` (after a
+  rollback, `OperationRolledBackError`; see below), and everything identkit does is done: the
+  identkit sessions stay revoked and the audit events are written, unless `auditError` is set
+  (see below). Some calls cannot be repeated (a finished
   passkey registration or TOTP enrolment, a `totp.remove` whose factor is gone), so re-run the
   hook with `sessions.revokeAll(error.accountId, error.revokeAllOptions)`.
   `revokeAll` is idempotent and calls the hook also when no session was live. Make the hook
   idempotent too. On such a re-run `revokedSessionIds` is empty, because the sessions are already
   revoked: do not depend on it to find the sessions to end.
-- `AllSessionsRevokedHookError` does not mean that the operation succeeded. A TOTP enrolment or
-  a passkey registration whose grant changed before it completed rolls back: identkit removes
-  the new factor or passkey, revokes every session of the account and records the failure. If
-  the hook throws then, the error has `rolledBack: true` and `revokeAllOptions` is `{}`; without
-  the hook failure the call would have returned `denied`. For every other operation
-  `rolledBack` is false. If an operation fails for another reason and rolls back (a store error
-  during a passkey registration or TOTP enrolment), the hook runs best effort and the original
-  error goes up, never `AllSessionsRevokedHookError` and never a sink error of the rollback.
+- A TOTP enrolment or a passkey registration rolls back when its grant changed before it
+  completed, and when the store fails after the new factor or passkey was stored (also on the
+  revocation of the other sessions): identkit removes the factor or passkey and revokes every
+  session of the account. A grant change is recorded with reason `grant_changed` and the call
+  returns `denied`. If an error comes up on the way (the store's, the audit sink's or the
+  hook's), the call throws `OperationRolledBackError` instead, with the first error as `cause`.
+  Its `hookFailed` is true if the hook threw or the store failed before identkit could call it;
+  then call `sessions.revokeAll(error.accountId, error.revokeAllOptions)` to finish the
+  revocation and run the hook. `revokeAllOptions` is always `{}`, so that call also ends the
+  session that started the operation.
+- The rule for callers: if you catch `OperationRolledBackError`, the operation did not take
+  effect. Any other error means that identkit did not roll back: what it wrote before the error
+  stands, and `AllSessionsRevokedHookError` means that the operation's writes are complete. An
+  error from `confirmEnrolment` or `finishRegistration` can also come before the activation, so
+  after any other error check `totp.get` or `passkeys.list` before you tell the person that the
+  factor or passkey is active. A rollback that cannot remove the new factor or passkey throws
+  the store's error or `PasskeyCleanupError` (see Passkeys and TOTP below).
 - The hook runs also when the audit sink throws, on the `session.revoked` events or on the
   operation's own events, so a failing sink cannot leave your application's sessions live.
   identkit still offers every other event of the operation to the sink (a refused
@@ -370,10 +380,13 @@ Sessions:
   the throttle store's error from the reset after a successful enrolment. Without such a
   failure, `auditError` is undefined. In short: sink fails only, the sink's error goes up; hook
   fails only, `AllSessionsRevokedHookError` without `auditError`; both fail,
-  `AllSessionsRevokedHookError` with `auditError`.
+  `AllSessionsRevokedHookError` with `auditError`. After a rollback, each of these goes up as
+  `OperationRolledBackError` instead.
 - A sink error on the `session.revoked` events is not a failed revocation: the sessions are
-  revoked. A TOTP enrolment or a passkey registration then stands, as when the sink refuses
-  `totp.enrolled` or `passkey.registered`.
+  revoked. On the success path a TOTP enrolment or a passkey registration then stands, as when
+  the sink refuses `totp.enrolled` or `passkey.registered`, and the sink's error goes up. On a
+  rollback the sink's error goes up as the `cause` of `OperationRolledBackError`, unless an
+  earlier error came first.
 
 Passkeys:
 
@@ -402,8 +415,9 @@ Passkeys:
   approve. The registration applies its grant again after the insert and activates the passkey
   only if the session is still live and no other passkey appeared meanwhile; otherwise it
   deletes it. After the activation it checks once more; if the grant no longer holds, it deletes
-  the passkey and ends every session of the account; an error on the way does the same. A crash
-  in between leaves an unusable pending row.
+  the passkey and ends every session of the account; an error on the way does the same, also a
+  store error on the revocation of the other sessions after the last check (see Sessions for
+  `OperationRolledBackError`). A crash in between leaves an unusable pending row.
 - If the store fails on both deletes of that passkey, identkit tries twice to disable the
   account, ends all its sessions and throws: the passkey may still be active without a valid
   grant. The audit event `passkey.registration_failed` says `cleanup_failed_account_disabled`
@@ -472,8 +486,13 @@ TOTP:
   enrollment token) can change the account's factors.
   Enrolment, removal and administrative revocation revoke the other sessions of the account (all
   of them for `revoke`). If that revocation fails, enrolment removes the factor again and ends
-  every session; removal retries once; `revoke` ends all sessions also when it finds no factor,
-  so a retry after an error completes it.
+  every session; `revoke` ends all sessions also when it finds no factor, so a retry after an
+  error completes it. Removal retries once. If the retry fails too, the factor stays removed and
+  `remove` throws `SessionsNotRevokedError`: a retried `remove` answers `not_found`, so finish
+  with `sessions.revokeAll(error.accountId, error.revokeAllOptions)`, which also runs the hook.
+  If the first attempt committed and lost its reply, the retry finds no live session: the hook
+  gets an empty `revokedSessionIds`, and no `session.revoked` event is recorded for the sessions
+  that the first attempt revoked.
 - A TOTP second factor or step-up checks after its write that the same factor is still the
   account's active factor. A removal that raced with the check yields no session and no step-up.
 
@@ -761,10 +780,13 @@ nobody. Without `callbackSecret` it signs callbacks with a random secret per ins
 
 ## Audit events
 
-identkit awaits `audit.emit` for every security-relevant event. If the sink throws, the operation
-fails. Events carry ids and reasons, never a code, token, challenge, key, person key, TOTP
-secret, sealed secret, provisioning URI or e-mail address. `addressDigest` is the HMAC of the
-address, for correlation. Approval events carry `level`; TOTP events carry `factorId`.
+identkit awaits `audit.emit` for every security-relevant event. If the sink throws, the call
+throws, but what identkit wrote before the event stands: a refused event undoes no revocation and
+no factor change (see Sessions; only `OperationRolledBackError` means that nothing took effect).
+`accounts.disable` records `account.disabled` only if the account was still active, so a retry
+does not record it twice; a refused `account.disabled` is then missing. Events carry ids and
+reasons, never a code, token, challenge, key, person key, TOTP secret, sealed secret,
+provisioning URI or e-mail address. `addressDigest` is the HMAC of the address, for correlation. Approval events carry `level`; TOTP events carry `factorId`.
 
 OIDC events carry `provider` and, where one exists, `linkId`, never an ID token, code, client
 secret, subject or address: `oidc.signed_in`, `oidc.sign_in_failed` (reason), `oidc.binding_refused`
