@@ -603,4 +603,4 @@ vulnerability. See [SECURITY.md](SECURITY.md).
 
 ## Licence
 
-MIT, see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE). identkit is maintained by dectria GmbH.
