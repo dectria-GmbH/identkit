@@ -685,6 +685,14 @@ First binding (no link for the subject yet), in this order:
    counts as a guest, so it fails closed. With `allowGuests: true` a guest (except a personal
    account, see rule 2) binds by `email` with `xms_edov` true, never by `preferred_username`. A
    link you import for a guest still signs in.
+   Limit: Microsoft does not document the `idp` value for a member of a federated domain (a
+   tenant domain that signs in at AD FS or another identity provider). If Entra puts the
+   federation provider there, identkit counts every such member as a guest and refuses its first
+   binding with `guest_account`. You can tell: the person gets `refused` with `guest_account`,
+   and the audit sink records `oidc.binding_refused` with that reason, while you know the person
+   is a member of your tenant or your tenant has no guests. Ways out: import a link for the
+   person (`oidc.importLink`; a linked subject signs in), or set `allowGuests: true`, which also
+   lets real guests bind by a verified address.
 4. The address must be verified by the provider (`unverified_address` otherwise): Google and
    other providers by `email_verified` true. Microsoft by `email` with the optional claim
    `xms_edov` true (add the optional claims `email` and `xms_edov` to the app registration). With
@@ -694,7 +702,9 @@ First binding (no link for the subject yet), in this order:
    authorization, so this is your decision; it stays off by default. The address must also stay
    the same under identkit's normalization except for ASCII case: an address that NFC or Unicode
    lowercase would change (for example the Kelvin sign, which lowercases to `k`) does not bind,
-   because it could turn into another account's address.
+   because it could turn into another account's address. An address with non-ASCII characters
+   (in the local part or the domain) does not bind either: identkit's address check accepts only
+   ASCII addresses.
 5. The account of that address. If there is none, identkit creates one if the policy's
    `createAccountOnFirstSignIn` is true, as for e-mail codes, else `no_account`. A disabled
    account is refused. With `linksPerAccount: "one"`, an account that has a link is refused
@@ -783,6 +793,13 @@ gradual deployment, before you turn on the option `oidc`. A rollback to an earli
 the first OIDC sign-in fails those sessions until they end or you revoke them. From this release
 on, every store drops a session method it does not know when it reads a session (fewer methods,
 never more rights), so a later release can add a method without this problem.
+
+A release that drops a method on read also writes the session back without it when it changes
+the session (`rotate`, a step-up, a second factor). So during a mixed deployment, a session can
+lose a newer method for good: it stays lost after every instance runs the newer release. No
+decision of identkit reads the session's methods, but if your code does (for example "only
+sessions with `oidc`"), it gets the wrong answer for such a session. This is one more reason to
+deploy a release to every instance before you turn on a method that it adds, as for `oidc`.
 
 A custom store needs the member `oidcLinks` (`insert(link, { exclusive })`, `findByKey`,
 `listByAccount`, `delete`) to use OIDC sign-in. It is optional in the type, so a custom store
