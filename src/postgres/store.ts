@@ -4,6 +4,7 @@ import { knownAuthMethods } from "../storage/auth-methods.js";
 import { applyThrottle } from "../storage/throttle-logic.js";
 import type {
   AccountRecord,
+  ApiTokenRecord,
   ChallengeRecord,
   CredentialRecord,
   EnrollmentTokenRecord,
@@ -47,6 +48,8 @@ const LEVELS = ["low", "substantial", "high"] as const;
 const OIDC_PROVIDERS = ["microsoft", "google", "oidc"] as const;
 const OIDC_LINK_SOURCES = ["sign_in", "import"] as const;
 const STEP_UP_METHODS = ["email_otp", "passkey", "totp"] as const;
+const API_TOKEN_ALGORITHMS = ["hmac-sha256", "sha256"] as const;
+const API_TOKEN_SOURCES = ["created", "import"] as const;
 
 const toAccount = (r: Row<"identkit_accounts">): AccountRecord => ({
   id: r.id,
@@ -175,6 +178,21 @@ const toOidcLink = (r: Row<"identkit_oidc_links">): OidcLinkRecord => ({
   tenantId: r.tenant_id,
   source: oneOf(r.source, OIDC_LINK_SOURCES),
   createdAt: r.created_at,
+});
+
+const toApiToken = (r: Row<"identkit_api_tokens">): ApiTokenRecord => ({
+  id: r.id,
+  accountId: r.account_id,
+  name: r.name,
+  scopes: [...r.scopes],
+  digest: r.digest,
+  digestAlgorithm: oneOf(r.digest_algorithm, API_TOKEN_ALGORITHMS),
+  source: oneOf(r.source, API_TOKEN_SOURCES),
+  createdAt: r.created_at,
+  expiresAt: r.expires_at,
+  lastUsedAt: r.last_used_at,
+  revokedAt: r.revoked_at,
+  revokeReason: r.revoke_reason,
 });
 
 /**
@@ -912,6 +930,129 @@ export function createPostgresStore(db: Kysely<IdentkitDatabase>): IdentkitStore
       async delete(id, accountId) {
         const row = await db
           .deleteFrom("identkit_oidc_links")
+          .where("id", "=", id)
+          .where("account_id", "=", accountId)
+          .returning("id")
+          .executeTakeFirst();
+        return row !== undefined;
+      },
+    },
+    apiTokens: {
+      async insert(t, limit) {
+        // READ COMMITTED whatever the database default, for the reason given at `oidcLinks`:
+        // the count after the account row lock must see the tokens that the transaction holding
+        // the lock before committed.
+        return db
+          .transaction()
+          .setIsolationLevel("read committed")
+          .execute(async (trx) => {
+            // The account row lock serializes inserts for one account, so the count and the
+            // insert below cannot interleave with another insert's.
+            await trx
+              .selectFrom("identkit_accounts")
+              .select("id")
+              .where("id", "=", t.accountId)
+              .forUpdate()
+              .executeTakeFirst();
+            const taken = await trx
+              .selectFrom("identkit_api_tokens")
+              .select("id")
+              .where("digest", "=", t.digest)
+              .executeTakeFirst();
+            if (taken) return "digest_taken";
+            const { active } = await trx
+              .selectFrom("identkit_api_tokens")
+              .select((eb) => eb.fn.countAll<string>().as("active"))
+              .where("account_id", "=", t.accountId)
+              .where("revoked_at", "is", null)
+              .where("expires_at", ">", limit.at)
+              .executeTakeFirstOrThrow();
+            if (Number(active) >= limit.maxActive) return "limit_reached";
+            const row = await trx
+              .insertInto("identkit_api_tokens")
+              .values({
+                id: t.id,
+                account_id: t.accountId,
+                name: t.name,
+                scopes: t.scopes,
+                digest: t.digest,
+                digest_algorithm: t.digestAlgorithm,
+                source: t.source,
+                created_at: t.createdAt,
+                expires_at: t.expiresAt,
+                last_used_at: t.lastUsedAt,
+                revoked_at: t.revokedAt,
+                revoke_reason: t.revokeReason,
+              })
+              .onConflict((oc) => oc.column("digest").doNothing())
+              .returning("id")
+              .executeTakeFirst();
+            return row ? "inserted" : "digest_taken";
+          });
+      },
+      async findByDigests(digests) {
+        if (digests.length === 0) return [];
+        // One query: the token and the status of its account.
+        const rows = await db
+          .selectFrom("identkit_api_tokens as t")
+          .innerJoin("identkit_accounts as a", "a.id", "t.account_id")
+          .selectAll("t")
+          .select("a.status as account_status")
+          .where("t.digest", "in", [...digests])
+          .execute();
+        return rows.map((r) => ({
+          record: toApiToken(r),
+          accountStatus: oneOf(r.account_status, ["active", "disabled"]),
+        }));
+      },
+      async listByAccount(accountId) {
+        const rows = await db
+          .selectFrom("identkit_api_tokens")
+          .selectAll()
+          .where("account_id", "=", accountId)
+          .where("revoked_at", "is", null)
+          .orderBy("created_at")
+          .orderBy("id")
+          .execute();
+        return rows.map(toApiToken);
+      },
+      async markUsed(id, at, notAfter) {
+        const row = await db
+          .updateTable("identkit_api_tokens")
+          .set({ last_used_at: at })
+          .where("id", "=", id)
+          .where("revoked_at", "is", null)
+          .where((eb) =>
+            eb.or([eb("last_used_at", "is", null), eb("last_used_at", "<=", notAfter)]),
+          )
+          .returning("id")
+          .executeTakeFirst();
+        return row !== undefined;
+      },
+      async revoke(id, accountId, at, reason) {
+        const row = await db
+          .updateTable("identkit_api_tokens")
+          .set({ revoked_at: at, revoke_reason: reason })
+          .where("id", "=", id)
+          .where("account_id", "=", accountId)
+          .where("revoked_at", "is", null)
+          .returning("id")
+          .executeTakeFirst();
+        return row !== undefined;
+      },
+      async revokeAllForAccount(accountId, at, reason) {
+        const rows = await db
+          .updateTable("identkit_api_tokens")
+          .set({ revoked_at: at, revoke_reason: reason })
+          .where("account_id", "=", accountId)
+          .where("revoked_at", "is", null)
+          .returning("id")
+          .execute();
+        return rows.map((r) => r.id);
+      },
+      async delete(id, accountId) {
+        const row = await db
+          .deleteFrom("identkit_api_tokens")
           .where("id", "=", id)
           .where("account_id", "=", accountId)
           .returning("id")

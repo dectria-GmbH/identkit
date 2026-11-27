@@ -119,6 +119,20 @@ export interface IdentkitDatabase {
     source: string;
     created_at: Date;
   };
+  identkit_api_tokens: {
+    id: string;
+    account_id: string;
+    name: string;
+    scopes: string[];
+    digest: string;
+    digest_algorithm: string;
+    source: string;
+    created_at: Date;
+    expires_at: Date;
+    last_used_at: Date | null;
+    revoked_at: Date | null;
+    revoke_reason: string | null;
+  };
   identkit_migrations: {
     name: string;
     applied_at: Date;

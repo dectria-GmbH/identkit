@@ -3,6 +3,7 @@ import { knownAuthMethods } from "./auth-methods.js";
 import { applyThrottle, type ThrottleState } from "./throttle-logic.js";
 import type {
   AccountRecord,
+  ApiTokenRecord,
   ChallengeRecord,
   CredentialRecord,
   EnrollmentTokenRecord,
@@ -49,6 +50,7 @@ export function createMemoryStore(): IdentkitStore {
   const totpFactors = new Map<string, TotpFactorRecord>();
   const verifications = new Map<string, VerificationRecord>();
   const oidcLinks = new Map<string, OidcLinkRecord>();
+  const apiTokens = new Map<string, ApiTokenRecord>();
 
   function revokeEnrollment(accountId: string, at: Date): number {
     let revoked = 0;
@@ -439,6 +441,79 @@ export function createMemoryStore(): IdentkitStore {
         const found = oidcLinks.get(id);
         if (!found || found.accountId !== accountId) return Promise.resolve(false);
         oidcLinks.delete(id);
+        return Promise.resolve(true);
+      },
+    },
+    apiTokens: {
+      insert(token, limit) {
+        const tokens = [...apiTokens.values()];
+        if (tokens.some((t) => t.digest === token.digest)) return Promise.resolve("digest_taken");
+        const active = tokens.filter(
+          (t) =>
+            t.accountId === token.accountId &&
+            t.revokedAt === null &&
+            t.expiresAt.getTime() > limit.at.getTime(),
+        );
+        if (active.length >= limit.maxActive) return Promise.resolve("limit_reached");
+        if (!accounts.has(token.accountId)) return Promise.reject(new Error("account not found"));
+        if (apiTokens.has(token.id)) return Promise.reject(new Error("duplicate api token id"));
+        apiTokens.set(token.id, copy(token));
+        return Promise.resolve("inserted");
+      },
+      findByDigests(digests) {
+        const found = [...apiTokens.values()].flatMap((record) => {
+          const account = accounts.get(record.accountId);
+          if (!digests.includes(record.digest) || !account) return [];
+          return [{ record: copy(record), accountStatus: account.status }];
+        });
+        return Promise.resolve(found);
+      },
+      listByAccount(accountId) {
+        return Promise.resolve(
+          [...apiTokens.values()]
+            .filter((t) => t.accountId === accountId && t.revokedAt === null)
+            .toSorted(
+              (a, b) => a.createdAt.getTime() - b.createdAt.getTime() || (a.id < b.id ? -1 : 1),
+            )
+            .map(copy),
+        );
+      },
+      markUsed(id, at, notAfter) {
+        const found = apiTokens.get(id);
+        if (
+          !found ||
+          found.revokedAt !== null ||
+          (found.lastUsedAt !== null && found.lastUsedAt.getTime() > notAfter.getTime())
+        ) {
+          return Promise.resolve(false);
+        }
+        found.lastUsedAt = at;
+        return Promise.resolve(true);
+      },
+      revoke(id, accountId, at, reason) {
+        const found = apiTokens.get(id);
+        if (!found || found.accountId !== accountId || found.revokedAt !== null) {
+          return Promise.resolve(false);
+        }
+        found.revokedAt = at;
+        found.revokeReason = reason;
+        return Promise.resolve(true);
+      },
+      revokeAllForAccount(accountId, at, reason) {
+        const revoked: string[] = [];
+        for (const token of apiTokens.values()) {
+          if (token.accountId === accountId && token.revokedAt === null) {
+            token.revokedAt = at;
+            token.revokeReason = reason;
+            revoked.push(token.id);
+          }
+        }
+        return Promise.resolve(revoked);
+      },
+      delete(id, accountId) {
+        const found = apiTokens.get(id);
+        if (!found || found.accountId !== accountId) return Promise.resolve(false);
+        apiTokens.delete(id);
         return Promise.resolve(true);
       },
     },

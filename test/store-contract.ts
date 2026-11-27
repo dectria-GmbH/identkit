@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { addSeconds } from "../src/clock.js";
 import type {
+  ApiTokenRecord,
   IdentkitStore,
   OidcLinkRecord,
   OtpFlowRecord,
@@ -92,6 +93,24 @@ function oidcLink(accountId: string, overrides: Partial<OidcLinkRecord> = {}): O
     tenantId: null,
     source: "sign_in",
     createdAt: T0,
+    ...overrides,
+  };
+}
+
+function apiToken(accountId: string, overrides: Partial<ApiTokenRecord> = {}): ApiTokenRecord {
+  return {
+    id: uid("tok"),
+    accountId,
+    name: "deploy script",
+    scopes: ["read:items", "write:items"],
+    digest: uid("digest"),
+    digestAlgorithm: "hmac-sha256",
+    source: "created",
+    createdAt: T0,
+    expiresAt: addSeconds(T0, 30 * 86_400),
+    lastUsedAt: null,
+    revokedAt: null,
+    revokeReason: null,
     ...overrides,
   };
 }
@@ -785,6 +804,125 @@ export function runStoreContract(
       );
       expect(perSubject.filter((r) => r === "inserted")).toHaveLength(1);
       expect(perSubject.filter((r) => r === "link_taken")).toHaveLength(7);
+    });
+
+    it("api tokens: insert, unique digest, lookup with the account status, list, revoke, delete", async () => {
+      const store = await factory();
+      const tokens = store.apiTokens;
+      if (!tokens) throw new Error("store has no apiTokens");
+      const a = account();
+      const b = account();
+      await store.accounts.insert(a);
+      await store.accounts.insert(b);
+      const limit = { maxActive: 5, at: T0 };
+      const first = apiToken(a.id, { scopes: ["z:last", "a:first"] });
+      expect(await tokens.insert(first, limit)).toBe("inserted");
+      expect(await tokens.insert({ ...apiToken(b.id), digest: first.digest }, limit)).toBe(
+        "digest_taken",
+      );
+      const legacy = apiToken(a.id, {
+        digestAlgorithm: "sha256",
+        source: "import",
+        createdAt: addSeconds(T0, 1),
+        lastUsedAt: addSeconds(T0, 1),
+      });
+      expect(await tokens.insert(legacy, limit)).toBe("inserted");
+
+      // Scopes keep their order; one read returns both digests with the account status.
+      expect(await tokens.findByDigests([first.digest])).toEqual([
+        { record: first, accountStatus: "active" },
+      ]);
+      const both = await tokens.findByDigests([first.digest, legacy.digest]);
+      expect(both.map((l) => l.record.id).toSorted()).toEqual([first.id, legacy.id].toSorted());
+      expect(both.find((l) => l.record.id === legacy.id)?.record).toEqual(legacy);
+      expect(await tokens.findByDigests([uid("none")])).toEqual([]);
+      expect(await tokens.findByDigests([])).toEqual([]);
+      expect((await tokens.listByAccount(a.id)).map((t) => t.id)).toEqual([first.id, legacy.id]);
+      expect(await tokens.listByAccount(b.id)).toEqual([]);
+
+      await store.accounts.setStatus(a.id, "disabled");
+      expect((await tokens.findByDigests([first.digest]))[0]?.accountStatus).toBe("disabled");
+
+      // Revocation is scoped to the account and happens once; a revoked token is still found.
+      expect(await tokens.revoke(first.id, b.id, T0, "revoked")).toBe(false);
+      expect(await tokens.revoke(first.id, a.id, addSeconds(T0, 5), "revoked")).toBe(true);
+      expect(await tokens.revoke(first.id, a.id, T0, "revoked")).toBe(false);
+      const revoked = (await tokens.findByDigests([first.digest]))[0]?.record;
+      expect(revoked?.revokedAt).toEqual(addSeconds(T0, 5));
+      expect(revoked?.revokeReason).toBe("revoked");
+      expect((await tokens.listByAccount(a.id)).map((t) => t.id)).toEqual([legacy.id]);
+
+      const third = apiToken(a.id);
+      await tokens.insert(third, limit);
+      expect((await tokens.revokeAllForAccount(a.id, T0, "revoked_all")).toSorted()).toEqual(
+        [legacy.id, third.id].toSorted(),
+      );
+      expect(await tokens.revokeAllForAccount(a.id, T0, "revoked_all")).toEqual([]);
+      expect(await tokens.listByAccount(a.id)).toEqual([]);
+
+      expect(await tokens.delete(third.id, b.id)).toBe(false);
+      expect(await tokens.delete(third.id, a.id)).toBe(true);
+      expect(await tokens.delete(third.id, a.id)).toBe(false);
+      expect(await tokens.findByDigests([third.digest])).toEqual([]);
+      // A deleted digest can be inserted again.
+      expect(await tokens.insert({ ...apiToken(b.id), digest: third.digest }, limit)).toBe(
+        "inserted",
+      );
+    });
+
+    it("api tokens: the active limit holds under concurrency; revoked and expired do not count", async () => {
+      const store = await factory();
+      const tokens = store.apiTokens;
+      if (!tokens) throw new Error("store has no apiTokens");
+      const a = account();
+      await store.accounts.insert(a);
+      const limit = { maxActive: 3, at: T0 };
+      const results = await Promise.all(
+        Array.from({ length: 10 }, () => tokens.insert(apiToken(a.id), limit)),
+      );
+      expect(results.filter((r) => r === "inserted")).toHaveLength(3);
+      expect(results.filter((r) => r === "limit_reached")).toHaveLength(7);
+      expect(await tokens.listByAccount(a.id)).toHaveLength(3);
+
+      const [oldest] = await tokens.listByAccount(a.id);
+      if (!oldest) throw new Error("no token");
+      await tokens.revoke(oldest.id, a.id, T0, "revoked");
+      expect(await tokens.insert(apiToken(a.id), limit)).toBe("inserted");
+      expect(await tokens.insert(apiToken(a.id), limit)).toBe("limit_reached");
+      // At the expiry of a token, it no longer counts.
+      const later = { maxActive: 3, at: addSeconds(T0, 30 * 86_400) };
+      const parallel = await Promise.all(
+        Array.from({ length: 6 }, () =>
+          tokens.insert(apiToken(a.id, { expiresAt: addSeconds(T0, 60 * 86_400) }), later),
+        ),
+      );
+      expect(parallel.filter((r) => r === "inserted")).toHaveLength(3);
+    });
+
+    it("api tokens: markUsed writes once per interval, also under concurrency, never after a revoke", async () => {
+      const store = await factory();
+      const tokens = store.apiTokens;
+      if (!tokens) throw new Error("store has no apiTokens");
+      const a = account();
+      await store.accounts.insert(a);
+      const t = apiToken(a.id);
+      await tokens.insert(t, { maxActive: 5, at: T0 });
+      const at = addSeconds(T0, 10);
+      const writes = await Promise.all(
+        Array.from({ length: 6 }, () => tokens.markUsed(t.id, at, addSeconds(at, -3600))),
+      );
+      expect(writes.filter(Boolean)).toHaveLength(1);
+      const lastUsed = async () => (await tokens.findByDigests([t.digest]))[0]?.record.lastUsedAt;
+      expect(await lastUsed()).toEqual(at);
+      const soon = addSeconds(at, 3599);
+      expect(await tokens.markUsed(t.id, soon, addSeconds(soon, -3600))).toBe(false);
+      const due = addSeconds(at, 3600);
+      expect(await tokens.markUsed(t.id, due, addSeconds(due, -3600))).toBe(true);
+      expect(await lastUsed()).toEqual(due);
+      await tokens.revoke(t.id, a.id, due, "revoked");
+      const after = addSeconds(due, 7200);
+      expect(await tokens.markUsed(t.id, after, addSeconds(after, -3600))).toBe(false);
+      expect(await tokens.markUsed(uid("none"), after, after)).toBe(false);
     });
   });
 }

@@ -3,6 +3,7 @@ import { knownAuthMethods } from "../storage/auth-methods.js";
 import { applyThrottle, type ThrottleState } from "../storage/throttle-logic.js";
 import type {
   AccountRecord,
+  ApiTokenRecord,
   ChallengeRecord,
   CredentialRecord,
   EnrollmentTokenRecord,
@@ -128,6 +129,8 @@ const LEVELS = ["low", "substantial", "high"] as const;
 const OIDC_PROVIDERS = ["microsoft", "google", "oidc"] as const;
 const OIDC_LINK_SOURCES = ["sign_in", "import"] as const;
 const STEP_UP_METHODS = ["email_otp", "passkey", "totp"] as const;
+const API_TOKEN_ALGORITHMS = ["hmac-sha256", "sha256"] as const;
+const API_TOKEN_SOURCES = ["created", "import"] as const;
 const CHALLENGE_PURPOSES = [
   "registration",
   "sign_in",
@@ -156,6 +159,25 @@ const toOidcLink = (r: Row): OidcLinkRecord => ({
   source: oneOf(r["source"], OIDC_LINK_SOURCES),
   createdAt: date(r["created_at"]),
 });
+
+const toApiToken = (r: Row): ApiTokenRecord => ({
+  id: text(r["id"]),
+  accountId: text(r["account_id"]),
+  name: text(r["name"]),
+  scopes: stringList(r["scopes"]),
+  digest: text(r["digest"]),
+  digestAlgorithm: oneOf(r["digest_algorithm"], API_TOKEN_ALGORITHMS),
+  source: oneOf(r["source"], API_TOKEN_SOURCES),
+  createdAt: date(r["created_at"]),
+  expiresAt: date(r["expires_at"]),
+  lastUsedAt: dateOrNull(r["last_used_at"]),
+  revokedAt: dateOrNull(r["revoked_at"]),
+  revokeReason: textOrNull(r["revoke_reason"]),
+});
+
+const API_TOKEN_COLUMNS =
+  "id, account_id, name, scopes, digest, digest_algorithm, source, created_at, expires_at, " +
+  "last_used_at, revoked_at, revoke_reason";
 
 const OIDC_LINK_COLUMNS =
   "id, account_id, link_key, provider, issuer, subject, tenant_id, source, created_at";
@@ -1024,6 +1046,113 @@ export function createD1Store(db: D1DatabaseLike, options: D1StoreOptions = {}):
       async delete(id, accountId) {
         const row = await one(
           "DELETE FROM identkit_oidc_links WHERE id = ?1 AND account_id = ?2 RETURNING id",
+          id,
+          accountId,
+        );
+        return row !== null;
+      },
+    },
+
+    apiTokens: {
+      async insert(t, limit) {
+        // Atomic: one INSERT ... SELECT. Its WHERE counts the active tokens of the account in
+        // the same statement, so concurrent inserts never exceed the limit, and the unique
+        // digest makes a second insert of a digest a no-op. The read after a miss only names
+        // the reason.
+        const row = await one(
+          `INSERT INTO identkit_api_tokens (${API_TOKEN_COLUMNS})
+           SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+           WHERE (
+             SELECT count(*) FROM identkit_api_tokens
+             WHERE account_id = ?2 AND revoked_at IS NULL AND expires_at > ?13
+           ) < ?14
+           ON CONFLICT (digest) DO NOTHING
+           RETURNING id`,
+          t.id,
+          t.accountId,
+          t.name,
+          JSON.stringify(t.scopes),
+          t.digest,
+          t.digestAlgorithm,
+          t.source,
+          ms(t.createdAt),
+          ms(t.expiresAt),
+          msOrNull(t.lastUsedAt),
+          msOrNull(t.revokedAt),
+          t.revokeReason,
+          ms(limit.at),
+          limit.maxActive,
+        );
+        if (row) return "inserted";
+        const taken = await one("SELECT id FROM identkit_api_tokens WHERE digest = ?1", t.digest);
+        return taken ? "digest_taken" : "limit_reached";
+      },
+      async findByDigests(digests) {
+        if (digests.length === 0) return [];
+        // One query: the token and the status of its account.
+        const placeholders = digests.map((_, i) => `?${i + 1}`).join(", ");
+        const columns = API_TOKEN_COLUMNS.split(", ")
+          .map((c) => `t.${c}`)
+          .join(", ");
+        const rows = await all(
+          `SELECT ${columns}, a.status AS account_status
+           FROM identkit_api_tokens t JOIN identkit_accounts a ON a.id = t.account_id
+           WHERE t.digest IN (${placeholders})`,
+          ...digests,
+        );
+        return rows.map((r) => ({
+          record: toApiToken(r),
+          accountStatus: oneOf(r["account_status"], ["active", "disabled"]),
+        }));
+      },
+      async listByAccount(accountId) {
+        const rows = await all(
+          `SELECT ${API_TOKEN_COLUMNS} FROM identkit_api_tokens
+           WHERE account_id = ?1 AND revoked_at IS NULL ORDER BY created_at, id`,
+          accountId,
+        );
+        return rows.map(toApiToken);
+      },
+      async markUsed(id, at, notAfter) {
+        // Atomic: one UPDATE that matches only while the last use is old enough.
+        const row = await one(
+          `UPDATE identkit_api_tokens SET last_used_at = ?2
+           WHERE id = ?1 AND revoked_at IS NULL AND (last_used_at IS NULL OR last_used_at <= ?3)
+           RETURNING id`,
+          id,
+          ms(at),
+          ms(notAfter),
+        );
+        return row !== null;
+      },
+      async revoke(id, accountId, at, reason) {
+        // Atomic: one UPDATE that matches only a token that is not revoked yet.
+        const row = await one(
+          `UPDATE identkit_api_tokens SET revoked_at = ?3, revoke_reason = ?4
+           WHERE id = ?1 AND account_id = ?2 AND revoked_at IS NULL
+           RETURNING id`,
+          id,
+          accountId,
+          ms(at),
+          reason,
+        );
+        return row !== null;
+      },
+      async revokeAllForAccount(accountId, at, reason) {
+        // Atomic: one UPDATE. It runs wholly before or wholly after a concurrent insert.
+        const rows = await all(
+          `UPDATE identkit_api_tokens SET revoked_at = ?2, revoke_reason = ?3
+           WHERE account_id = ?1 AND revoked_at IS NULL
+           RETURNING id`,
+          accountId,
+          ms(at),
+          reason,
+        );
+        return rows.map((r) => text(r["id"]));
+      },
+      async delete(id, accountId) {
+        const row = await one(
+          "DELETE FROM identkit_api_tokens WHERE id = ?1 AND account_id = ?2 RETURNING id",
           id,
           accountId,
         );
