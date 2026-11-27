@@ -1,7 +1,8 @@
 // Runs test/workerd/smoke-worker.js in workerd (through Miniflare) without nodejs_compat, against
 // the built `dist` entries, `identkit/d1` included (against a local D1 binding). Run it after
 // `pnpm build`. Exits non-zero if a check fails.
-// It also times `sessions.validate` with the memory store, in workerd and on Node.
+// It also times `sessions.validate` and `apiTokens.verify` with the memory store, in workerd and on
+// Node.
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Miniflare } from "miniflare";
@@ -64,11 +65,11 @@ async function identityProviderService() {
   };
 }
 
-/** Wall time per call of `sessions.validate` in workerd: two runs, so setup cost cancels out. */
-async function benchWorkerd(mf) {
+/** Wall time per call in workerd (`path`: `bench` or `bench-tokens`): two runs, so setup cost cancels out. */
+async function benchWorkerd(mf, path) {
   const time = async (n) => {
     const started = performance.now();
-    const response = await mf.dispatchFetch(`http://smoke/bench?n=${n}`);
+    const response = await mf.dispatchFetch(`http://smoke/${path}?n=${n}`);
     const body = await response.json();
     if (body.valid !== n) throw new Error(`bench: ${body.valid} of ${n} sessions valid`);
     return performance.now() - started;
@@ -79,13 +80,15 @@ async function benchWorkerd(mf) {
   return (full - base) / BENCH_CALLS;
 }
 
-/** CPU time per call of `sessions.validate` on Node, as a proxy. */
+/** CPU time per call of `sessions.validate` and of `apiTokens.verify` on Node, as a proxy. */
 async function benchNode() {
   const { createIdentkit, createHmacHasher, createMemoryStore } = await import(
     resolve(root, "dist/index.js")
   );
   const testing = await import(resolve(root, "dist/testing/index.js"));
-  const { basePolicy, config } = await import(resolve(root, "test/workerd/smoke-config.js"));
+  const { API_TOKENS, basePolicy, config } = await import(
+    resolve(root, "test/workerd/smoke-config.js")
+  );
   const mail = testing.createRecordingMailSender();
   const ik = createIdentkit({
     config,
@@ -97,6 +100,7 @@ async function benchNode() {
     audit: testing.createRecordingAuditSink(),
     clock: testing.createFakeClock(),
     policy: basePolicy,
+    apiTokens: API_TOKENS,
   });
   const requested = await ik.emailSignIn.requestCode({ email: "person@example.org" });
   const signedIn = await ik.emailSignIn.verifyCode({
@@ -109,7 +113,23 @@ async function benchNode() {
     if (!(await ik.sessions.validate(signedIn.token))) throw new Error("session not valid");
   }
   const used = process.cpuUsage(before);
-  return (used.user + used.system) / 1000 / BENCH_CALLS;
+  const sessionMs = (used.user + used.system) / 1000 / BENCH_CALLS;
+
+  const created = await ik.apiTokens.create({
+    accountId: signedIn.account.id,
+    name: "bench",
+    scopes: ["read"],
+    expiresInDays: 7,
+  });
+  for (let i = 0; i < 100; i += 1) await ik.apiTokens.verify(created.token);
+  const tokensBefore = process.cpuUsage();
+  for (let i = 0; i < BENCH_CALLS; i += 1) {
+    if ((await ik.apiTokens.verify(created.token)).status !== "valid") {
+      throw new Error("token not valid");
+    }
+  }
+  const tokensUsed = process.cpuUsage(tokensBefore);
+  return { sessionMs, tokenMs: (tokensUsed.user + tokensUsed.system) / 1000 / BENCH_CALLS };
 }
 
 const mf = new Miniflare({
@@ -141,13 +161,16 @@ try {
     if (!result.ok) failed = true;
   }
   if (results.length === 0) failed = true;
-  const workerdMs = await benchWorkerd(mf);
+  const workerdMs = await benchWorkerd(mf, "bench");
   console.log(`sessions.validate in workerd: ${workerdMs.toFixed(4)} ms wall time per call`);
+  const tokenWorkerdMs = await benchWorkerd(mf, "bench-tokens");
+  console.log(`apiTokens.verify in workerd: ${tokenWorkerdMs.toFixed(4)} ms wall time per call`);
 } finally {
   await mf.dispose();
 }
 const nodeMs = await benchNode();
-console.log(`sessions.validate on Node: ${nodeMs.toFixed(4)} ms CPU time per call`);
+console.log(`sessions.validate on Node: ${nodeMs.sessionMs.toFixed(4)} ms CPU time per call`);
+console.log(`apiTokens.verify on Node: ${nodeMs.tokenMs.toFixed(4)} ms CPU time per call`);
 
 if (failed) {
   console.error("workerd smoke test failed");

@@ -60,3 +60,6 @@ export const basePolicy = {
   approvalEvidenceLevels: ["signature"],
   createAccountOnFirstSignIn: true,
 };
+
+/** API token options of the smoke test and its timing runs. */
+export const API_TOKENS = { prefix: "pat_", allowedScopes: ["read", "write"] };
